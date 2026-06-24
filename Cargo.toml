@@ -1,0 +1,25 @@
+[package]
+name = "io-offline"
+description = "Offline-first replica engine library"
+version = "0.1.0"
+authors = ["soywod <pimalaya.org@posteo.net>"]
+edition = "2024"
+rust-version = "1.87"
+license = "MIT OR Apache-2.0"
+categories = ["email", "caching"]
+keywords = ["offline", "sync", "replica", "io-free", "pim"]
+homepage = "https://pimalaya.org"
+documentation = "https://docs.rs/io-offline/latest/io_offline"
+repository = "https://github.com/pimalaya/io-offline"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["client"]
+client = []
+
+[dependencies]
+log = { version = "0.4", default-features = false }
+thiserror = { version = "2", default-features = false }

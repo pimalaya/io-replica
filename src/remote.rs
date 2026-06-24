@@ -1,0 +1,92 @@
+//! Payloads exchanged with the remote seam.
+//!
+//! The consumer satisfies four capabilities by driving a protocol crate
+//! (io-imap, io-jmap, io-webdav) or io-email's clients: count, enumerate,
+//! fetch and push. These types are what those capabilities return.
+
+use alloc::vec::Vec;
+
+use crate::{
+    collection::Checkpoint,
+    object::Hash,
+    placement::{Flags, Handle, LinkId, Meta},
+};
+
+/// The detail tier a fetch targets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Tier {
+    /// Summary only (a header or property subset); cheap.
+    Meta,
+    /// The full item body; yields an object.
+    Full,
+}
+
+/// One row of an enumerate snapshot: handle and flags, no link id, no body.
+///
+/// Enough to run the flag and membership three-way merge without fetching
+/// any body, which is exactly why a partial body cache stays safe. The
+/// link id is not here: enumeration only has to yield handles (an IMAP
+/// SEARCH returns just UIDs), so the link id is resolved later at the
+/// [`Tier::Meta`] fetch and lands on the placement then.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteItem {
+    /// The protocol handle.
+    pub handle: Handle,
+    /// The current remote flag set.
+    pub flags: Flags,
+}
+
+/// The result of enumerating a collection: its full or delta member set
+/// plus the new checkpoint.
+///
+/// `complete` tells the merge how to read the absence of a known local
+/// handle. A complete snapshot lists every current member, so a local
+/// placement missing from `items` was deleted upstream. A delta snapshot
+/// (QRESYNC, a JMAP/`/changes` query, a CalDAV sync-token) lists only what
+/// changed since `cursor`: unlisted placements are untouched, and removals
+/// arrive explicitly in `vanished`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteSnapshot {
+    /// The members observed: every current member when `complete`, else
+    /// only those added or changed since the cursor.
+    pub items: Vec<RemoteItem>,
+    /// Handles removed upstream since the cursor. Always empty for a
+    /// complete snapshot (absence from `items` already means removed).
+    pub vanished: Vec<Handle>,
+    /// Whether `items` is the whole member set (true) or a delta (false).
+    pub complete: bool,
+    /// The checkpoint these items are current as of.
+    pub checkpoint: Checkpoint,
+}
+
+/// The result of fetching one item at a requested tier.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FetchedItem {
+    /// The fetched handle.
+    pub handle: Handle,
+    /// The resolved link id.
+    pub link_id: LinkId,
+    /// The cached summary (always set; projected from the body where the
+    /// backend has no cheap summary tier).
+    pub meta: Meta,
+    /// The body and its content hash; `None` at [`Tier::Meta`].
+    pub body: Option<(Hash, Vec<u8>)>,
+}
+
+/// The outcome of pushing one change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PushOutcome {
+    /// The remote accepted the change.
+    Accepted,
+    /// Optimistic concurrency rejected it; the base was stale.
+    Rejected,
+}
+
+/// The result of pushing one change.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PushResult {
+    /// The handle the change targeted.
+    pub handle: Handle,
+    /// Whether the remote accepted it.
+    pub outcome: PushOutcome,
+}
