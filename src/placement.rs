@@ -123,6 +123,24 @@ pub enum Status {
     Tombstone,
     /// Both sides changed and diverged; awaiting keep-both resolution.
     Conflict,
+    /// Locally created (a copy, move or append) with no remote handle yet;
+    /// a create is pending. Its [`Placement::handle`] is a provisional
+    /// placeholder until the push reconciles it to the server-assigned one.
+    Created,
+}
+
+/// Where a pending create's content already lives, so the push can reuse a
+/// server-side copy or move instead of re-uploading the body.
+///
+/// `None` on the placement means a genuine append (new content the server
+/// has never seen); `Some` means the body is already a member of `collection`
+/// under `handle`, so the push issues a copy or move from there.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Origin {
+    /// The collection the source member lives in.
+    pub collection: CollectionId,
+    /// The source member's handle.
+    pub handle: Handle,
 }
 
 /// The last-synced state a placement reconciles against.
@@ -161,4 +179,7 @@ pub struct Placement {
     pub status: Status,
     /// The last-synced base; `None` until first reconciled.
     pub base: Option<Base>,
+    /// For a [`Status::Created`] placement, where its body already lives so
+    /// the push can copy or move it; `None` otherwise (and for an append).
+    pub origin: Option<Origin>,
 }

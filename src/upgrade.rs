@@ -298,6 +298,7 @@ mod tests {
             flags: Flags::default(),
             status: Status::Clean,
             base: None,
+            origin: None,
         }
     }
 

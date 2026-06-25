@@ -9,23 +9,26 @@ use alloc::vec::Vec;
 use crate::{
     collection::{Checkpoint, CollectionId},
     object::Object,
-    placement::{Base, Flags, Handle, Placement},
+    placement::{Base, Flags, Handle, Origin, Placement},
 };
 
 /// A change to push to the remote.
 ///
-/// Membership is add or remove only; a move is a remove from the source
-/// plus an add to the target. On backends without a native move this is a
-/// copy then delete, acceptable for v1.
+/// Membership is add or remove only; a move is the target add plus the
+/// source remove. An add reuses a server-side copy or move when it carries
+/// an [`Origin`], else it uploads the [`Object`] body (a genuine append).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Change {
-    /// Add a member, carrying the object body to upload.
+    /// Add a member. The push reconciles the provisional `handle` to the
+    /// server-assigned one (returned as [`crate::remote::PushResult::assigned`]).
     Add {
-        /// The handle the member will be known by (provisional until the
-        /// next enumerate reconciles it by link id).
+        /// The provisional handle the member is staged under locally.
         handle: Handle,
-        /// The body to upload.
-        object: Object,
+        /// Where the body already lives, for a server-side copy or move;
+        /// `None` for an append that uploads `object`.
+        origin: Option<Origin>,
+        /// The body to upload when there is no `origin` (an append).
+        object: Option<Object>,
     },
     /// Remove a member.
     Remove(Handle),

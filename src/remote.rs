@@ -85,8 +85,11 @@ pub enum PushOutcome {
 /// The result of pushing one change.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PushResult {
-    /// The handle the change targeted.
+    /// The handle the change targeted (the provisional one for an add).
     pub handle: Handle,
     /// Whether the remote accepted it.
     pub outcome: PushOutcome,
+    /// For an accepted add, the server-assigned handle the engine rekeys
+    /// the provisional placement to; `None` for flag and remove pushes.
+    pub assigned: Option<Handle>,
 }
