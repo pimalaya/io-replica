@@ -30,8 +30,15 @@ pub enum Change {
         /// The body to upload when there is no `origin` (an append).
         object: Option<Object>,
     },
-    /// Remove a member.
-    Remove(Handle),
+    /// Remove a member. `to` is the collection to move it into (an offline
+    /// move, a server-side UID MOVE); `None` is a plain delete, which the
+    /// consumer routes to trash.
+    Remove {
+        /// The member to remove.
+        handle: Handle,
+        /// The move destination, or `None` for a delete.
+        to: Option<CollectionId>,
+    },
     /// Replace a member's flag set.
     SetFlags {
         /// The member to update.

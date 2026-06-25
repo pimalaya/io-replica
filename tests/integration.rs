@@ -241,27 +241,56 @@ impl Remote for MemRemote {
         changes: Vec<Change>,
     ) -> Result<Vec<PushResult>, Infallible> {
         self.calls += 1;
-        let server = self.items.entry(collection.clone()).or_default();
         let mut results = Vec::new();
 
         for change in changes {
-            let handle = match change {
+            let (handle, assigned) = match change {
                 Change::SetFlags { handle, flags } => {
-                    if let Some(item) = server.get_mut(&handle) {
+                    if let Some(item) = self
+                        .items
+                        .get_mut(collection)
+                        .and_then(|c| c.get_mut(&handle))
+                    {
                         item.flags = flags;
                     }
-                    handle
+                    (handle, None)
                 }
-                Change::Remove(handle) => {
-                    server.remove(&handle);
-                    handle
+                Change::Remove { handle, to } => {
+                    // A move relocates the item; a plain delete drops it.
+                    if let Some(item) = self
+                        .items
+                        .get_mut(collection)
+                        .and_then(|c| c.remove(&handle))
+                        .filter(|_| to.is_some())
+                    {
+                        let target = to.expect("a move target");
+                        self.items
+                            .entry(target)
+                            .or_default()
+                            .insert(Handle::from(format!("{}-moved", handle.as_str())), item);
+                    }
+                    (handle, None)
                 }
-                Change::Add { handle, .. } => handle,
+                // A copy create: server-side copy the origin item into this
+                // collection under a freshly assigned handle (COPYUID).
+                Change::Add { handle, origin, .. } => {
+                    let assigned = origin.and_then(|o| {
+                        let item = self.items.get(&o.collection)?.get(&o.handle)?.clone();
+                        let new = Handle::from(format!("{}-copy", o.handle.as_str()));
+                        self.items
+                            .entry(collection.clone())
+                            .or_default()
+                            .insert(new.clone(), item);
+                        Some(new)
+                    });
+                    (handle, assigned)
+                }
             };
 
             results.push(PushResult {
                 handle,
                 outcome: PushOutcome::Accepted,
+                assigned,
             });
         }
 
@@ -411,4 +440,51 @@ fn full_offline_lifecycle() {
         client.storage().placement("inbox", "i1").status,
         Status::Conflict,
     );
+}
+
+#[test]
+fn offline_copy_creates_pushes_and_rekeys() {
+    let mut client = seeded_client();
+    let opts = OfflineSyncOptions::default();
+
+    // Know the inbox spine, so inbox/i2 is a real placement to copy.
+    client.sync("inbox", opts).unwrap();
+
+    // Copy inbox/i2 into archive offline: a Created placeholder is staged in
+    // archive carrying its origin, and the source is left untouched.
+    client
+        .mutate(
+            "inbox",
+            Mutation::Copy {
+                handle: Handle::from("i2"),
+                target: "archive".into(),
+                placeholder: Handle::from("tmp-i2"),
+            },
+        )
+        .unwrap();
+    let staged = client.storage().placement("archive", "tmp-i2");
+    assert_eq!(staged.status, Status::Created);
+    assert!(staged.origin.is_some());
+    assert_eq!(
+        client.storage().placement("inbox", "i2").status,
+        Status::Clean,
+        "the copy source is untouched",
+    );
+
+    // Syncing archive pushes the create (a server-side copy) and rekeys the
+    // placeholder to the server-assigned handle, clean and based.
+    let report = client.sync("archive", opts).unwrap();
+    assert_eq!(report.pushed, 1);
+    assert!(
+        client
+            .storage()
+            .placements
+            .get(&("archive".into(), Handle::from("tmp-i2")))
+            .is_none(),
+        "the placeholder is dropped once the copy is confirmed",
+    );
+    let real = client.storage().placement("archive", "i2-copy");
+    assert_eq!(real.status, Status::Clean);
+    assert!(real.base.is_some());
+    assert!(real.origin.is_none());
 }

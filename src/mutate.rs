@@ -7,7 +7,7 @@
 
 use core::fmt;
 
-use alloc::string::String;
+use alloc::{string::String, vec::Vec};
 
 use log::{debug, trace};
 use thiserror::Error;
@@ -46,6 +46,16 @@ pub enum Mutation {
         /// The provisional handle the copy is staged under in `target`.
         placeholder: Handle,
     },
+    /// Move a placement into `target`: tombstone the source carrying its
+    /// destination, so the next sync pushes one atomic server-side UID MOVE
+    /// (no body re-upload, no window where it is on neither side). The target
+    /// picks it up on its own next enumerate.
+    Move {
+        /// The source placement to move.
+        handle: Handle,
+        /// The collection to move it into.
+        target: CollectionId,
+    },
 }
 
 impl Mutation {
@@ -55,6 +65,7 @@ impl Mutation {
             Self::SetFlags { handle, .. } => handle,
             Self::Remove(handle) => handle,
             Self::Copy { handle, .. } => handle,
+            Self::Move { handle, .. } => handle,
         }
     }
 }
@@ -96,16 +107,16 @@ impl OfflineMutate {
     /// Stages the writes for the mutation given its loaded source placement.
     /// Flags and removes rewrite the source in place; a copy leaves the
     /// source untouched and stages a pending create in the target.
-    fn writes(&self, mut source: Placement) -> alloc::vec::Vec<WriteOp> {
+    fn writes(&self, mut source: Placement) -> Vec<WriteOp> {
         match &self.mutation {
             Mutation::SetFlags { flags, .. } => {
                 source.flags = flags.clone();
                 source.status = Status::Dirty;
-                alloc::vec![WriteOp::UpsertPlacement(source)]
+                vec![WriteOp::UpsertPlacement(source)]
             }
             Mutation::Remove(_) => {
                 source.status = Status::Tombstone;
-                alloc::vec![WriteOp::UpsertPlacement(source)]
+                vec![WriteOp::UpsertPlacement(source)]
             }
             Mutation::Copy {
                 target,
@@ -127,7 +138,19 @@ impl OfflineMutate {
                         handle: source.handle.clone(),
                     }),
                 };
-                alloc::vec![WriteOp::UpsertPlacement(create)]
+                vec![WriteOp::UpsertPlacement(create)]
+            }
+            Mutation::Move { target, .. } => {
+                // Tombstone the source, carrying the move destination in its
+                // origin so the sync pushes a UID MOVE rather than a trash
+                // delete. No target placement: it appears there on the next
+                // enumerate.
+                source.status = Status::Tombstone;
+                source.origin = Some(Origin {
+                    collection: target.clone(),
+                    handle: source.handle.clone(),
+                });
+                vec![WriteOp::UpsertPlacement(source)]
             }
         }
     }
@@ -325,5 +348,39 @@ mod tests {
         let origin = p.origin.as_ref().expect("the copy carries its origin");
         assert_eq!(origin.collection.as_str(), "inbox");
         assert_eq!(origin.handle.as_str(), "1");
+    }
+
+    #[test]
+    fn move_tombstones_source_with_target() {
+        // A move tombstones the source and records its destination in origin,
+        // so the sync pushes a UID MOVE rather than a trash delete.
+        let mutation = Mutation::Move {
+            handle: Handle::from("1"),
+            target: "archive".into(),
+        };
+        let mut mutate = OfflineMutate::new("inbox", mutation);
+        let _ = mutate.resume(None);
+
+        let ops = match mutate.resume(Some(OfflineArg::Load(loaded("1")))) {
+            OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+        let WriteOp::UpsertPlacement(p) = &ops[0] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[0]);
+        };
+        assert_eq!(
+            p.collection.as_str(),
+            "inbox",
+            "the source row, not a target one"
+        );
+        assert_eq!(p.status, Status::Tombstone);
+        assert_eq!(
+            p.origin
+                .as_ref()
+                .expect("a move target")
+                .collection
+                .as_str(),
+            "archive",
+        );
     }
 }

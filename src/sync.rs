@@ -29,7 +29,7 @@ use crate::{
     remote::{PushOutcome, RemoteItem, RemoteSnapshot},
 };
 
-/// Whether the local side may push to the remote.
+/// Tuning for one sync run: the push direction and the enumerate depth.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OfflineSyncOptions {
     /// When false the source is treated read-only: local changes are kept
@@ -239,7 +239,7 @@ impl OfflineSync {
         let remote_present = remote_item.is_some();
 
         match (local_present, base_present, remote_present) {
-            // local delete: both knew it, we removed it
+            // local delete or move: both knew it, we removed it here
             (false, true, true) if local_tombstone => {
                 if !self.opts.push {
                     // Read-only source: apply the delete locally only.
@@ -247,10 +247,19 @@ impl OfflineSync {
                     return None;
                 }
                 // Hold the drop until the remote confirms it (in PendingPush);
-                // a rejected delete keeps the tombstone for the next retry.
+                // a rejected push keeps the tombstone for the next retry. A
+                // move carries its destination in `origin`; a plain delete has
+                // none, and the consumer routes it to trash.
                 self.pending_drops.insert(handle.clone());
                 self.report.pushed += 1;
-                Some(Change::Remove(handle.clone()))
+                let to = local
+                    .as_ref()
+                    .and_then(|p| p.origin.as_ref())
+                    .map(|o| o.collection.clone());
+                Some(Change::Remove {
+                    handle: handle.clone(),
+                    to,
+                })
             }
             // local delete of something already gone remote
             (false, _, false) if local_tombstone => {
@@ -502,8 +511,14 @@ impl OfflineCoroutine for OfflineSync {
                                 self.drop(&result.handle);
                             }
                             if let Some(placeholder) = self.pending_creates.remove(&result.handle) {
-                                if let Some(assigned) = result.assigned.clone() {
-                                    self.rekey_create(placeholder, assigned);
+                                match result.assigned.clone() {
+                                    // The remote returned the new handle: rekey.
+                                    Some(assigned) => self.rekey_create(placeholder, assigned),
+                                    // No assigned handle (no UIDPLUS): the copy
+                                    // landed, so drop the placeholder; the next
+                                    // enumerate re-adds it by its real handle and
+                                    // links the body by link id.
+                                    None => self.drop(&placeholder.handle),
                                 }
                             }
                         }
@@ -1269,6 +1284,49 @@ mod tests {
                 .iter()
                 .any(|w| matches!(w, WriteOp::DropPlacement { .. })),
             "a rejected create must not drop the placeholder: {writes:?}",
+        );
+        assert!(upserted(&writes, "tmp-1").is_none());
+    }
+
+    #[test]
+    fn move_pushes_remove_with_target() {
+        // A tombstone carrying an origin is a move: it pushes a Remove naming
+        // the destination, so the consumer issues a UID MOVE.
+        let mut local = synced("1", &["seen"]);
+        local.status = Status::Tombstone;
+        local.origin = Some(Origin {
+            collection: "archive".into(),
+            handle: Handle::from("1"),
+        });
+
+        let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
+        let (pushes, _writes, report) = run(&mut sync, vec![local], vec![remote("1", &["seen"])]);
+
+        match &pushes.expect("a push")[0] {
+            Change::Remove { to: Some(to), .. } => assert_eq!(to.as_str(), "archive"),
+            other => panic!("expected a move Remove, got {other:?}"),
+        }
+        assert_eq!(report.pushed, 1);
+    }
+
+    #[test]
+    fn accepted_create_without_assigned_drops_placeholder() {
+        // A copy whose push is accepted with no assigned handle (no UIDPLUS)
+        // drops the placeholder: the next enumerate re-adds the real handle.
+        let local = created("tmp-1");
+        let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
+        let results = vec![PushResult {
+            handle: Handle::from("tmp-1"),
+            outcome: PushOutcome::Accepted,
+            assigned: None,
+        }];
+        let (writes, _report) = drive_push(&mut sync, vec![local], vec![], results);
+
+        assert!(
+            writes.iter().any(
+                |w| matches!(w, WriteOp::DropPlacement { handle, .. } if handle.as_str() == "tmp-1")
+            ),
+            "the placeholder is dropped once the copy lands: {writes:?}",
         );
         assert!(upserted(&writes, "tmp-1").is_none());
     }

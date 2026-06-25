@@ -17,7 +17,7 @@ It is deliberately backend-agnostic and protocol-agnostic: it owns no wire proto
 
 The engine separates *what an item is* from *where it sits*, and never folds the two together. This split is what makes dedup, the unified across-collections view, and a safe partial cache all fall out for free.
 
-- An `Object` (object.rs) is the content-addressed body: a `Hash` (a collision-resistant content hash) plus a byte size. Stored once, the bytes live out of band at blobdir/<hash>, refcounted so copy, move and undelete are reference edits. Where content is immutable the object never changes; where it is mutable an edit is simply a new object (new hash) and the old one is dereferenced.
+- An `Object` (object.rs) is the content-addressed body: a `Hash` (a collision-resistant content hash) plus a byte size. Stored once, the bytes live out of band at blobdir/<hash>, refcounted so copy, move and undelete are reference edits. Where content is immutable the object never changes; where it is mutable an edit is a new object (new hash). The engine only ever adds: it emits `StoreObject`, never a deref op, so dropping the old hash and reclaiming bytes is the consumer's job today (there is no GC `WriteOp` yet).
 - A `Placement` (placement.rs) is one item's presence in one collection. It pins a logical item to a single collection through the protocol `Handle` (an IMAP UID, a WebDAV href, a JMAP id; always a string so non-integer ids are a non-issue), and carries the per-location mutable state.
 
 Many placements may point at one object: this is the dedup and unified-view mechanism. The cross-collection identity is the `LinkId` (placement.rs): a stable content id (the Message-ID header, a vCard or iCalendar UID), never derived from a per-copy value a provider may rewrite. A body present under one collection is linked into another by `LinkId`, so a copied or shared message is fetched and stored once.
@@ -36,9 +36,9 @@ The completeness of the `Probed` spine plus the per-placement base, not the pres
 
 `Status` records how a placement relates to its sync base: `Clean` (in sync), `Dirty` (locally changed, a push pending), `Tombstone` (locally deleted, a remove pending), `Conflict` (both sides diverged, awaiting keep-both resolution), `Created` (locally created under a provisional handle, an add pending; the create path below).
 
-`Base` is the last-synced state the three-way merge reconciles against: the last-synced `flags`, the last-synced `present` membership, and an optional `etag` holding the last-synced content identity for mutable-content backends (mail is immutable, so `etag` stays `None` there). A placement carries `base = None` until first reconciled.
+`Base` is the last-synced state the three-way merge reconciles against: the last-synced `flags`, the last-synced `present` membership, and an optional `etag` reserved for the last-synced content identity of mutable-content backends. Today the merge diffs flags only: `etag` is not yet compared, and `RemoteItem` carries no content token to diff it against, so an in-place content edit (a CalDAV event change) is not yet detected. Mail is immutable, so this is moot for it. A placement carries `base = None` until first reconciled.
 
-A `Collection` (collection.rs) is a mailbox, address book or calendar: a `CollectionId`, a name, and an opaque per-collection `Checkpoint` (a QRESYNC pack, a JMAP state string, a WebDAV sync-token). The engine never inspects the checkpoint; it only round-trips it between storage and remote.
+A `Collection` (collection.rs) is a mailbox, address book or calendar: a `CollectionId`, a name, an opaque per-collection `Checkpoint` (a QRESYNC pack, a JMAP state string, a WebDAV sync-token), and an `enumerated` flag. The engine never inspects the checkpoint; it only round-trips it between storage and remote. The `Collection` struct itself is defined but not yet wired: no verb produces or consumes it (`Loaded` carries placements plus checkpoint directly), so treat it as a reserved carrier for the collection list.
 
 ## The coroutine contract
 
@@ -49,7 +49,7 @@ Every verb is an I/O-free state machine (coroutine.rs). It implements `OfflineCo
 - remote: `WantsCount`, `WantsEnumerate { collection, cursor }`, `WantsFetch { collection, handles, tier }`, `WantsPush { collection, changes }`;
 - storage: `WantsLoad`, `WantsLookupObject(link_ids)`, `WantsWrite(ops)`.
 
-Each yield is paired with the `OfflineArg` the driver feeds back: `Count`, `Enumerate(RemoteSnapshot)`, `Fetch(Vec<FetchedItem>)`, `Push(Vec<PushResult>)`, `Load(Loaded)`, `LookupObject(BTreeMap<LinkId, Hash>)`, `Write`. Outbound effects travel as two payload types (change.rs): `Change` is what to push to the remote (`Add`, `Remove`, `SetFlags`), and `WriteOp` is what to persist locally (`UpsertPlacement`, `DropPlacement`, `StoreObject`, `SetBase`, `SetCheckpoint`). The consumer applies a `WriteOp` batch atomically. A `Change::Add` carries an optional `Origin` (the source collection and handle, for a server-side copy or move that avoids re-uploading the body) and an optional `Object` (the bytes to upload for a genuine append).
+Each yield is paired with the `OfflineArg` the driver feeds back: `Count`, `Enumerate(RemoteSnapshot)`, `Fetch(Vec<FetchedItem>)`, `Push(Vec<PushResult>)`, `Load(Loaded)`, `LookupObject(BTreeMap<LinkId, Hash>)`, `Write`. Outbound effects travel as two payload types (change.rs): `Change` is what to push to the remote (`Add`, `Remove`, `SetFlags`), and `WriteOp` is what to persist locally (`UpsertPlacement`, `DropPlacement`, `StoreObject`, `SetBase`, `SetCheckpoint`). The consumer applies a `WriteOp` batch atomically. A `Change::Add` carries an optional `Origin` (the source collection and handle, for a server-side copy that avoids re-uploading the body) and an optional `Object` (the bytes to upload for a genuine append); a `Change::Remove` carries an optional `to` collection (a move, a server-side UID MOVE), or `None` for a plain delete the consumer routes to trash.
 
 The remote payloads (remote.rs) are the seam's vocabulary: a `RemoteItem` is one enumerate row (handle and flags, deliberately no `LinkId` and no body, because an IMAP SEARCH returns just UIDs and the link id is resolved later at the `Meta` fetch); a `RemoteSnapshot` carries the observed items, the `vanished` handles, a `complete` flag, and the new checkpoint; a `FetchedItem` carries the resolved `LinkId`, the `Meta`, and the body at `Tier::Full`; a `PushResult` carries the per-change `PushOutcome` (`Accepted` or `Rejected`), plus an `assigned` handle the engine rekeys a confirmed create to.
 
@@ -62,16 +62,16 @@ The remote payloads (remote.rs) are the seam's vocabulary: a `RemoteItem` is one
 
 ## The three-way merge
 
-`sync` loads local state, enumerates the remote (full or delta), then runs a three-way merge of Local, Base and Remote per placement, keyed on the handle. The merge compares per-placement identities (the flag set, and a content token for mutable backends), never raw bytes.
+`sync` loads local state, enumerates the remote (full or delta), then runs a three-way merge of Local, Base and Remote per placement, keyed on the handle. The merge compares per-placement identities (today the flag set; a content token for mutable backends is the reserved `etag` slot, not yet wired), never raw bytes.
 
 `reconcile` builds the candidate handle set, then merges each:
 
 - `full_candidates` (complete snapshot): the union of local and remote handles, where a local handle absent from the remote reads as removed upstream.
-- `delta_candidates` (incremental snapshot): the changed handles, the vanished handles, plus every locally `Dirty` or `Tombstone` handle whose pending push the delta would otherwise never revisit. An unlisted dirty handle is unchanged upstream, so its remote state is synthesized from its own base.
+- `delta_candidates` (incremental snapshot): the changed handles, the vanished handles, plus every locally non-clean handle (`Dirty`, `Tombstone`, `Conflict` or `Created`) whose pending push the delta would otherwise never revisit. An unlisted non-clean handle is unchanged upstream, so its remote state is synthesized from its own base.
 
 `merge` dispatches on `(local_present, base_present, remote_present)`:
 
-- local tombstone, was based, still remote: push a `Remove` (held, see below);
+- local tombstone, was based, still remote: push a `Remove` (held, see below), carrying the move destination from `origin` when it is a move rather than a delete;
 - local tombstone, already gone remote: just drop it, no push;
 - based and present locally, vanished remote: remote delete, drop it and count a pull;
 - not local, not based, present remote: remote add, pull a fresh `Probed` placement;
@@ -105,25 +105,23 @@ In the Android app these depths surface as three user actions: Refresh (an incre
 
 The std client (client.rs) is the reference driver: `OfflineClient<S, R>` wraps a consumer `Storage` and a consumer `Remote`, and its generic `run` loop services each yield by calling the matching trait method and resuming with the reply. The four verbs are exposed as `open`, `upgrade`, `mutate` and `sync`. A desktop or Neverest consumer backs `Remote` with io-email's blocking clients and `Storage` with sqlite plus a blob dir.
 
-The Android app (himalaya-android-m3) drives the same coroutines without using `OfflineClient`: it implements an equivalent loop in rust/src/offline.rs that services each yield over two Kotlin transports reached by JNI. The storage seam (rust/src/storage.rs) upcalls a Kotlin `IndexTransport.index(json)` once per request, exchanging JSON: `load`, `lookup`, `write`. On the Kotlin side IndexDb.kt is a raw SQLite store (no Room) translating the engine's placement/object/checkpoint model into its envelope, mailbox and object rows; the engine `Level` (probed/meta/full) and the row state (spine/envelope/full) are the same ladder under two names, and the account-global link index backs the cross-mailbox dedup lookup. The index is a disposable cache, rebuilt on any schema change. The remote seam is io-imap, driven by the engine itself: on `WantsEnumerate` the driver runs SELECT (QRESYNC) plus a `CHANGEDSINCE` flag fetch for a delta, or a full UID listing plus flag fetch for a complete snapshot; on `WantsFetch` it runs ENVELOPE plus FLAGS at the meta tier and a raw body (content-hashed into an object) at the full tier; on `WantsPush` it runs an absolute STORE for flags and a MOVE to trash for a removal.
-
-One constraint runs end to end today: handles are numeric IMAP UIDs everywhere. The Kotlin store keys its envelope rows by `(account, mailbox, uid INTEGER)`, the driver builds every `Handle` from a UID string, and the merge keys on those. Membership creation is not pushed in this cut: the driver reports a `Change::Add` as `Rejected` so the engine never drops a member silently.
+A consumer may also drive the coroutines directly without `OfflineClient`: the Himalaya Android app does, servicing each yield over two Kotlin transports reached by JNI (io-imap as the remote seam, a SQLite index plus a blob dir as the storage seam). That wiring, the JSON contract over JNI, and the IMAP enumerate are app concerns and live in that repo; see the himalaya-android-m3 ARCHITECTURE. Two engine-level facts matter here: a `Handle` is any string (so a consumer's storage keys stay protocol-neutral), and a consumer that does not yet build creates reports `Change::Add` as `Rejected` so the engine keeps the placeholder rather than dropping a member.
 
 ## The create path
 
-The engine core is implemented for copy; move and append, and the whole app wiring, are not. The flow is the membership-add counterpart of the flag and delete pushes, reusing the same confirm-before-rewrite discipline.
+Offline copy and move are wired end to end (the Himalaya app drives them); offline append (a genuinely new message) is the one piece not yet built. All three are the membership counterpart of the flag and delete pushes, reusing the same confirm-before-rewrite discipline.
 
-What exists in the engine (and is unit-tested):
+Copy:
 
-- `mutate`'s `Copy` stages a `Status::Created` placement in the target collection under a provisional placeholder handle, carrying its `Origin` (the source `CollectionId` plus source `Handle`), and leaves the source untouched.
-- `sync`'s merge turns that `Created` placement into a `Change::Add { handle, origin, object }`: `origin` set so the push can reuse a server-side copy or move instead of re-uploading, `object` reserved for an append. The placeholder is stashed in `pending_creates`.
-- On `Accepted` with an `assigned` handle, `rekey_create` drops the placeholder and re-inserts the placement clean and based under the server-assigned handle; on `Rejected` the placeholder stays for the next sync.
+- `mutate`'s `Copy` stages a `Status::Created` placement in the target collection under a provisional placeholder handle, carrying its `Origin` (the source `CollectionId` plus `Handle`), and leaves the source untouched.
+- `sync`'s merge turns that `Created` placement into a `Change::Add { handle, origin, object }`: `origin` set so the push reuses a server-side copy (no body re-upload), `object` reserved for an append. The placeholder is stashed in `pending_creates`.
+- On `Accepted`: if the push reports an `assigned` handle (a UIDPLUS-capable driver), `rekey_create` re-inserts the placement clean and based under it; if not, the placeholder is simply dropped and the real handle is re-added by the target's next enumerate, deduping the body by link id. On `Rejected` the placeholder stays for the next sync.
 
-What is not built:
+Move:
 
-- `mutate` has only `Copy`. Move (a copy plus a source tombstone, ideally pushed as one atomic server-side UID MOVE so there is no window where the message is on neither side) and append (a genuine compose, `origin = None`, pushing the stored object's bytes) are not implemented.
-- The Android driver still reports `Change::Add` as `Rejected`: it does not yet run the UID `COPY`/`MOVE` (or `APPEND`), nor parse the UIDPLUS response (`COPYUID`/`APPENDUID`) into the `assigned` handle.
-- The blocking constraint is the handle type. A provisional placeholder is not a numeric server UID, but the Android store keys placements by `uid INTEGER` and the app threads UIDs as numbers end to end. A create therefore needs either a storage migration to string handles (so a placeholder and a real UID are both representable) or a separate pending-origin side table holding the create intent until its UIDPLUS reconcile lands. The engine does not force the choice: it only needs the handle to be a string, which it already is.
+- `mutate`'s `Move` tombstones the source carrying its destination in `origin` (no target placement), so the merge pushes one `Change::Remove { handle, to: Some(target) }`: the consumer issues a single atomic server-side UID MOVE, never a copy-then-delete with a window where the message is on neither side. The target picks it up on its own next enumerate. (A plain delete is the same `Remove` with `to = None`, routed to trash.)
+
+Not built: append (`origin = None`, pushing the stored object's bytes via the reserved `object` field) for a genuinely new local message (an offline compose or draft). The engine shape is ready; only the `mutate` entry and the driver's `APPEND` are missing.
 
 ## Module layout
 
@@ -132,7 +130,7 @@ src/
   lib.rs          crate root: no_std, module + client-feature gates
   coroutine.rs    OfflineCoroutine / OfflineCoroutineState / OfflineYield / OfflineArg
   object.rs       Object, Hash (content-addressed body)
-  placement.rs    Placement, Handle, LinkId, Meta, Flags, Level, Status, Base
+  placement.rs    Placement, Handle, LinkId, Meta, Flags, Level, Status, Base, Origin
   collection.rs   Collection, CollectionId, Checkpoint
   change.rs       Change (push) + WriteOp (persist)
   remote.rs       RemoteItem, RemoteSnapshot, FetchedItem, PushResult, Tier
@@ -148,4 +146,4 @@ Each verb follows the standard coroutine template: one `new`, a private `State` 
 
 ## Notes for the reader
 
-A few things are defined ahead of their first use, so do not mistake them for dead code: `WantsCount` and the `Remote::count` capability exist for protocols that expose a cheap member count, but no verb emits `WantsCount` yet (the Android driver stubs it to zero). The `WriteOp::SetBase` variant exists for a base-only rewrite, but the sync coroutine currently sets the base inline through `UpsertPlacement` rather than emitting `SetBase`. The create path (the `Created` status, `Change::Add` with its origin, and the rekey on accept) is built and tested in the engine but not yet driven by any app; see the create-path section above.
+A few things are defined ahead of their first use, so do not mistake them for dead code: `WantsCount` and the `Remote::count` capability exist for protocols that expose a cheap member count, but no verb emits `WantsCount` yet (the Android driver stubs it to zero). The `WriteOp::SetBase` variant exists for a base-only rewrite, but the sync coroutine sets the base inline through `UpsertPlacement` rather than emitting `SetBase`. The `Collection` struct (with its `enumerated` flag) is defined but no verb produces or consumes it. The create path (the `Created` status, `Change::Add` with its origin, and the rekey on accept) is built and tested in the engine but not yet driven by any consumer; see the create-path section above.
