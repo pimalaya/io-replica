@@ -190,6 +190,7 @@ impl Remote for MemRemote {
             .map(|(handle, item)| RemoteItem {
                 handle: handle.clone(),
                 flags: item.flags.clone(),
+                revision: None,
             })
             .collect();
 
@@ -229,6 +230,7 @@ impl Remote for MemRemote {
                 link_id: item.link_id.clone(),
                 meta,
                 body,
+                revision: None,
             });
         }
 
@@ -255,7 +257,7 @@ impl Remote for MemRemote {
                     }
                     (handle, None)
                 }
-                Change::Remove { handle, to } => {
+                Change::Remove { handle, to, .. } => {
                     // A move relocates the item; a plain delete drops it.
                     if let Some(item) = self
                         .items
@@ -271,6 +273,9 @@ impl Remote for MemRemote {
                     }
                     (handle, None)
                 }
+                // A content update: this store keeps bodies out of band, so
+                // accepting the push is enough.
+                Change::Update { handle, .. } => (handle, None),
                 // A copy create: server-side copy the origin item into this
                 // collection under a freshly assigned handle (COPYUID).
                 Change::Add { handle, origin, .. } => {
@@ -291,6 +296,7 @@ impl Remote for MemRemote {
                 handle,
                 outcome: PushOutcome::Accepted,
                 assigned,
+                revision: None,
             });
         }
 

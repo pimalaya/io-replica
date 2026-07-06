@@ -146,16 +146,23 @@ pub struct Origin {
 /// The last-synced state a placement reconciles against.
 ///
 /// Where content is immutable only flags and membership mutate, so the
-/// base is `{flags, present}`; where content is mutable, `etag` holds the
-/// last-synced content identity so an in-place edit is detected.
+/// base is `{flags, present}`; where content is mutable, `revision` holds
+/// the last-synced content revision so an in-place edit is detected.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Base {
     /// Last-synced flag set.
     pub flags: Flags,
     /// Last-synced membership in the collection.
     pub present: bool,
-    /// Last-synced content identity for mutable-content backends.
-    pub etag: Option<String>,
+    /// Last-synced content revision for mutable-content backends (a WebDAV
+    /// etag, an MS Graph changeKey); `None` where content is immutable.
+    pub revision: Option<String>,
+    /// Last-synced body, kept pinned in the object store (the consumer
+    /// counts it as a reference) so a content three-way merge has its base
+    /// bytes even after a local edit points the placement at a new object.
+    /// `None` where content is immutable (the current object is always the
+    /// synced one) or while no body has been synced.
+    pub object: Option<Hash>,
 }
 
 /// One item's presence in one collection.
@@ -177,6 +184,10 @@ pub struct Placement {
     pub flags: Flags,
     /// How this placement relates to its base.
     pub status: Status,
+    /// The remote content revision observed when the placement was marked
+    /// [`Status::Conflict`]: what the consumer resolves against (fetch that
+    /// revision's body, merge, then edit). `None` otherwise.
+    pub conflict_revision: Option<String>,
     /// The last-synced base; `None` until first reconciled.
     pub base: Option<Base>,
     /// For a [`Status::Created`] placement, where its body already lives so

@@ -16,7 +16,8 @@ use crate::{
     change::WriteOp,
     collection::CollectionId,
     coroutine::*,
-    placement::{Flags, Handle, Origin, Placement, Status},
+    object::Object,
+    placement::{Flags, Handle, Level, Meta, Origin, Placement, Status},
 };
 
 /// A local edit applied offline.
@@ -35,6 +36,25 @@ pub enum Mutation {
     },
     /// Mark a placement deleted, keeping it as a tombstone until synced.
     Remove(Handle),
+    /// Replace a placement's body with locally edited content: the new
+    /// object is stored, the placement repointed at it and marked dirty;
+    /// the base keeps the previously synced body, so the next sync derives
+    /// the pending push and a content three-way merge keeps its base
+    /// bytes. Editing a conflicted placement resolves it: the remote
+    /// revision observed at conflict time becomes the new base revision,
+    /// so the resolving push is conditioned on the remote state the
+    /// resolution was merged against.
+    Edit {
+        /// The placement to update.
+        handle: Handle,
+        /// The new body's object metadata.
+        object: Object,
+        /// The new body bytes.
+        body: Vec<u8>,
+        /// The refreshed summary, when the consumer projects one; `None`
+        /// keeps the cached summary.
+        meta: Option<Meta>,
+    },
     /// Copy a placement into `target` as a pending create that the next
     /// sync pushes with a server-side copy (no body re-upload). The source
     /// is left untouched.
@@ -64,6 +84,7 @@ impl Mutation {
         match self {
             Self::SetFlags { handle, .. } => handle,
             Self::Remove(handle) => handle,
+            Self::Edit { handle, .. } => handle,
             Self::Copy { handle, .. } => handle,
             Self::Move { handle, .. } => handle,
         }
@@ -118,6 +139,37 @@ impl OfflineMutate {
                 source.status = Status::Tombstone;
                 vec![WriteOp::UpsertPlacement(source)]
             }
+            Mutation::Edit {
+                object, body, meta, ..
+            } => {
+                source.object = Some(object.hash.clone());
+                source.level = Level::Full;
+                if meta.is_some() {
+                    source.meta = meta.clone();
+                }
+
+                // NOTE: editing a conflict is its resolution: the base
+                // adopts the remote revision the resolution was merged
+                // against.
+                if source.status == Status::Conflict {
+                    let revision = source.conflict_revision.take();
+                    if let (Some(base), Some(revision)) = (source.base.as_mut(), revision) {
+                        base.revision = Some(revision);
+                    }
+                }
+
+                if source.status != Status::Created {
+                    source.status = Status::Dirty;
+                }
+
+                vec![
+                    WriteOp::StoreObject {
+                        object: object.clone(),
+                        body: body.clone(),
+                    },
+                    WriteOp::UpsertPlacement(source),
+                ]
+            }
             Mutation::Copy {
                 target,
                 placeholder,
@@ -132,6 +184,7 @@ impl OfflineMutate {
                     meta: source.meta.clone(),
                     flags: source.flags.clone(),
                     status: Status::Created,
+                    conflict_revision: None,
                     base: None,
                     origin: Some(Origin {
                         collection: source.collection.clone(),
@@ -234,11 +287,13 @@ mod tests {
                 level: Level::Meta,
                 meta: None,
                 flags: Flags::default(),
+                conflict_revision: None,
                 status: Status::Clean,
                 base: Some(Base {
                     flags: Flags::default(),
                     present: true,
-                    etag: None,
+                    revision: None,
+                    object: None,
                 }),
                 origin: None,
             }],
@@ -320,6 +375,79 @@ mod tests {
             OfflineCoroutineState::Complete(Err(OfflineMutateError::MissingArg)) => {}
             state => panic!("expected MissingArg, got {state:?}"),
         }
+    }
+
+    #[test]
+    fn edit_stages_a_dirty_body() {
+        // An edit stores the new object, repoints the placement at it at
+        // full level and marks it dirty; the base keeps the synced state so
+        // the next sync derives the push.
+        use crate::object::{Hash, Object};
+
+        let mutation = Mutation::Edit {
+            handle: Handle::from("1"),
+            object: Object {
+                hash: Hash::from("h2"),
+                size: 4,
+            },
+            body: b"body".to_vec(),
+            meta: None,
+        };
+        let mut mutate = OfflineMutate::new("inbox", mutation);
+        let _ = mutate.resume(None);
+
+        let ops = match mutate.resume(Some(OfflineArg::Load(loaded("1")))) {
+            OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+
+        assert!(
+            matches!(&ops[0], WriteOp::StoreObject { object, .. } if object.hash == Hash::from("h2"))
+        );
+        let WriteOp::UpsertPlacement(p) = &ops[1] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[1]);
+        };
+        assert_eq!(p.status, Status::Dirty);
+        assert_eq!(p.object, Some(Hash::from("h2")));
+        assert_eq!(p.level, Level::Full);
+        assert!(p.base.is_some(), "base must be preserved for sync");
+    }
+
+    #[test]
+    fn edit_resolves_a_conflict() {
+        // Editing a conflicted placement is its resolution: the base adopts
+        // the remote revision observed at conflict time, so the resolving
+        // push is gated on the remote state the merge was made against.
+        use crate::object::{Hash, Object};
+
+        let mutation = Mutation::Edit {
+            handle: Handle::from("1"),
+            object: Object {
+                hash: Hash::from("h3"),
+                size: 6,
+            },
+            body: b"merged".to_vec(),
+            meta: None,
+        };
+        let mut mutate = OfflineMutate::new("inbox", mutation);
+        let _ = mutate.resume(None);
+
+        let mut loaded = loaded("1");
+        loaded.placements[0].status = Status::Conflict;
+        loaded.placements[0].conflict_revision = Some("r2".into());
+
+        let ops = match mutate.resume(Some(OfflineArg::Load(loaded))) {
+            OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+        let WriteOp::UpsertPlacement(p) = &ops[1] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[1]);
+        };
+
+        assert_eq!(p.status, Status::Dirty);
+        assert_eq!(p.conflict_revision, None);
+        let base = p.base.as_ref().expect("a base");
+        assert_eq!(base.revision.as_deref(), Some("r2"));
     }
 
     #[test]

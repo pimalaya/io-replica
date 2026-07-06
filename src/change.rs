@@ -6,9 +6,11 @@
 
 use alloc::vec::Vec;
 
+use alloc::string::String;
+
 use crate::{
     collection::{Checkpoint, CollectionId},
-    object::Object,
+    object::{Hash, Object},
     placement::{Base, Flags, Handle, Origin, Placement},
 };
 
@@ -38,6 +40,10 @@ pub enum Change {
         handle: Handle,
         /// The move destination, or `None` for a delete.
         to: Option<CollectionId>,
+        /// The last-synced content revision, as an optimistic-concurrency
+        /// precondition (a WebDAV If-Match); `None` where content is
+        /// immutable or never synced with one.
+        if_match: Option<String>,
     },
     /// Replace a member's flag set.
     SetFlags {
@@ -45,6 +51,17 @@ pub enum Change {
         handle: Handle,
         /// The new flag set.
         flags: Flags,
+    },
+    /// Replace a member's content in place with a locally edited body.
+    Update {
+        /// The member to update.
+        handle: Handle,
+        /// The hash of the new body in the object store.
+        object: Hash,
+        /// The last-synced content revision, as an optimistic-concurrency
+        /// precondition (a WebDAV If-Match); `None` when never based on
+        /// one.
+        if_match: Option<String>,
     },
 }
 

@@ -4,7 +4,7 @@
 //! (io-imap, io-jmap, io-webdav) or io-email's clients: count, enumerate,
 //! fetch and push. These types are what those capabilities return.
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 
 use crate::{
     collection::Checkpoint,
@@ -21,19 +21,25 @@ pub enum Tier {
     Full,
 }
 
-/// One row of an enumerate snapshot: handle and flags, no link id, no body.
+/// One row of an enumerate snapshot: handle, flags and content revision,
+/// no link id, no body.
 ///
-/// Enough to run the flag and membership three-way merge without fetching
-/// any body, which is exactly why a partial body cache stays safe. The
-/// link id is not here: enumeration only has to yield handles (an IMAP
-/// SEARCH returns just UIDs), so the link id is resolved later at the
-/// [`Tier::Meta`] fetch and lands on the placement then.
+/// Enough to run the flag, membership and content three-way merge without
+/// fetching any body, which is exactly why a partial body cache stays
+/// safe. The link id is not here: enumeration only has to yield handles
+/// (an IMAP SEARCH returns just UIDs), so the link id is resolved later at
+/// the [`Tier::Meta`] fetch and lands on the placement then.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteItem {
     /// The protocol handle.
     pub handle: Handle,
     /// The current remote flag set.
     pub flags: Flags,
+    /// The current remote content revision, for mutable-content backends
+    /// (a WebDAV etag, an MS Graph changeKey). `None` where content is
+    /// immutable (IMAP), which the merge reads as unchanged, never as
+    /// unknown.
+    pub revision: Option<String>,
 }
 
 /// The result of enumerating a collection: its full or delta member set
@@ -71,6 +77,9 @@ pub struct FetchedItem {
     pub meta: Meta,
     /// The body and its content hash; `None` at [`Tier::Meta`].
     pub body: Option<(Hash, Vec<u8>)>,
+    /// The remote content revision the fetched body corresponds to, for
+    /// mutable-content backends; `None` where content is immutable.
+    pub revision: Option<String>,
 }
 
 /// The outcome of pushing one change.
@@ -92,4 +101,8 @@ pub struct PushResult {
     /// For an accepted add, the server-assigned handle the engine rekeys
     /// the provisional placement to; `None` for flag and remove pushes.
     pub assigned: Option<Handle>,
+    /// For an accepted push that wrote content (an add, later an update),
+    /// the content revision the remote now holds; `None` when the remote
+    /// does not report one, and for flag and remove pushes.
+    pub revision: Option<String>,
 }

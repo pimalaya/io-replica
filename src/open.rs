@@ -97,6 +97,7 @@ mod tests {
             meta: None,
             flags: Flags::default(),
             status: Status::Clean,
+            conflict_revision: None,
             base: None,
             origin: None,
         }

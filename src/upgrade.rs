@@ -219,6 +219,15 @@ impl OfflineCoroutine for OfflineUpgrade {
                                 size: body.len(),
                             };
                             self.ops.push(WriteOp::StoreObject { object, body });
+
+                            // NOTE: the revision travels with the body: the
+                            // stored object is the remote content as of the
+                            // fetch, so the base records both.
+                            if let Some(base) = &mut patched.base {
+                                base.revision = item.revision.clone();
+                                base.object = Some(hash.clone());
+                            }
+
                             patched.object = Some(hash);
                             patched.level = Level::Full;
                             self.report.fetched += 1;
@@ -281,7 +290,7 @@ mod tests {
 
     use crate::{
         object::Hash,
-        placement::{Flags, LinkId, Meta, Status},
+        placement::{Base, Flags, LinkId, Meta, Status},
         remote::FetchedItem,
         storage::Loaded,
         upgrade::*,
@@ -297,6 +306,7 @@ mod tests {
             meta: None,
             flags: Flags::default(),
             status: Status::Clean,
+            conflict_revision: None,
             base: None,
             origin: None,
         }
@@ -362,6 +372,7 @@ mod tests {
             link_id: LinkId::from("msg-b"),
             meta: Meta("hdr".into()),
             body: Some((Hash::from("h-b"), b"body".to_vec())),
+            revision: None,
         }];
         let ops = match up.resume(Some(OfflineArg::Fetch(items))) {
             OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(ops)) => ops,
@@ -375,6 +386,53 @@ mod tests {
         };
         assert_eq!(report.fetched, 1);
         assert_eq!(report.deduped, 0);
+    }
+
+    #[test]
+    fn full_fetch_stamps_the_base_revision_and_object() {
+        // A fetched body is the remote content as of the fetch: a based
+        // placement records the fetched revision and pins the stored body
+        // as its content base.
+        let mut placement = probed("1", Some("msg-b"), Level::Meta);
+        placement.base = Some(Base {
+            flags: Flags::default(),
+            present: true,
+            revision: None,
+            object: None,
+        });
+        let loaded = Loaded {
+            placements: vec![placement],
+            checkpoint: None,
+        };
+
+        let mut up = OfflineUpgrade::new("inbox", vec![Handle::from("1")], Tier::Full);
+        let _ = up.resume(None);
+        let _ = up.resume(Some(OfflineArg::Load(loaded)));
+        let _ = up.resume(Some(OfflineArg::LookupObject(BTreeMap::new())));
+
+        let items = vec![FetchedItem {
+            handle: Handle::from("1"),
+            link_id: LinkId::from("msg-b"),
+            meta: Meta("hdr".into()),
+            body: Some((Hash::from("h-b"), b"body".to_vec())),
+            revision: Some("r7".into()),
+        }];
+        let ops = match up.resume(Some(OfflineArg::Fetch(items))) {
+            OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+
+        let patched = ops
+            .iter()
+            .find_map(|op| match op {
+                WriteOp::UpsertPlacement(p) => Some(p),
+                _ => None,
+            })
+            .expect("an upserted placement");
+        let base = patched.base.as_ref().expect("a base");
+        assert_eq!(base.revision.as_deref(), Some("r7"));
+        assert_eq!(base.object, Some(Hash::from("h-b")));
+        assert_eq!(patched.object, Some(Hash::from("h-b")));
     }
 
     #[test]

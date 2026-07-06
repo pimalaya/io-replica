@@ -21,7 +21,9 @@ Each placement sits at one rung of a level ladder, where each rung includes the 
 
 ## Verbs
 
-Four coroutines: `open` (load a collection, fully offline), `upgrade` (pull a level, no merge, dedup before fetching a body), `mutate` (write flags or membership locally, mark dirty, no network), and `sync` (derive local changes, pull the remote delta, three-way merge against the base, write the new base and checkpoint).
+Four coroutines: `open` (load a collection, fully offline), `upgrade` (pull a level, no merge, dedup before fetching a body), `mutate` (write flags, content or membership locally, mark dirty, no network), and `sync` (derive local changes, pull the remote delta, three-way merge against the base, write the new base and checkpoint).
+
+For mutable-content backends (CardDAV, CalDAV), content changes ride a per-item revision (a WebDAV etag): a local edit pushes an in-place update gated on the last-synced revision, a remote edit drops the stale body for an on-demand refetch, and a divergence marks the placement conflicted, carrying the observed remote revision so the consumer can merge the content itself (vcard-rs for contacts) and resolve with an edit. Immutable-content backends (IMAP) report no revision and stage no edit, so their merge stays flags and membership only.
 
 ## AI disclosure
 
