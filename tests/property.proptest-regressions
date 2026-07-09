@@ -1,0 +1,20 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc dca5833583136bdd1deddfa78d45b388b199ef94d792e680360aa863e67b253d # shrinks to ops = [ServerEdit(557402394638131760, 0), LocalEdit(11523519978271324952, 0)]
+cc 2543fe9b79284d4bf5d584f178204ec6d270d277bdf17d9158443c21544c9211 # shrinks to ops = [Sync, Sync, ServerSetFlags(0, Flags({})), LocalSetFlags(0, Flags({})), LocalSetFlags(0, Flags({})), LocalSetFlags(0, Flags({}))], crash_after = 10
+cc 9709626cc8300692761123efae5603e9524216afb65bfc95fc0bd3ecc0da9959 # shrinks to ops = [ServerRemove(1963250931453251480), ServerEdit(0, 0), ServerSetFlags(0, Flags({"flagged"})), LocalEdit(1135739937157415015, 0), Sync, LocalRemove(0)]
+cc c5d2683d259fcbd914c7866dc2c2b7cab4e7b256f791b4036937e9a3df9a6717 # shrinks to ops = [Sync, ServerAdd(38), Sync, LocalSetFlags(0, Flags({})), LocalEdit(11488286495829891506, 0), Sync, LocalRemove(2232789621198088677), Sync, ServerAdd(38), ServerSetFlags(4662841179732305857, Flags({"seen"}))], crash_after = 5
+cc 359d51bce7970916407a290a20d81e7bba358283442688335caf27dc677a4196 # shrinks to ops = [LocalSetFlags(0, Flags({})), ServerEdit(9587673678059703428, 0), LocalMove(12285484583905876826)]
+cc 284c8ea51e331be509ac092352b0eec2dceb31fbf79b462fdebc103ec036d41c # shrinks to ops = [Sync, LocalSetFlags(0, Flags({})), LocalEdit(0, 0), LocalEdit(0, 0), ServerSetFlags(0, Flags({})), LocalSetFlags(0, Flags({})), LocalSetFlags(0, Flags({})), LocalEdit(0, 0), ServerSetFlags(0, Flags({})), LocalMove(3889285590442085690), LocalEdit(5852942682352631525, 119), LocalEdit(18368858947423843881, 227), ServerRemove(1706416586577173191), Sync, LocalRemove(5181976679334720262)], crash_after = 10
+cc a11dc4390380440d579f15882a051ac1878c35b72b199fd122164eb5d88b3568 # shrinks to ops = [ServerSetFlags(1477026811058593951, Flags({})), LocalSetFlags(1620710514686747935, Flags({"seen"}))], crash_after = 2
+cc 1e61cc6d66a72124df6a73a3df935cc4e7b83673633392731f9e02561db2b4c3 # shrinks to ops = [LocalMove(4981912415980751299), ServerRemove(11905337856271907575), ServerSetFlags(0, Flags({"flagged"})), LocalSetFlags(0, Flags({}))]
+cc d87b3b6738d30fdcfc3d29115b2149ac647bd0949dccbc5cf33fe4a26fe09043 # shrinks to ops = [LocalEdit(8046694581227984089, 0), LocalSetFlags(10695452185280597, Flags({})), Sync, ServerRemove(2646139017811393273)], crash_after = 4
+cc b8bd8c19878349d628e3ffda8f4f054aa92c6ddb33c49d9fcf8d7bc1241c72c3 # shrinks to ops = [LocalRemove(0), Sync, LocalEdit(0, 0), ServerRemove(0), Sync, LocalEdit(0, 0)]
+cc 8f24d232c26dd6e67c986d90d86d78cd6901aa528db5cc1a113fa3584764d3bc # shrinks to ops = [Upgrade(4231617453485268575), LocalEdit(7253838734198178799, 0), LocalMove(8384027992709167087), Upgrade(0)], crash_after = 5
+cc 8d20e43847831fb15b3e05c1c1e25f0af6584e179d56d80796a36be8ef28956b # shrinks to ops = [LocalEdit(0, 0), ServerSetFlags(0, Flags({})), Sync, Bump, LocalMove(39577130958355886), ServerEdit(4380278204943753373, 0)]
+cc 05e876b3c43b13279c8bc8f54d76df17f51a7af48da52d8fa08e928bb51f2469 # shrinks to ops = [Upgrade(0), LocalEdit(0, 0), ServerEdit(0, 0), Bump, LocalSetFlags(0, Flags({})), Sync, Bump, LocalEdit(1847393290279647333, 0)], crash_after = 1
+cc b51200cbc6e58fd6849da176838e1e5c37433e91eac7d816a101f8569be1bd71 # shrinks to ops = [LocalRemove(0), LocalEdit(0, 0), Sync, Bump, LocalEdit(0, 0)]

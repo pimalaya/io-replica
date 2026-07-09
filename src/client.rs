@@ -20,6 +20,7 @@ use crate::{
     object::Hash,
     open::{OfflineOpen, OfflineOpenError},
     placement::{Handle, LinkId},
+    rekey::{OfflineRekey, OfflineRekeyError, OfflineRekeyReport},
     remote::{FetchedItem, PushResult, RemoteSnapshot, Tier},
     storage::Loaded,
     sync::{OfflineSync, OfflineSyncError, OfflineSyncOptions, OfflineSyncReport},
@@ -37,7 +38,14 @@ pub trait Storage {
     /// Resolves which link ids already map to a stored object.
     fn lookup_objects(&self, links: &[LinkId]) -> Result<BTreeMap<LinkId, Hash>, Self::Error>;
 
-    /// Applies a batch of writes atomically.
+    /// Applies a batch of writes atomically, maintaining the
+    /// pointer-derived object references [`WriteOp`] documents.
+    ///
+    /// The engine assumes a single writer per collection between a load
+    /// and the write derived from it: a batch applied over state another
+    /// actor changed in between clobbers that change. How the guarantee
+    /// is provided is the storage's business (a sqlite transaction, a
+    /// lock file, process-level serialization).
     fn write(&mut self, ops: Vec<WriteOp>) -> Result<(), Self::Error>;
 }
 
@@ -45,10 +53,6 @@ pub trait Storage {
 pub trait Remote {
     /// The error this remote raises.
     type Error;
-
-    /// Reports the remote member count, when the protocol offers one
-    /// cheaply.
-    fn count(&mut self, collection: &CollectionId) -> Result<usize, Self::Error>;
 
     /// Enumerates the collection: a full set, or a delta from `cursor`.
     fn enumerate(
@@ -66,6 +70,10 @@ pub trait Remote {
     ) -> Result<Vec<FetchedItem>, Self::Error>;
 
     /// Pushes each change, returning a per-change outcome.
+    ///
+    /// Pushes are at-least-once: a crash between a serviced push and its
+    /// recording write replays the change on the next sync, so the
+    /// consumer keeps retries harmless (see [`Change`]).
     fn push(
         &mut self,
         collection: &CollectionId,
@@ -160,13 +168,6 @@ where
                 OfflineCoroutineState::Complete(Err(err)) => {
                     return Err(OfflineClientError::Coroutine(err));
                 }
-                OfflineCoroutineState::Yielded(OfflineYield::WantsCount(collection)) => {
-                    let count = self
-                        .remote
-                        .count(&collection)
-                        .map_err(OfflineClientError::Remote)?;
-                    arg = Some(OfflineArg::Count(count));
-                }
                 OfflineCoroutineState::Yielded(OfflineYield::WantsEnumerate {
                     collection,
                     cursor,
@@ -257,5 +258,14 @@ where
         opts: OfflineSyncOptions,
     ) -> Result<OfflineSyncReport, OfflineClientError<S::Error, R::Error, OfflineSyncError>> {
         self.run(OfflineSync::new(collection, opts))
+    }
+
+    /// Rebuilds a collection after a handle-space change (an IMAP
+    /// UIDVALIDITY bump), carrying local state over by link id.
+    pub fn rekey(
+        &mut self,
+        collection: impl Into<CollectionId>,
+    ) -> Result<OfflineRekeyReport, OfflineClientError<S::Error, R::Error, OfflineRekeyError>> {
+        self.run(OfflineRekey::new(collection))
     }
 }

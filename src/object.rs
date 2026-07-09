@@ -46,3 +46,18 @@ pub struct Object {
     /// The byte size of the content.
     pub size: usize,
 }
+
+#[cfg(test)]
+mod tests {
+    use alloc::string::String;
+
+    use crate::object::Hash;
+
+    #[test]
+    fn hash_converts_from_owned_and_borrowed_strings() {
+        let owned = Hash::from(String::from("abc"));
+        let borrowed = Hash::from("abc");
+        assert_eq!(owned, borrowed);
+        assert_eq!(owned.as_str(), "abc");
+    }
+}

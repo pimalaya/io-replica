@@ -45,3 +45,18 @@ pub struct Collection {
     /// Whether the probed spine is complete as of the checkpoint.
     pub enumerated: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use alloc::string::String;
+
+    use crate::collection::CollectionId;
+
+    #[test]
+    fn id_converts_from_owned_and_borrowed_strings() {
+        let owned = CollectionId::from(String::from("inbox"));
+        let borrowed = CollectionId::from("inbox");
+        assert_eq!(owned, borrowed);
+        assert_eq!(owned.as_str(), "inbox");
+    }
+}

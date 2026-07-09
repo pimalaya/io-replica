@@ -7,8 +7,8 @@
 //!
 //! Every verb in this crate (open, upgrade, mutate, sync) picks the
 //! standard [`OfflineYield`] directly: it gathers every effect the engine
-//! emits, both remote (count, enumerate, fetch, push) and storage (load,
-//! lookup object, write). The engine performs none of them; a consumer
+//! emits, both remote (enumerate, fetch, push) and storage (load, lookup
+//! object, write). The engine performs none of them; a consumer
 //! services each yield and resumes the coroutine with the matching
 //! [`OfflineArg`].
 //!
@@ -69,10 +69,6 @@ pub trait OfflineCoroutine {
 /// seam, the second the storage seam.
 #[derive(Debug)]
 pub enum OfflineYield {
-    /// Consumer must report the remote member count and feed back
-    /// [`OfflineArg::Count`].
-    WantsCount(CollectionId),
-
     /// Consumer must enumerate the remote collection (full, or delta from
     /// `cursor`) and feed back [`OfflineArg::Enumerate`].
     WantsEnumerate {
@@ -122,8 +118,6 @@ pub enum OfflineYield {
 /// carries the value the driver gathered while servicing it.
 #[derive(Clone, Debug)]
 pub enum OfflineArg {
-    /// Reply to [`OfflineYield::WantsCount`].
-    Count(usize),
     /// Reply to [`OfflineYield::WantsEnumerate`].
     Enumerate(RemoteSnapshot),
     /// Reply to [`OfflineYield::WantsFetch`].

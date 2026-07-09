@@ -10,14 +10,14 @@ io-offline is an **offline-first replica engine library**: it maintains a local 
 
 It is deliberately backend-agnostic and protocol-agnostic: it owns no wire protocol and no on-disk format. It speaks two seams, storage and remote, both expressed as coroutine yields, so a consumer wires it to whatever it likes (sqlite plus a blob dir on desktop, io-imap over JNI plus an Android sqlite store on mobile). The crate has two of the three standard layers; there is no CLI:
 
-1. **I/O-free coroutines** (`no_std` core, always present): the whole replica logic, four verbs, emitting `Wants` for both storage and remote effects.
+1. **I/O-free coroutines** (`no_std` core, always present): the whole replica logic, five verbs, emitting `Wants` for both storage and remote effects.
 2. **Std client** (`client` feature): a blocking driver, `OfflineClient`, that services those `Wants` through a `Storage` and a `Remote` trait the consumer implements.
 
 ## The core model: two identity axes, never collapsed
 
 The engine separates *what an item is* from *where it sits*, and never folds the two together. This split is what makes dedup, the unified across-collections view, and a safe partial cache all fall out for free.
 
-- An `Object` (object.rs) is the content-addressed body: a `Hash` (a collision-resistant content hash) plus a byte size. Stored once, the bytes live out of band at blobdir/<hash>, refcounted so copy, move and undelete are reference edits. Where content is immutable the object never changes; where it is mutable an edit is a new object (new hash). The engine only ever adds: it emits `StoreObject`, never a deref op, so dropping the old hash and reclaiming bytes is the consumer's job today (there is no GC `WriteOp` yet).
+- An `Object` (object.rs) is the content-addressed body: a `Hash` (a collision-resistant content hash) plus a byte size. Stored once, the bytes live out of band at blobdir/<hash>, refcounted so copy, move and undelete are reference edits. Where content is immutable the object never changes; where it is mutable an edit is a new object (new hash). References derive from placement pointers (`Placement::object` and `Base::object`): the consumer maintains the counts by diffing each `UpsertPlacement` against the row it replaces and releasing both pointers of a `DropPlacement`, and may garbage-collect an object no placement points at. `StoreObject` stores bytes and takes no reference of its own.
 - A `Placement` (placement.rs) is one item's presence in one collection. It pins a logical item to a single collection through the protocol `Handle` (an IMAP UID, a WebDAV href, a JMAP id; always a string so non-integer ids are a non-issue), and carries the per-location mutable state.
 
 Many placements may point at one object: this is the dedup and unified-view mechanism. The cross-collection identity is the `LinkId` (placement.rs): a stable content id (the Message-ID header, a vCard or iCalendar UID), never derived from a per-copy value a provider may rewrite. A body present under one collection is linked into another by `LinkId`, so a copied or shared message is fetched and stored once.
@@ -34,9 +34,9 @@ The completeness of the `Probed` spine plus the per-placement base, not the pres
 
 ### Status and base
 
-`Status` records how a placement relates to its sync base: `Clean` (in sync), `Dirty` (locally changed, a push pending), `Tombstone` (locally deleted, a remove pending), `Conflict` (both sides diverged, awaiting keep-both resolution), `Created` (locally created under a provisional handle, an add pending; the create path below).
+`Status` records how a placement relates to its sync base: `Clean` (in sync), `Dirty` (locally changed, a push pending), `Tombstone` (locally deleted, a remove pending), `Conflict` (content diverged on both sides, awaiting keep-both resolution; flags never conflict, they merge element-wise), `Created` (locally created under a provisional handle, an add pending; the create path below).
 
-`Base` is the last-synced state the three-way merge reconciles against: the last-synced `flags`, the last-synced `present` membership, and an optional `etag` reserved for the last-synced content identity of mutable-content backends. Today the merge diffs flags only: `etag` is not yet compared, and `RemoteItem` carries no content token to diff it against, so an in-place content edit (a CalDAV event change) is not yet detected. Mail is immutable, so this is moot for it. A placement carries `base = None` until first reconciled.
+`Base` is the last-synced state the three-way merge reconciles against: the last-synced `flags`, an optional `revision` (the last-synced content revision of mutable-content backends: a WebDAV etag, an MS Graph changeKey), and an optional `object` pinning the last-synced body so a content merge keeps its base bytes after a local edit repoints the placement. The base's existence is the membership base: a based placement was a member as of the last sync, and `base = None` means never reconciled. Immutable-content backends (IMAP) report no revision, which the merge reads as unchanged, never as unknown.
 
 A `Collection` (collection.rs) is a mailbox, address book or calendar: a `CollectionId`, a name, an opaque per-collection `Checkpoint` (a QRESYNC pack, a JMAP state string, a WebDAV sync-token), and an `enumerated` flag. The engine never inspects the checkpoint; it only round-trips it between storage and remote. The `Collection` struct itself is defined but not yet wired: no verb produces or consumes it (`Loaded` carries placements plus checkpoint directly), so treat it as a reserved carrier for the collection list.
 
@@ -46,49 +46,54 @@ Every verb is an I/O-free state machine (coroutine.rs). It implements `OfflineCo
 
 `OfflineYield` gathers every effect, the remote seam first, the storage seam second:
 
-- remote: `WantsCount`, `WantsEnumerate { collection, cursor }`, `WantsFetch { collection, handles, tier }`, `WantsPush { collection, changes }`;
+- remote: `WantsEnumerate { collection, cursor }`, `WantsFetch { collection, handles, tier }`, `WantsPush { collection, changes }`;
 - storage: `WantsLoad`, `WantsLookupObject(link_ids)`, `WantsWrite(ops)`.
 
-Each yield is paired with the `OfflineArg` the driver feeds back: `Count`, `Enumerate(RemoteSnapshot)`, `Fetch(Vec<FetchedItem>)`, `Push(Vec<PushResult>)`, `Load(Loaded)`, `LookupObject(BTreeMap<LinkId, Hash>)`, `Write`. Outbound effects travel as two payload types (change.rs): `Change` is what to push to the remote (`Add`, `Remove`, `SetFlags`), and `WriteOp` is what to persist locally (`UpsertPlacement`, `DropPlacement`, `StoreObject`, `SetBase`, `SetCheckpoint`). The consumer applies a `WriteOp` batch atomically. A `Change::Add` carries an optional `Origin` (the source collection and handle, for a server-side copy that avoids re-uploading the body) and an optional `Object` (the bytes to upload for a genuine append); a `Change::Remove` carries an optional `to` collection (a move, a server-side UID MOVE), or `None` for a plain delete the consumer routes to trash.
+Each yield is paired with the `OfflineArg` the driver feeds back: `Enumerate(RemoteSnapshot)`, `Fetch(Vec<FetchedItem>)`, `Push(Vec<PushResult>)`, `Load(Loaded)`, `LookupObject(BTreeMap<LinkId, Hash>)`, `Write`. Outbound effects travel as two payload types (change.rs): `Change` is what to push to the remote (`Add`, `Remove`, `SetFlags`, `Update`), and `WriteOp` is what to persist locally (`UpsertPlacement`, `DropPlacement`, `StoreObject`, `SetCheckpoint`). The consumer applies a `WriteOp` batch atomically. A `Change::Add` carries an optional `Origin` (the source collection and handle, for a server-side copy that avoids re-uploading the body), an optional object `Hash` (the stored body to upload for a genuine append), the `Flags` to create the member with (an IMAP APPEND flag list; a copy may ignore it, the skew reconciles on the next sync), and an optional `LinkId` (the idempotency key for a retried add); a `Change::Remove` carries an optional `to` collection (a move, a server-side UID MOVE), or `None` for a plain delete the consumer routes to trash; a `Change::Update` replaces a member's content in place, gated on the last-synced revision (`if_match`).
+
+Pushes are at-least-once: a crash between a serviced push and the storage write that records it replays the change on the next sync. Flag and content pushes re-apply harmlessly; the consumer keeps the other two harmless by treating a remove of an already-missing member as `Accepted` and by using an add's `link_id` to detect that it already landed instead of duplicating it.
 
 The remote payloads (remote.rs) are the seam's vocabulary: a `RemoteItem` is one enumerate row (handle and flags, deliberately no `LinkId` and no body, because an IMAP SEARCH returns just UIDs and the link id is resolved later at the `Meta` fetch); a `RemoteSnapshot` carries the observed items, the `vanished` handles, a `complete` flag, and the new checkpoint; a `FetchedItem` carries the resolved `LinkId`, the `Meta`, and the body at `Tier::Full`; a `PushResult` carries the per-change `PushOutcome` (`Accepted` or `Rejected`), plus an `assigned` handle the engine rekeys a confirmed create to.
 
-## The four verbs
+## The five verbs
 
 - `open` (open.rs): a single storage `WantsLoad`, handing the placements and checkpoint straight back. No network is ever touched; this is the fully-offline collection open.
 - `upgrade` (upgrade.rs): a pure pull to a higher level, never a merge. For `Tier::Full` it first resolves the targeted placements' link ids against the object store (`WantsLookupObject`): a body already stored under another collection is linked without any round-trip (the dedup path), and only the misses are fetched. This stores one body for an item that appears in several collections at once.
-- `mutate` (mutate.rs): a local edit with no network. It loads the source placement and stages the resulting writes. A `SetFlags` rewrites the source `Dirty`, a `Remove` rewrites it `Tombstone` (the base left untouched so the next sync derives the push), and a `Copy` leaves the source untouched and stages a `Status::Created` placement in the target collection, carrying its `Origin`, under a provisional placeholder handle. Move and append reuse this create staging and are not built yet.
+- `mutate` (mutate.rs): a local edit with no network. It loads the source placement and stages the resulting writes. A `SetFlags` rewrites the source `Dirty` (a `Created` or `Conflict` placement keeps its status; the flag change rides along), a `Remove` rewrites it `Tombstone` (the base left untouched so the next sync derives the push), an `Edit` stores the new body and repoints the placement at it dirty (editing a conflicted placement is its resolution: the base adopts the remote revision observed at conflict time), a `Copy` leaves the source untouched and stages a `Status::Created` placement in the target collection, carrying its `Origin`, under a provisional placeholder handle, and a `Move` tombstones the source carrying its destination in `origin` so the sync pushes one atomic server-side move.
 - `sync` (sync.rs): the load-bearing verb, below.
+- `rekey` (rekey.rs): the recovery verb for a handle-space change (an IMAP UIDVALIDITY bump renumbers every UID). It enumerates the new spine in full, resolves the new link ids at the meta tier, and carries every old placement over to the new handle of the same logical item: the cache (level, summary, body) survives without a refetch, a pending flag delta re-derives against the new base, a tombstone keeps its pending remove and move destination, a staged edit keeps its body (its first push is last-writer-wins: the old revision chain died with the old handles). Pending state whose link id was never resolved cannot be matched; it is dropped and counted in the report. Pending creates are local staging, not spine, and are left untouched.
 
 ## The three-way merge
 
-`sync` loads local state, enumerates the remote (full or delta), then runs a three-way merge of Local, Base and Remote per placement, keyed on the handle. The merge compares per-placement identities (today the flag set; a content token for mutable backends is the reserved `etag` slot, not yet wired), never raw bytes.
+`sync` loads local state, enumerates the remote (full or delta), then runs a three-way merge of Local, Base and Remote per placement, keyed on the handle. The merge compares per-placement identities (the flag set, and for mutable-content backends the content `revision`), never raw bytes.
 
 `reconcile` builds the candidate handle set, then merges each:
 
 - `full_candidates` (complete snapshot): the union of local and remote handles, where a local handle absent from the remote reads as removed upstream.
 - `delta_candidates` (incremental snapshot): the changed handles, the vanished handles, plus every locally non-clean handle (`Dirty`, `Tombstone`, `Conflict` or `Created`) whose pending push the delta would otherwise never revisit. An unlisted non-clean handle is unchanged upstream, so its remote state is synthesized from its own base.
 
-`merge` dispatches on `(local_present, base_present, remote_present)`:
+`merge` dispatches on `(local_present, based, remote_present)`:
 
-- local tombstone, was based, still remote: push a `Remove` (held, see below), carrying the move destination from `origin` when it is a move rather than a delete;
+- local tombstone, was based, still remote: push a `Remove` (held, see below), carrying the move destination from `origin` when it is a move rather than a delete; unless the remote revision moved past the base, in which case the remote edit beats the local delete and the placement is re-pulled fresh;
 - local tombstone, already gone remote: just drop it, no push;
-- based and present locally, vanished remote: remote delete, drop it and count a pull;
+- based and present locally, vanished remote: remote delete, drop it and count a pull; unless the placement carries a staged content edit (dirty or conflicted), in which case the edit beats the delete and the placement converts to a pending create that re-uploads the edited body (held, see below; a conflict is moot once the remote side is gone);
 - not local, not based, present remote: remote add, pull a fresh `Probed` placement;
-- present on both: reconcile flags;
-- present locally, never based, not upstream: if `Status::Created`, push a `Change::Add` carrying its origin (held, see below); any other base-less placement is left untouched.
+- present on both: reconcile content, then flags;
+- present locally, never based, not upstream: if `Status::Created`, push a `Change::Add` carrying its origin or its stored body (held, see below); any other base-less placement is left untouched.
 
-`reconcile_flags` is the flag-level three-way merge against `base.flags`: local-only change pushes a `SetFlags` (held), remote-only change pulls, an identical convergence on both sides rebases clean with no push, and a divergence is written back as `Status::Conflict` keeping the local flags and the original base so it can be re-resolved later rather than silently losing a side. A placement present on both but never based converges on the remote.
+`reconcile_content` runs first for a placement present on both sides, reading positive signals only: the local side changed when a dirty placement points at a body its base does not hold, the remote side when the enumerate reported a revision differing from the base. A local-only edit pushes an `Update` gated on the base revision (held); a remote-only edit drops the stale body for an on-demand refetch (the level falls back to `Probed`, keeping the stale summary as a display fallback) and rebases the revision; a divergence marks the placement `Status::Conflict` carrying the observed remote revision, so the consumer merges the content itself and resolves with an edit. An unresolved conflict is left alone, only its observed remote revision tracks the latest remote.
 
-`OfflineSyncReport` counts `pulled`, `pushed`, `conflicts` and `rejected`.
+`reconcile_flags` is an element-wise three-way merge against `base.flags` (`Flags::merge`): each flag is independent, the side that changed a flag's presence from the base wins for that flag, and both sides changing always agree, so flags never conflict. The merged set is pushed when the local side won any flag and pulled when the remote side did (both can happen in one sync: divergent sets fold into their union of changes and both sides converge on it). A placement present on both but never based converges on the remote. Flag pulls and rebases on a content-conflicted placement keep its `Conflict` status: only an edit resolves a conflict.
+
+`OfflineSyncReport` counts `pulled`, `pushed` (accepted pushes), `conflicts`, `rejected` and `refreshed`.
 
 ## Push-outcome discipline
 
 A push is confirmed before the local state is rewritten. This is the subtle correctness point of the whole engine, so it is worth stating plainly.
 
-When the merge derives a push it does not immediately rewrite the placement. A flag push stashes the placement in `pending_rebases`; a tombstone delete stashes the handle in `pending_drops`; a create stashes the placeholder placement in `pending_creates`. The engine then yields `WantsPush` and waits for the `PushResult` outcomes:
+When the merge derives a push it does not immediately rewrite the placement. A flag push stashes the placement in `pending_flag_pushes`; a content push stashes it in `pending_content_pushes` (kept apart so an accepted flag push on a conflicted placement is never misread as a resolved content push); a tombstone delete stashes the handle in `pending_drops`; a create stashes the placeholder placement in `pending_creates`. The engine then yields `WantsPush` and waits for the `PushResult` outcomes:
 
-- `Accepted`: the rebase is applied (the flag push rebases the placement clean onto its new base), the drop is applied (the confirmed delete drops the placement), or the create is rekeyed (the placeholder is dropped and the placement re-inserted clean and based under the `assigned` server handle).
+- `Accepted`: the rebase is applied (a flag push rebases the placement clean onto its new base; a content push pins the pushed body and reported revision as the new base, keeping a riding flag edit dirty), the drop is applied (the confirmed delete drops the placement), or the create is rekeyed (the placeholder is dropped and the placement re-inserted clean and based under the `assigned` server handle).
 - `Rejected`: nothing is rewritten. The placement stays `Dirty`, stays a `Tombstone`, or keeps its `Created` placeholder, so the next sync retries the push.
 
 The reason a rejected delete must not drop the placement is specific to incremental sync: dropping a message locally while it still exists on the server creates a permanent desync, because QRESYNC `CHANGEDSINCE` will never re-list an unchanged message, so the replica would never see it again. Holding the drop until the server confirms the move-to-trash closes that hole. Any handle the push never reported on is treated like a rejection (left dirty) for the same reason.
@@ -103,7 +108,7 @@ In the Android app these depths surface as three user actions: Refresh (an incre
 
 ## Driving the engine from an app
 
-The std client (client.rs) is the reference driver: `OfflineClient<S, R>` wraps a consumer `Storage` and a consumer `Remote`, and its generic `run` loop services each yield by calling the matching trait method and resuming with the reply. The four verbs are exposed as `open`, `upgrade`, `mutate` and `sync`. A desktop or Neverest consumer backs `Remote` with io-email's blocking clients and `Storage` with sqlite plus a blob dir.
+The std client (client.rs) is the reference driver: `OfflineClient<S, R>` wraps a consumer `Storage` and a consumer `Remote`, and its generic `run` loop services each yield by calling the matching trait method and resuming with the reply. The five verbs are exposed as `open`, `upgrade`, `mutate`, `sync` and `rekey`. A desktop or Neverest consumer backs `Remote` with io-email's blocking clients and `Storage` with sqlite plus a blob dir.
 
 A consumer may also drive the coroutines directly without `OfflineClient`: the Himalaya Android app does, servicing each yield over two Kotlin transports reached by JNI (io-imap as the remote seam, a SQLite index plus a blob dir as the storage seam). That wiring, the JSON contract over JNI, and the IMAP enumerate are app concerns and live in that repo; see the himalaya-android-m3 ARCHITECTURE. Two engine-level facts matter here: a `Handle` is any string (so a consumer's storage keys stay protocol-neutral), and a consumer that does not yet build creates reports `Change::Add` as `Rejected` so the engine keeps the placeholder rather than dropping a member.
 
@@ -114,14 +119,14 @@ Offline copy and move are wired end to end (the Himalaya app drives them); offli
 Copy:
 
 - `mutate`'s `Copy` stages a `Status::Created` placement in the target collection under a provisional placeholder handle, carrying its `Origin` (the source `CollectionId` plus `Handle`), and leaves the source untouched.
-- `sync`'s merge turns that `Created` placement into a `Change::Add { handle, origin, object }`: `origin` set so the push reuses a server-side copy (no body re-upload), `object` reserved for an append. The placeholder is stashed in `pending_creates`.
+- `sync`'s merge turns that `Created` placement into a `Change::Add { handle, link_id, flags, origin, object }`: `origin` set so the push reuses a server-side copy (no body re-upload), `object` carrying the stored body's hash for an append, `flags` the flag set to create with, `link_id` as the retry idempotency key. The placeholder is stashed in `pending_creates`.
 - On `Accepted`: if the push reports an `assigned` handle (a UIDPLUS-capable driver), `rekey_create` re-inserts the placement clean and based under it; if not, the placeholder is simply dropped and the real handle is re-added by the target's next enumerate, deduping the body by link id. On `Rejected` the placeholder stays for the next sync.
 
 Move:
 
 - `mutate`'s `Move` tombstones the source carrying its destination in `origin` (no target placement), so the merge pushes one `Change::Remove { handle, to: Some(target) }`: the consumer issues a single atomic server-side UID MOVE, never a copy-then-delete with a window where the message is on neither side. The target picks it up on its own next enumerate. (A plain delete is the same `Remove` with `to = None`, routed to trash.)
 
-Not built: append (`origin = None`, pushing the stored object's bytes via the reserved `object` field) for a genuinely new local message (an offline compose or draft). The engine shape is ready; only the `mutate` entry and the driver's `APPEND` are missing.
+Append (`origin = None`, `object` naming the stored body to upload) is pushed by the sync in one case today: a staged local edit whose remote member was deleted upstream resurrects as a pending create. A `mutate` entry for a genuinely new local item (an offline compose or draft) is not built yet; the engine shape is ready, only that entry and the driver's `APPEND` are missing.
 
 ## Module layout
 
@@ -139,6 +144,7 @@ src/
   upgrade.rs      OfflineUpgrade       pull a level, dedup before fetch
   mutate.rs       OfflineMutate        local flag/remove, mark dirty, no network
   sync.rs         OfflineSync          enumerate + three-way merge + push + checkpoint
+  rekey.rs        OfflineRekey         rebuild after a handle-space change, carry by link id
   client.rs       (client) OfflineClient: Storage + Remote traits, blocking run loop
 ```
 
@@ -146,4 +152,4 @@ Each verb follows the standard coroutine template: one `new`, a private `State` 
 
 ## Notes for the reader
 
-A few things are defined ahead of their first use, so do not mistake them for dead code: `WantsCount` and the `Remote::count` capability exist for protocols that expose a cheap member count, but no verb emits `WantsCount` yet (the Android driver stubs it to zero). The `WriteOp::SetBase` variant exists for a base-only rewrite, but the sync coroutine sets the base inline through `UpsertPlacement` rather than emitting `SetBase`. The `Collection` struct (with its `enumerated` flag) is defined but no verb produces or consumes it. The create path (the `Created` status, `Change::Add` with its origin, and the rekey on accept) is built and tested in the engine but not yet driven by any consumer; see the create-path section above.
+One thing is defined ahead of its first use, so do not mistake it for dead code: the `Collection` struct (with its `enumerated` flag) is defined but no verb produces or consumes it (`Loaded` carries placements plus checkpoint directly); treat it as a reserved carrier for the collection list. A handle-space change (an IMAP UIDVALIDITY bump renumbers every handle) is `rekey`'s job: a consumer that detects the change runs it instead of a full sync, which would drop the whole spine and every pending change with it. The residual limitation is that rekey matches by link id, so pending state on placements that never resolved one (a probed-only spine) is dropped, and said so in the report.

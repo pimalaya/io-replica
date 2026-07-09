@@ -4,307 +4,21 @@
 //! Exercises the whole lifecycle on a generic collection of items: initial
 //! pull, fully offline open, progressive upgrade with cross-collection
 //! object dedup (one item present in two collections), local mutation,
-//! push, remote pull, and a divergent-flags conflict. The in-memory
-//! backends prove the engine drives the protocol purely through its
-//! `Wants`, knowing nothing of either side.
+//! push, remote pull, and a divergent flag merge where both sides survive.
 
-use std::{collections::BTreeMap, convert::Infallible};
+// NOTE: shared across test targets; not every target uses every helper
+#[allow(dead_code)]
+mod common;
 
 use io_offline::{
-    change::{Change, WriteOp},
-    client::{OfflineClient, Remote, Storage},
-    collection::{Checkpoint, CollectionId},
+    client::OfflineClient,
     mutate::Mutation,
-    object::{Hash, Object},
-    placement::{Flags, Handle, Level, LinkId, Meta, Placement, Status},
-    remote::{FetchedItem, PushOutcome, PushResult, RemoteItem, RemoteSnapshot, Tier},
-    storage::Loaded,
+    placement::{Flags, Handle, Level, Status},
+    remote::Tier,
     sync::OfflineSyncOptions,
 };
 
-// ---- in-memory storage ------------------------------------------------
-
-#[derive(Default)]
-struct MemStorage {
-    placements: BTreeMap<(CollectionId, Handle), Placement>,
-    objects: BTreeMap<Hash, (Object, Vec<u8>)>,
-    checkpoints: BTreeMap<CollectionId, Checkpoint>,
-}
-
-impl MemStorage {
-    fn placement(&self, collection: &str, handle: &str) -> &Placement {
-        self.placements
-            .get(&(collection.into(), Handle::from(handle)))
-            .expect("placement exists")
-    }
-}
-
-impl Storage for MemStorage {
-    type Error = Infallible;
-
-    fn load(&self, collection: &CollectionId) -> Result<Loaded, Infallible> {
-        let placements = self
-            .placements
-            .iter()
-            .filter(|((c, _), _)| c == collection)
-            .map(|(_, p)| p.clone())
-            .collect();
-        let checkpoint = self.checkpoints.get(collection).cloned();
-
-        Ok(Loaded {
-            placements,
-            checkpoint,
-        })
-    }
-
-    fn lookup_objects(&self, links: &[LinkId]) -> Result<BTreeMap<LinkId, Hash>, Infallible> {
-        let mut known = BTreeMap::new();
-
-        for link in links {
-            // any placement, in any collection, that already links this
-            // logical item to a stored body
-            let hit = self.placements.values().find_map(|p| {
-                let matches = p.link_id.as_ref() == Some(link);
-                matches.then(|| p.object.clone()).flatten()
-            });
-            if let Some(hash) = hit {
-                known.insert(link.clone(), hash);
-            }
-        }
-
-        Ok(known)
-    }
-
-    fn write(&mut self, ops: Vec<WriteOp>) -> Result<(), Infallible> {
-        for op in ops {
-            match op {
-                WriteOp::UpsertPlacement(p) => {
-                    self.placements
-                        .insert((p.collection.clone(), p.handle.clone()), p);
-                }
-                WriteOp::DropPlacement { collection, handle } => {
-                    self.placements.remove(&(collection, handle));
-                }
-                WriteOp::StoreObject { object, body } => {
-                    self.objects.insert(object.hash.clone(), (object, body));
-                }
-                WriteOp::SetBase {
-                    collection,
-                    handle,
-                    base,
-                } => {
-                    if let Some(p) = self.placements.get_mut(&(collection, handle)) {
-                        p.base = Some(base);
-                    }
-                }
-                WriteOp::SetCheckpoint {
-                    collection,
-                    checkpoint,
-                } => {
-                    self.checkpoints.insert(collection, checkpoint);
-                }
-            }
-        }
-
-        Ok(())
-    }
-}
-
-// ---- fake remote ------------------------------------------------------
-
-#[derive(Clone)]
-struct ServerItem {
-    link_id: LinkId,
-    flags: Flags,
-    body: Vec<u8>,
-}
-
-#[derive(Default)]
-struct MemRemote {
-    items: BTreeMap<CollectionId, BTreeMap<Handle, ServerItem>>,
-    full_fetches: Vec<Handle>,
-    calls: usize,
-}
-
-impl MemRemote {
-    fn seed(&mut self, collection: &str, handle: &str, link: &str, flags: &[&str], body: &[u8]) {
-        self.items.entry(collection.into()).or_default().insert(
-            Handle::from(handle),
-            ServerItem {
-                link_id: LinkId::from(link),
-                flags: Flags::from_iter(flags.iter().copied()),
-                body: body.to_vec(),
-            },
-        );
-    }
-
-    fn set_flags(&mut self, collection: &str, handle: &str, flags: &[&str]) {
-        self.items
-            .get_mut(&collection.into())
-            .and_then(|c| c.get_mut(&Handle::from(handle)))
-            .expect("server item exists")
-            .flags = Flags::from_iter(flags.iter().copied());
-    }
-
-    fn flags_of(&self, collection: &str, handle: &str) -> &Flags {
-        &self
-            .items
-            .get(&collection.into())
-            .and_then(|c| c.get(&Handle::from(handle)))
-            .expect("server item exists")
-            .flags
-    }
-}
-
-fn hash(body: &[u8]) -> Hash {
-    // tiny deterministic content hash: identical bytes collapse to one
-    // object, which is exactly what the dedup path keys on
-    let mut acc: u64 = 1469598103934665603;
-    for byte in body {
-        acc ^= *byte as u64;
-        acc = acc.wrapping_mul(1099511628211);
-    }
-    Hash::from(format!("{acc:016x}"))
-}
-
-impl Remote for MemRemote {
-    type Error = Infallible;
-
-    fn count(&mut self, collection: &CollectionId) -> Result<usize, Infallible> {
-        self.calls += 1;
-        Ok(self.items.get(collection).map(|c| c.len()).unwrap_or(0))
-    }
-
-    fn enumerate(
-        &mut self,
-        collection: &CollectionId,
-        _cursor: Option<Checkpoint>,
-    ) -> Result<RemoteSnapshot, Infallible> {
-        self.calls += 1;
-
-        let items = self
-            .items
-            .get(collection)
-            .into_iter()
-            .flatten()
-            .map(|(handle, item)| RemoteItem {
-                handle: handle.clone(),
-                flags: item.flags.clone(),
-                revision: None,
-            })
-            .collect();
-
-        Ok(RemoteSnapshot {
-            items,
-            vanished: Vec::new(),
-            complete: true,
-            checkpoint: Checkpoint(b"server-state".to_vec()),
-        })
-    }
-
-    fn fetch(
-        &mut self,
-        collection: &CollectionId,
-        handles: Vec<Handle>,
-        tier: Tier,
-    ) -> Result<Vec<FetchedItem>, Infallible> {
-        self.calls += 1;
-
-        let collection = self.items.get(collection).cloned().unwrap_or_default();
-        let mut out = Vec::new();
-
-        for handle in handles {
-            let item = collection.get(&handle).expect("fetched handle exists");
-            let meta = Meta(format!("headers:{}", handle.as_str()));
-
-            let body = match tier {
-                Tier::Meta => None,
-                Tier::Full => {
-                    self.full_fetches.push(handle.clone());
-                    Some((hash(&item.body), item.body.clone()))
-                }
-            };
-
-            out.push(FetchedItem {
-                handle,
-                link_id: item.link_id.clone(),
-                meta,
-                body,
-                revision: None,
-            });
-        }
-
-        Ok(out)
-    }
-
-    fn push(
-        &mut self,
-        collection: &CollectionId,
-        changes: Vec<Change>,
-    ) -> Result<Vec<PushResult>, Infallible> {
-        self.calls += 1;
-        let mut results = Vec::new();
-
-        for change in changes {
-            let (handle, assigned) = match change {
-                Change::SetFlags { handle, flags } => {
-                    if let Some(item) = self
-                        .items
-                        .get_mut(collection)
-                        .and_then(|c| c.get_mut(&handle))
-                    {
-                        item.flags = flags;
-                    }
-                    (handle, None)
-                }
-                Change::Remove { handle, to, .. } => {
-                    // A move relocates the item; a plain delete drops it.
-                    if let Some(item) = self
-                        .items
-                        .get_mut(collection)
-                        .and_then(|c| c.remove(&handle))
-                        .filter(|_| to.is_some())
-                    {
-                        let target = to.expect("a move target");
-                        self.items
-                            .entry(target)
-                            .or_default()
-                            .insert(Handle::from(format!("{}-moved", handle.as_str())), item);
-                    }
-                    (handle, None)
-                }
-                // A content update: this store keeps bodies out of band, so
-                // accepting the push is enough.
-                Change::Update { handle, .. } => (handle, None),
-                // A copy create: server-side copy the origin item into this
-                // collection under a freshly assigned handle (COPYUID).
-                Change::Add { handle, origin, .. } => {
-                    let assigned = origin.and_then(|o| {
-                        let item = self.items.get(&o.collection)?.get(&o.handle)?.clone();
-                        let new = Handle::from(format!("{}-copy", o.handle.as_str()));
-                        self.items
-                            .entry(collection.clone())
-                            .or_default()
-                            .insert(new.clone(), item);
-                        Some(new)
-                    });
-                    (handle, assigned)
-                }
-            };
-
-            results.push(PushResult {
-                handle,
-                outcome: PushOutcome::Accepted,
-                assigned,
-                revision: None,
-            });
-        }
-
-        Ok(results)
-    }
-}
-
-// ---- the scenario -----------------------------------------------------
+use crate::common::{MemRemote, MemStorage};
 
 fn seeded_client() -> OfflineClient<MemStorage, MemRemote> {
     let body_a = b"From: a\r\nMessage-ID: <msg-a>\r\n\r\nshared body\r\n";
@@ -425,8 +139,9 @@ fn full_offline_lifecycle() {
             .contains("flagged")
     );
 
-    // 7. divergent edits on both sides keep both: a conflict, never a
-    // silent loss
+    // 7. divergent flag edits on both sides merge element-wise: the local
+    // removal of "seen" and addition of "draft" and the remote addition of
+    // "important" all survive, with no conflict and no silent loss
     client
         .mutate(
             "inbox",
@@ -441,10 +156,22 @@ fn full_offline_lifecycle() {
         .set_flags("inbox", "i1", &["seen", "important"]);
 
     let report = client.sync("inbox", OfflineSyncOptions::default()).unwrap();
-    assert_eq!(report.conflicts, 1);
+    assert_eq!(report.conflicts, 0, "flags never conflict");
+    assert_eq!(report.pushed, 1);
+    assert_eq!(report.pulled, 1);
+
+    let merged = &client.storage().placement("inbox", "i1").flags;
+    assert!(merged.contains("draft"), "the local addition survives");
+    assert!(merged.contains("important"), "the remote addition survives");
+    assert!(!merged.contains("seen"), "the local removal wins");
+    assert_eq!(
+        client.remote().flags_of("inbox", "i1"),
+        merged,
+        "both sides converged on the merged set",
+    );
     assert_eq!(
         client.storage().placement("inbox", "i1").status,
-        Status::Conflict,
+        Status::Clean,
     );
 }
 
@@ -482,11 +209,10 @@ fn offline_copy_creates_pushes_and_rekeys() {
     let report = client.sync("archive", opts).unwrap();
     assert_eq!(report.pushed, 1);
     assert!(
-        client
+        !client
             .storage()
             .placements
-            .get(&("archive".into(), Handle::from("tmp-i2")))
-            .is_none(),
+            .contains_key(&("archive".into(), Handle::from("tmp-i2"))),
         "the placeholder is dropped once the copy is confirmed",
     );
     let real = client.storage().placement("archive", "i2-copy");

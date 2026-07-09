@@ -102,6 +102,8 @@ impl OfflineCoroutine for OfflineUpgrade {
         &mut self,
         arg: Option<OfflineArg>,
     ) -> OfflineCoroutineState<Self::Yield, Self::Return> {
+        trace!("upgrade: {}", self.state);
+
         match (&self.state, arg) {
             (State::Start, None) => {
                 debug!("load target items from storage");
@@ -314,6 +316,7 @@ mod tests {
 
     #[test]
     fn full_dedup_links_without_fetch() {
+        crate::testlog::init();
         let loaded = Loaded {
             placements: vec![probed("2", Some("msg-a"), Level::Meta)],
             checkpoint: None,
@@ -396,7 +399,6 @@ mod tests {
         let mut placement = probed("1", Some("msg-b"), Level::Meta);
         placement.base = Some(Base {
             flags: Flags::default(),
-            present: true,
             revision: None,
             object: None,
         });
@@ -475,5 +477,130 @@ mod tests {
             OfflineCoroutineState::Complete(Err(OfflineUpgradeError::MissingArg)) => {}
             state => panic!("expected MissingArg, got {state:?}"),
         }
+    }
+
+    #[test]
+    fn unexpected_arg_errors() {
+        let mut up = OfflineUpgrade::new("inbox", vec![Handle::from("1")], Tier::Meta);
+        let _ = up.resume(None);
+        match up.resume(Some(OfflineArg::Write)) {
+            OfflineCoroutineState::Complete(Err(OfflineUpgradeError::UnexpectedArg)) => {}
+            state => panic!("expected UnexpectedArg, got {state:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_handle_completes_without_work() {
+        // A requested handle with no placement is not the upgrade's to
+        // invent: it is skipped, not fetched.
+        let loaded = Loaded {
+            placements: vec![probed("1", None, Level::Probed)],
+            checkpoint: None,
+        };
+        let mut up = OfflineUpgrade::new("inbox", vec![Handle::from("nope")], Tier::Meta);
+        let _ = up.resume(None);
+
+        match up.resume(Some(OfflineArg::Load(loaded))) {
+            OfflineCoroutineState::Complete(Ok(report)) => assert_eq!(report.upgraded, 0),
+            state => panic!("expected Complete(Ok), got {state:?}"),
+        }
+    }
+
+    #[test]
+    fn full_without_link_ids_fetches_directly() {
+        // Probed placements carry no link id yet, so there is nothing to
+        // look up in the object store: the full upgrade fetches directly.
+        let loaded = Loaded {
+            placements: vec![probed("1", None, Level::Probed)],
+            checkpoint: None,
+        };
+        let mut up = OfflineUpgrade::new("inbox", vec![Handle::from("1")], Tier::Full);
+        let _ = up.resume(None);
+
+        match up.resume(Some(OfflineArg::Load(loaded))) {
+            OfflineCoroutineState::Yielded(OfflineYield::WantsFetch { tier, handles, .. }) => {
+                assert_eq!(tier, Tier::Full);
+                assert_eq!(handles, vec![Handle::from("1")]);
+            }
+            state => panic!("expected WantsFetch Full, got {state:?}"),
+        }
+    }
+
+    #[test]
+    fn fetched_unknown_handle_is_skipped() {
+        // A fetch reply naming a handle with no placement (a lagging or
+        // buggy consumer) is ignored rather than upserted or panicking.
+        let loaded = Loaded {
+            placements: vec![probed("1", None, Level::Probed)],
+            checkpoint: None,
+        };
+        let mut up = OfflineUpgrade::new("inbox", vec![Handle::from("1")], Tier::Meta);
+        let _ = up.resume(None);
+        let _ = up.resume(Some(OfflineArg::Load(loaded)));
+
+        let items = vec![FetchedItem {
+            handle: Handle::from("ghost"),
+            link_id: LinkId::from("msg-x"),
+            meta: Meta("hdr".into()),
+            body: None,
+            revision: None,
+        }];
+        let ops = match up.resume(Some(OfflineArg::Fetch(items))) {
+            OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+        assert!(ops.is_empty(), "nothing to write: {ops:?}");
+
+        match up.resume(Some(OfflineArg::Write)) {
+            OfflineCoroutineState::Complete(Ok(report)) => assert_eq!(report.upgraded, 0),
+            state => panic!("expected Complete(Ok), got {state:?}"),
+        }
+    }
+
+    #[test]
+    fn full_mixes_dedup_hits_and_fetch_misses() {
+        crate::testlog::init();
+        // Two placements at meta level: one link id resolves in the object
+        // store (linked without a fetch), the other misses and is fetched.
+        let loaded = Loaded {
+            placements: vec![
+                probed("1", Some("msg-a"), Level::Meta),
+                probed("2", Some("msg-b"), Level::Meta),
+            ],
+            checkpoint: None,
+        };
+        let mut up = OfflineUpgrade::new(
+            "inbox",
+            vec![Handle::from("1"), Handle::from("2")],
+            Tier::Full,
+        );
+        let _ = up.resume(None);
+        let _ = up.resume(Some(OfflineArg::Load(loaded)));
+
+        let mut known = BTreeMap::new();
+        known.insert(LinkId::from("msg-a"), Hash::from("h-a"));
+
+        let handles = match up.resume(Some(OfflineArg::LookupObject(known))) {
+            OfflineCoroutineState::Yielded(OfflineYield::WantsFetch { handles, .. }) => handles,
+            state => panic!("expected WantsFetch for the miss, got {state:?}"),
+        };
+        assert_eq!(handles, vec![Handle::from("2")], "only the miss fetches");
+
+        let items = vec![FetchedItem {
+            handle: Handle::from("2"),
+            link_id: LinkId::from("msg-b"),
+            meta: Meta("hdr".into()),
+            body: Some((Hash::from("h-b"), b"body".to_vec())),
+            revision: None,
+        }];
+        let _ = up.resume(Some(OfflineArg::Fetch(items)));
+
+        let report = match up.resume(Some(OfflineArg::Write)) {
+            OfflineCoroutineState::Complete(Ok(report)) => report,
+            state => panic!("expected Complete(Ok), got {state:?}"),
+        };
+        assert_eq!(report.upgraded, 2);
+        assert_eq!(report.deduped, 1);
+        assert_eq!(report.fetched, 1);
     }
 }

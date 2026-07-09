@@ -48,6 +48,8 @@ impl OfflineCoroutine for OfflineOpen {
         &mut self,
         arg: Option<OfflineArg>,
     ) -> OfflineCoroutineState<Self::Yield, Self::Return> {
+        trace!("open: {}", self.state);
+
         match (&self.state, arg) {
             (State::Start, None) => {
                 debug!("load collection from storage");
@@ -116,6 +118,7 @@ mod tests {
 
     #[test]
     fn load_completes_with_placements() {
+        crate::testlog::init();
         let mut open = OfflineOpen::new("inbox");
         let _ = open.resume(None);
 
@@ -152,7 +155,7 @@ mod tests {
     fn wrong_arg_kind_at_pending_load_errors() {
         let mut open = OfflineOpen::new("inbox");
         let _ = open.resume(None);
-        match open.resume(Some(OfflineArg::Count(0))) {
+        match open.resume(Some(OfflineArg::Write)) {
             OfflineCoroutineState::Complete(Err(OfflineOpenError::UnexpectedArg)) => {}
             state => panic!("expected UnexpectedArg, got {state:?}"),
         }

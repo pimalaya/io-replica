@@ -16,7 +16,10 @@ pub mod mutate;
 pub mod object;
 pub mod open;
 pub mod placement;
+pub mod rekey;
 pub mod remote;
 pub mod storage;
 pub mod sync;
+#[cfg(test)]
+mod testlog;
 pub mod upgrade;

@@ -92,6 +92,22 @@ impl Flags {
     pub fn contains(&self, flag: &str) -> bool {
         self.0.contains(flag)
     }
+
+    /// Three-way merges two flag sets element-wise against their base.
+    ///
+    /// Each flag is independent: the side that changed a flag's presence
+    /// from the base wins for that flag, and both sides changing always
+    /// agree (a presence flip from the base has only one direction), so
+    /// an element-wise merge can never conflict. As set algebra the
+    /// result is (local AND remote) OR (local MINUS base) OR (remote
+    /// MINUS base).
+    pub fn merge(base: &Flags, local: &Flags, remote: &Flags) -> Flags {
+        let kept = local.0.intersection(&remote.0).cloned();
+        let local_adds = local.0.difference(&base.0).cloned();
+        let remote_adds = remote.0.difference(&base.0).cloned();
+
+        Flags(kept.chain(local_adds).chain(remote_adds).collect())
+    }
 }
 
 impl<S: ToString> FromIterator<S> for Flags {
@@ -121,7 +137,9 @@ pub enum Status {
     Dirty,
     /// Locally deleted since the base; a remove is pending.
     Tombstone,
-    /// Both sides changed and diverged; awaiting keep-both resolution.
+    /// Content diverged on both sides; awaiting keep-both resolution.
+    /// Flags never conflict (they merge element-wise), so this is a
+    /// mutable-content state only.
     Conflict,
     /// Locally created (a copy, move or append) with no remote handle yet;
     /// a create is pending. Its [`Placement::handle`] is a provisional
@@ -145,15 +163,15 @@ pub struct Origin {
 
 /// The last-synced state a placement reconciles against.
 ///
-/// Where content is immutable only flags and membership mutate, so the
-/// base is `{flags, present}`; where content is mutable, `revision` holds
-/// the last-synced content revision so an in-place edit is detected.
+/// Its existence is the membership base: a based placement was a member
+/// of the collection as of the last sync (`Placement::base` is `None`
+/// until first reconciled). Where content is immutable only flags and
+/// membership mutate; where it is mutable, `revision` holds the
+/// last-synced content revision so an in-place edit is detected.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Base {
     /// Last-synced flag set.
     pub flags: Flags,
-    /// Last-synced membership in the collection.
-    pub present: bool,
     /// Last-synced content revision for mutable-content backends (a WebDAV
     /// etag, an MS Graph changeKey); `None` where content is immutable.
     pub revision: Option<String>,
@@ -178,7 +196,10 @@ pub struct Placement {
     pub object: Option<Hash>,
     /// The current detail level.
     pub level: Level,
-    /// The cached summary; `None` until [`Level::Meta`].
+    /// The cached summary; `None` until fetched. After a remote content
+    /// change the sync drops the level back to [`Level::Probed`] but
+    /// keeps the stale summary as a display fallback until the next
+    /// [`Level::Meta`] upgrade refetches it.
     pub meta: Option<Meta>,
     /// The current flag set.
     pub flags: Flags,
@@ -193,4 +214,59 @@ pub struct Placement {
     /// For a [`Status::Created`] placement, where its body already lives so
     /// the push can copy or move it; `None` otherwise (and for an append).
     pub origin: Option<Origin>,
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::string::String;
+
+    use crate::placement::{Flags, Handle, LinkId};
+
+    fn flags(flags: &[&str]) -> Flags {
+        Flags::from_iter(flags.iter().copied())
+    }
+
+    #[test]
+    fn ids_convert_from_owned_and_borrowed_strings() {
+        assert_eq!(Handle::from(String::from("1")), Handle::from("1"));
+        assert_eq!(Handle::from("1").as_str(), "1");
+        assert_eq!(LinkId::from(String::from("m")), LinkId::from("m"));
+        assert_eq!(LinkId::from("m").as_str(), "m");
+    }
+
+    #[test]
+    fn merge_keeps_unchanged_flags() {
+        let base = flags(&["seen"]);
+        let merged = Flags::merge(&base, &base, &base);
+        assert_eq!(merged, base);
+    }
+
+    #[test]
+    fn merge_takes_each_side_addition() {
+        let merged = Flags::merge(&flags(&[]), &flags(&["a"]), &flags(&["b"]));
+        assert_eq!(merged, flags(&["a", "b"]));
+    }
+
+    #[test]
+    fn merge_takes_each_side_removal() {
+        let base = flags(&["a", "b", "c"]);
+        let merged = Flags::merge(&base, &flags(&["b", "c"]), &flags(&["a", "b"]));
+        assert_eq!(merged, flags(&["b"]));
+    }
+
+    #[test]
+    fn merge_removal_beats_the_other_side_keeping() {
+        let base = flags(&["seen"]);
+        let merged = Flags::merge(&base, &flags(&[]), &base);
+        assert_eq!(merged, flags(&[]));
+    }
+
+    #[test]
+    fn merge_agreeing_changes_converge() {
+        // both sides added and removed the same flags: no double effect
+        let base = flags(&["old"]);
+        let both = flags(&["new"]);
+        let merged = Flags::merge(&base, &both, &both);
+        assert_eq!(merged, both);
+    }
 }

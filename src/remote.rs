@@ -1,8 +1,8 @@
 //! Payloads exchanged with the remote seam.
 //!
-//! The consumer satisfies four capabilities by driving a protocol crate
-//! (io-imap, io-jmap, io-webdav) or io-email's clients: count, enumerate,
-//! fetch and push. These types are what those capabilities return.
+//! The consumer satisfies three capabilities by driving a protocol crate
+//! (io-imap, io-jmap, io-webdav) or io-email's clients: enumerate, fetch
+//! and push. These types are what those capabilities return.
 
 use alloc::{string::String, vec::Vec};
 
@@ -83,6 +83,11 @@ pub struct FetchedItem {
 }
 
 /// The outcome of pushing one change.
+///
+/// Pushes are at-least-once (see [`crate::change::Change`]): a remove
+/// whose target is already missing means the delete landed, so the
+/// consumer reports it [`PushOutcome::Accepted`], not rejected; a
+/// rejection keeps the tombstone retrying forever.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PushOutcome {
     /// The remote accepted the change.

@@ -132,7 +132,12 @@ impl OfflineMutate {
         match &self.mutation {
             Mutation::SetFlags { flags, .. } => {
                 source.flags = flags.clone();
-                source.status = Status::Dirty;
+                // NOTE: a pending create stays a create and an unresolved
+                // content conflict stays a conflict (its resolution is an
+                // edit); the flag change rides along either way.
+                if source.status == Status::Clean {
+                    source.status = Status::Dirty;
+                }
                 vec![WriteOp::UpsertPlacement(source)]
             }
             Mutation::Remove(_) => {
@@ -217,6 +222,8 @@ impl OfflineCoroutine for OfflineMutate {
         &mut self,
         arg: Option<OfflineArg>,
     ) -> OfflineCoroutineState<Self::Yield, Self::Return> {
+        trace!("mutate: {}", self.state);
+
         match (&mut self.state, arg) {
             (State::Start, None) => {
                 debug!("load target item from storage");
@@ -278,6 +285,7 @@ mod tests {
     };
 
     fn loaded(handle: &str) -> Loaded {
+        crate::testlog::init();
         Loaded {
             placements: vec![Placement {
                 collection: "inbox".into(),
@@ -291,7 +299,6 @@ mod tests {
                 status: Status::Clean,
                 base: Some(Base {
                     flags: Flags::default(),
-                    present: true,
                     revision: None,
                     object: None,
                 }),
@@ -320,6 +327,60 @@ mod tests {
         assert_eq!(p.status, Status::Dirty);
         assert!(p.flags.contains("seen"));
         assert!(p.base.is_some(), "base must be preserved for sync");
+    }
+
+    #[test]
+    fn set_flags_on_a_conflicted_placement_keeps_the_conflict() {
+        // The flag edit rides along; the content conflict stays unresolved
+        // (its resolution is an edit), so the sync never mistakes the
+        // placement for a plain dirty one.
+        let mutation = Mutation::SetFlags {
+            handle: Handle::from("1"),
+            flags: Flags::from_iter(["seen"]),
+        };
+        let mut mutate = OfflineMutate::new("inbox", mutation);
+        let _ = mutate.resume(None);
+
+        let mut loaded = loaded("1");
+        loaded.placements[0].status = Status::Conflict;
+        loaded.placements[0].conflict_revision = Some("r2".into());
+
+        let ops = match mutate.resume(Some(OfflineArg::Load(loaded))) {
+            OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+        let WriteOp::UpsertPlacement(p) = &ops[0] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[0]);
+        };
+        assert_eq!(p.status, Status::Conflict);
+        assert_eq!(p.conflict_revision.as_deref(), Some("r2"));
+        assert!(p.flags.contains("seen"));
+    }
+
+    #[test]
+    fn set_flags_on_a_created_placement_stays_created() {
+        // A pending create keeps its status, else the sync would never
+        // push the add.
+        let mutation = Mutation::SetFlags {
+            handle: Handle::from("1"),
+            flags: Flags::from_iter(["seen"]),
+        };
+        let mut mutate = OfflineMutate::new("inbox", mutation);
+        let _ = mutate.resume(None);
+
+        let mut loaded = loaded("1");
+        loaded.placements[0].status = Status::Created;
+        loaded.placements[0].base = None;
+
+        let ops = match mutate.resume(Some(OfflineArg::Load(loaded))) {
+            OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+        let WriteOp::UpsertPlacement(p) = &ops[0] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[0]);
+        };
+        assert_eq!(p.status, Status::Created);
+        assert!(p.flags.contains("seen"));
     }
 
     #[test]
@@ -378,6 +439,18 @@ mod tests {
     }
 
     #[test]
+    fn unexpected_arg_errors() {
+        let mutation = Mutation::Remove(Handle::from("1"));
+        let mut mutate = OfflineMutate::new("inbox", mutation);
+        let _ = mutate.resume(None);
+
+        match mutate.resume(Some(OfflineArg::Write)) {
+            OfflineCoroutineState::Complete(Err(OfflineMutateError::UnexpectedArg)) => {}
+            state => panic!("expected UnexpectedArg, got {state:?}"),
+        }
+    }
+
+    #[test]
     fn edit_stages_a_dirty_body() {
         // An edit stores the new object, repoints the placement at it at
         // full level and marks it dirty; the base keeps the synced state so
@@ -411,6 +484,34 @@ mod tests {
         assert_eq!(p.object, Some(Hash::from("h2")));
         assert_eq!(p.level, Level::Full);
         assert!(p.base.is_some(), "base must be preserved for sync");
+    }
+
+    #[test]
+    fn edit_refreshes_the_projected_meta() {
+        // A consumer that projects a fresh summary from the edited body
+        // passes it along; the cached one is replaced.
+        use crate::object::{Hash, Object};
+
+        let mutation = Mutation::Edit {
+            handle: Handle::from("1"),
+            object: Object {
+                hash: Hash::from("h2"),
+                size: 4,
+            },
+            body: b"body".to_vec(),
+            meta: Some(Meta("fresh".into())),
+        };
+        let mut mutate = OfflineMutate::new("inbox", mutation);
+        let _ = mutate.resume(None);
+
+        let ops = match mutate.resume(Some(OfflineArg::Load(loaded("1")))) {
+            OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+        let WriteOp::UpsertPlacement(p) = &ops[1] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[1]);
+        };
+        assert_eq!(p.meta, Some(Meta("fresh".into())));
     }
 
     #[test]

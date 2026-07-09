@@ -20,6 +20,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 default = ["client"]
 client = []
 
+[dev-dependencies]
+proptest = "1"
+
 [dependencies]
 log = { version = "0.4", default-features = false }
 thiserror = { version = "2", default-features = false }
