@@ -416,8 +416,25 @@ impl OfflineSync {
     /// flags-only merge.
     fn reconcile_content(&mut self, local: &Placement, item: &RemoteItem) -> ContentOutcome {
         let Some(base) = &local.base else {
-            // NOTE: never based: no content signal to compare against; the
-            // flag reconciliation owns the never-based convergence.
+            // A base-less placement that carries a body the remote also
+            // holds is a create-collision: both sides minted content for
+            // this handle with no shared ancestor, so there is no
+            // three-way merge to run. Surface it as a conflict (the remote
+            // revision is what the consumer resolves against) instead of
+            // converging on flags alone, which would strand the two bodies
+            // apart and, once a spoke's base is lost this way, loop every
+            // sync without ever reconciling the content again. A body-less
+            // never-based placement carries no content signal, so it still
+            // falls through to the flag reconciliation.
+            if local.object.is_some() && item.revision.is_some() {
+                let mut conflicted = local.clone();
+                conflicted.status = Status::Conflict;
+                conflicted.conflict_revision = item.revision.clone();
+                self.writes
+                    .push(WriteOp::UpsertPlacement(conflicted.clone()));
+                self.report.conflicts += 1;
+                return ContentOutcome::Rewritten(conflicted);
+            }
             return ContentOutcome::Untouched;
         };
 
@@ -1851,6 +1868,53 @@ mod tests {
             Some(Hash::from("h2")),
             "the edit survives"
         );
+    }
+
+    #[test]
+    fn base_less_body_present_on_both_conflicts() {
+        // A create-collision, or a spoke whose content base was orphaned:
+        // the placement carries a body but has no base, yet the remote
+        // holds the same handle. With no shared ancestor there is nothing
+        // to merge, so it is surfaced as a conflict carrying the remote
+        // revision instead of converging on flags alone, which would
+        // strand the two bodies apart and loop every sync. The consumer's
+        // resolution then re-establishes a base, so the state self-heals.
+        let mut placement = synced("1", &[]);
+        placement.base = None;
+        placement.object = Some(Hash::from("h1"));
+        placement.level = Level::Full;
+
+        let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
+        let (pushes, writes, report) = run(&mut sync, vec![placement], vec![remote_rev("1", "r9")]);
+
+        assert!(pushes.is_none(), "an unresolved conflict pushes nothing");
+        assert_eq!(report.conflicts, 1);
+        let conflicted = upserted(&writes, "1").expect("a conflicted placement");
+        assert_eq!(conflicted.status, Status::Conflict);
+        assert_eq!(conflicted.conflict_revision.as_deref(), Some("r9"));
+        assert_eq!(
+            conflicted.object,
+            Some(Hash::from("h1")),
+            "the body survives for the resolution"
+        );
+    }
+
+    #[test]
+    fn base_less_body_less_present_on_both_stays_flag_only() {
+        // A never-based placement with no body carries no content signal,
+        // so it must still converge on flags alone (the create-collision
+        // rule only fires when a body is actually present on both sides).
+        let mut placement = synced("1", &["seen"]);
+        placement.base = None;
+
+        let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
+        let (pushes, writes, report) = run(&mut sync, vec![placement], vec![remote("1", &["seen"])]);
+
+        assert!(pushes.is_none());
+        assert_eq!(report.conflicts, 0);
+        let converged = upserted(&writes, "1").expect("a converged placement");
+        assert_eq!(converged.status, Status::Clean);
+        assert!(converged.base.is_some(), "it becomes based on the remote");
     }
 
     #[test]
