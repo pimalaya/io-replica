@@ -1,13 +1,13 @@
 [package]
 name = "io-offline"
-description = "Offline-first replica engine library"
+description = "Offline-first replica engine library for Rust"
 version = "0.1.0"
 authors = ["soywod <pimalaya.org@posteo.net>"]
-edition = "2024"
 rust-version = "1.87"
+edition = "2024"
 license = "MIT OR Apache-2.0"
-categories = ["email", "caching"]
-keywords = ["offline", "sync", "replica", "io-free", "pim"]
+categories = ["api-bindings", "no-std"]
+keywords = ["io-free", "no-std", "coroutine", "offline", "sync"]
 homepage = "https://pimalaya.org"
 documentation = "https://docs.rs/io-offline/latest/io_offline"
 repository = "https://github.com/pimalaya/io-offline"

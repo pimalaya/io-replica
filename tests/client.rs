@@ -8,14 +8,14 @@ mod common;
 use std::collections::BTreeMap;
 
 use io_offline::{
-    change::{Change, WriteOp},
-    client::{OfflineClient, OfflineClientError, Remote, Storage},
-    collection::{Checkpoint, CollectionId},
-    mutate::Mutation,
-    object::Hash,
-    placement::{Handle, LinkId},
-    remote::{FetchedItem, PushResult, RemoteSnapshot, Tier},
-    storage::Loaded,
+    change::{OfflineChange, OfflineWriteOp},
+    client::{OfflineClient, OfflineClientError, OfflineRemote, OfflineStorage},
+    collection::{OfflineCheckpoint, OfflineCollectionId},
+    mutate::OfflineMutation,
+    object::OfflineHash,
+    placement::{OfflineHandle, OfflineLinkId},
+    remote::{OfflineFetchedItem, OfflinePushResult, OfflineRemoteSnapshot, OfflineTier},
+    storage::OfflineLoaded,
     sync::OfflineSyncOptions,
 };
 
@@ -24,18 +24,21 @@ use crate::common::{MemRemote, MemStorage};
 /// A storage whose every call fails.
 struct BrokenStorage;
 
-impl Storage for BrokenStorage {
+impl OfflineStorage for BrokenStorage {
     type Error = &'static str;
 
-    fn load(&self, _: &CollectionId) -> Result<Loaded, Self::Error> {
+    fn load(&self, _: &OfflineCollectionId) -> Result<OfflineLoaded, Self::Error> {
         Err("disk on fire")
     }
 
-    fn lookup_objects(&self, _: &[LinkId]) -> Result<BTreeMap<LinkId, Hash>, Self::Error> {
+    fn lookup_objects(
+        &self,
+        _: &[OfflineLinkId],
+    ) -> Result<BTreeMap<OfflineLinkId, OfflineHash>, Self::Error> {
         Err("disk on fire")
     }
 
-    fn write(&mut self, _: Vec<WriteOp>) -> Result<(), Self::Error> {
+    fn write(&mut self, _: Vec<OfflineWriteOp>) -> Result<(), Self::Error> {
         Err("disk on fire")
     }
 }
@@ -43,27 +46,31 @@ impl Storage for BrokenStorage {
 /// A remote whose every call fails.
 struct BrokenRemote;
 
-impl Remote for BrokenRemote {
+impl OfflineRemote for BrokenRemote {
     type Error = &'static str;
 
     fn enumerate(
         &mut self,
-        _: &CollectionId,
-        _: Option<Checkpoint>,
-    ) -> Result<RemoteSnapshot, Self::Error> {
+        _: &OfflineCollectionId,
+        _: Option<OfflineCheckpoint>,
+    ) -> Result<OfflineRemoteSnapshot, Self::Error> {
         Err("network unplugged")
     }
 
     fn fetch(
         &mut self,
-        _: &CollectionId,
-        _: Vec<Handle>,
-        _: Tier,
-    ) -> Result<Vec<FetchedItem>, Self::Error> {
+        _: &OfflineCollectionId,
+        _: Vec<OfflineHandle>,
+        _: OfflineTier,
+    ) -> Result<Vec<OfflineFetchedItem>, Self::Error> {
         Err("network unplugged")
     }
 
-    fn push(&mut self, _: &CollectionId, _: Vec<Change>) -> Result<Vec<PushResult>, Self::Error> {
+    fn push(
+        &mut self,
+        _: &OfflineCollectionId,
+        _: Vec<OfflineChange>,
+    ) -> Result<Vec<OfflinePushResult>, Self::Error> {
         Err("network unplugged")
     }
 }
@@ -73,8 +80,11 @@ fn storage_error_propagates() {
     let mut client = OfflineClient::new(BrokenStorage, MemRemote::default());
 
     let err = client.open("inbox").unwrap_err();
-    assert!(matches!(err, OfflineClientError::Storage("disk on fire")));
-    assert_eq!(err.to_string(), "Storage seam failed: disk on fire");
+    assert!(matches!(
+        err,
+        OfflineClientError::OfflineStorage("disk on fire")
+    ));
+    assert_eq!(err.to_string(), "OfflineStorage seam failed: disk on fire");
 }
 
 #[test]
@@ -86,9 +96,12 @@ fn remote_error_propagates() {
         .unwrap_err();
     assert!(matches!(
         err,
-        OfflineClientError::Remote("network unplugged")
+        OfflineClientError::OfflineRemote("network unplugged")
     ));
-    assert_eq!(err.to_string(), "Remote seam failed: network unplugged");
+    assert_eq!(
+        err.to_string(),
+        "OfflineRemote seam failed: network unplugged"
+    );
 }
 
 #[test]
@@ -96,7 +109,10 @@ fn coroutine_error_propagates() {
     let mut client = OfflineClient::new(MemStorage::default(), MemRemote::default());
 
     let err = client
-        .mutate("inbox", Mutation::Remove(Handle::from("nope")))
+        .mutate(
+            "inbox",
+            OfflineMutation::Remove(OfflineHandle::from("nope")),
+        )
         .unwrap_err();
     assert!(matches!(err, OfflineClientError::Coroutine(_)));
     assert_eq!(
@@ -113,7 +129,7 @@ fn seams_are_borrowable_both_ways() {
     client
         .storage_mut()
         .checkpoints
-        .insert("inbox".into(), Checkpoint(b"cp".to_vec()));
+        .insert("inbox".into(), OfflineCheckpoint(b"cp".to_vec()));
 
     assert_eq!(client.remote().calls, 0);
     assert_eq!(client.storage().checkpoints.len(), 1);

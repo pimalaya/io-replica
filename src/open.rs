@@ -8,7 +8,7 @@ use core::fmt;
 use log::{debug, trace};
 use thiserror::Error;
 
-use crate::{collection::CollectionId, coroutine::*, storage::Loaded};
+use crate::{collection::OfflineCollectionId, coroutine::*, storage::OfflineLoaded};
 
 /// Failure causes during an OPEN flow.
 #[derive(Clone, Debug, Error)]
@@ -23,13 +23,13 @@ pub enum OfflineOpenError {
 
 /// I/O-free OPEN coroutine.
 pub struct OfflineOpen {
-    collection: CollectionId,
+    collection: OfflineCollectionId,
     state: State,
 }
 
 impl OfflineOpen {
     /// Creates a coroutine that loads `collection` from storage.
-    pub fn new(collection: impl Into<CollectionId>) -> Self {
+    pub fn new(collection: impl Into<OfflineCollectionId>) -> Self {
         let collection = collection.into();
         debug!("open collection {}", collection.as_str());
 
@@ -42,7 +42,7 @@ impl OfflineOpen {
 
 impl OfflineCoroutine for OfflineOpen {
     type Yield = OfflineYield;
-    type Return = Result<Loaded, OfflineOpenError>;
+    type Return = Result<OfflineLoaded, OfflineOpenError>;
 
     fn resume(
         &mut self,
@@ -83,22 +83,24 @@ impl fmt::Display for State {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use crate::{
-        collection::Checkpoint,
+        collection::OfflineCheckpoint,
         open::*,
-        placement::{Flags, Handle, Level, Placement, Status},
+        placement::{OfflineFlags, OfflineHandle, OfflineLevel, OfflinePlacement, OfflineStatus},
     };
 
-    fn placement(handle: &str) -> Placement {
-        Placement {
+    fn placement(handle: &str) -> OfflinePlacement {
+        OfflinePlacement {
             collection: "inbox".into(),
-            handle: Handle::from(handle),
+            handle: OfflineHandle::from(handle),
             link_id: None,
             object: None,
-            level: Level::Probed,
+            level: OfflineLevel::Probed,
             meta: None,
-            flags: Flags::default(),
-            status: Status::Clean,
+            flags: OfflineFlags::default(),
+            status: OfflineStatus::Clean,
             conflict_revision: None,
             base: None,
             origin: None,
@@ -122,9 +124,9 @@ mod tests {
         let mut open = OfflineOpen::new("inbox");
         let _ = open.resume(None);
 
-        let loaded = Loaded {
+        let loaded = OfflineLoaded {
             placements: vec![placement("1"), placement("2")],
-            checkpoint: Some(Checkpoint(b"tok".to_vec())),
+            checkpoint: Some(OfflineCheckpoint(b"tok".to_vec())),
         };
         match open.resume(Some(OfflineArg::Load(loaded))) {
             OfflineCoroutineState::Complete(Ok(out)) => assert_eq!(out.placements.len(), 2),

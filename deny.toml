@@ -3,4 +3,8 @@ unknown-git = "deny"
 unknown-registry = "deny"
 
 [licenses]
-allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+allow = [
+  "Apache-2.0",
+  "MIT",
+  "Unicode-3.0",
+]

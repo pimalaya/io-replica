@@ -1,9 +1,9 @@
 //! I/O-free coroutine to reconcile a collection with its remote.
 //!
 //! The load-bearing verb. It loads local state, enumerates the remote
-//! delta, then runs a three-way merge of Local, Base and Remote per
+//! delta, then runs a three-way merge of Local, OfflineBase and OfflineRemote per
 //! placement: local-won changes are pushed, remote-won changes are
-//! pulled. Flags merge element-wise and never conflict (each flag is
+//! pulled. OfflineFlags merge element-wise and never conflict (each flag is
 //! independent, so divergent sets fold into their union of changes);
 //! only divergent content edits are kept both as a conflict. The merge
 //! compares per-placement identities (flags and a content revision),
@@ -26,11 +26,13 @@ use log::{debug, trace};
 use thiserror::Error;
 
 use crate::{
-    change::{Change, WriteOp},
-    collection::{Checkpoint, CollectionId},
+    change::{OfflineChange, OfflineWriteOp},
+    collection::{OfflineCheckpoint, OfflineCollectionId},
     coroutine::*,
-    placement::{Base, Flags, Handle, Level, Placement, Status},
-    remote::{PushOutcome, RemoteItem, RemoteSnapshot},
+    placement::{
+        OfflineBase, OfflineFlags, OfflineHandle, OfflineLevel, OfflinePlacement, OfflineStatus,
+    },
+    remote::{OfflinePushOutcome, OfflineRemoteItem, OfflineRemoteSnapshot},
 };
 
 /// Tuning for one sync run: the push direction and the enumerate depth.
@@ -87,37 +89,37 @@ pub enum OfflineSyncError {
 
 /// I/O-free SYNC coroutine.
 pub struct OfflineSync {
-    collection: CollectionId,
+    collection: OfflineCollectionId,
     opts: OfflineSyncOptions,
-    local: BTreeMap<Handle, Placement>,
-    checkpoint: Option<Checkpoint>,
-    writes: Vec<WriteOp>,
+    local: BTreeMap<OfflineHandle, OfflinePlacement>,
+    checkpoint: Option<OfflineCheckpoint>,
+    writes: Vec<OfflineWriteOp>,
     /// Flag pushes awaiting their outcome: the local placement to rebase
     /// once the remote confirms, keyed by handle. A rejected push leaves
     /// the placement untouched (dirty) so the next sync retries it.
-    pending_flag_pushes: BTreeMap<Handle, Placement>,
+    pending_flag_pushes: BTreeMap<OfflineHandle, OfflinePlacement>,
     /// Content pushes awaiting their outcome: the local placement whose
     /// base adopts the pushed body and reported revision once the remote
     /// confirms. Kept apart from flag pushes so an accepted flag push on
     /// a conflicted placement (whose body also differs from its base) is
     /// never misread as a resolved content push.
-    pending_content_pushes: BTreeMap<Handle, Placement>,
+    pending_content_pushes: BTreeMap<OfflineHandle, OfflinePlacement>,
     /// Tombstone deletes awaiting their outcome: the placement is dropped
     /// only once the remote confirms the delete. A rejected push keeps the
     /// tombstone so the next sync retries, rather than dropping a message
     /// the server still has (a permanent desync under incremental sync).
-    pending_drops: BTreeSet<Handle>,
+    pending_drops: BTreeSet<OfflineHandle>,
     /// Pending creates awaiting their outcome, keyed by provisional handle:
     /// the staged placement to rekey to the server-assigned handle once the
     /// add is accepted. A rejected push keeps the placeholder for a retry.
-    pending_creates: BTreeMap<Handle, Placement>,
+    pending_creates: BTreeMap<OfflineHandle, OfflinePlacement>,
     report: OfflineSyncReport,
     state: State,
 }
 
 impl OfflineSync {
     /// Creates a coroutine that reconciles `collection`.
-    pub fn new(collection: impl Into<CollectionId>, opts: OfflineSyncOptions) -> Self {
+    pub fn new(collection: impl Into<OfflineCollectionId>, opts: OfflineSyncOptions) -> Self {
         let collection = collection.into();
         debug!(
             "sync collection {} (push={})",
@@ -142,17 +144,17 @@ impl OfflineSync {
 
     /// Runs the three-way merge, filling `self.writes` and `self.report`
     /// and returning the pushes to send.
-    fn reconcile(&mut self, snapshot: RemoteSnapshot) -> Vec<Change> {
-        let RemoteSnapshot {
+    fn reconcile(&mut self, snapshot: OfflineRemoteSnapshot) -> Vec<OfflineChange> {
+        let OfflineRemoteSnapshot {
             items,
             vanished,
             complete,
             checkpoint,
         } = snapshot;
 
-        let remote: BTreeMap<Handle, RemoteItem> =
+        let remote: BTreeMap<OfflineHandle, OfflineRemoteItem> =
             items.into_iter().map(|i| (i.handle.clone(), i)).collect();
-        let vanished: BTreeSet<Handle> = vanished.into_iter().collect();
+        let vanished: BTreeSet<OfflineHandle> = vanished.into_iter().collect();
 
         let candidates = if complete {
             self.full_candidates(&remote)
@@ -168,7 +170,7 @@ impl OfflineSync {
             }
         }
 
-        self.writes.push(WriteOp::SetCheckpoint {
+        self.writes.push(OfflineWriteOp::SetCheckpoint {
             collection: self.collection.clone(),
             checkpoint,
         });
@@ -181,9 +183,10 @@ impl OfflineSync {
     /// handle absent from `remote` reads as removed upstream.
     fn full_candidates(
         &self,
-        remote: &BTreeMap<Handle, RemoteItem>,
-    ) -> Vec<(Handle, Option<RemoteItem>)> {
-        let handles: BTreeSet<Handle> = self.local.keys().chain(remote.keys()).cloned().collect();
+        remote: &BTreeMap<OfflineHandle, OfflineRemoteItem>,
+    ) -> Vec<(OfflineHandle, Option<OfflineRemoteItem>)> {
+        let handles: BTreeSet<OfflineHandle> =
+            self.local.keys().chain(remote.keys()).cloned().collect();
         handles
             .into_iter()
             .map(|handle| {
@@ -199,16 +202,16 @@ impl OfflineSync {
     /// unchanged upstream, so its remote state is its own base.
     fn delta_candidates(
         &self,
-        remote: &BTreeMap<Handle, RemoteItem>,
-        vanished: &BTreeSet<Handle>,
-    ) -> Vec<(Handle, Option<RemoteItem>)> {
+        remote: &BTreeMap<OfflineHandle, OfflineRemoteItem>,
+        vanished: &BTreeSet<OfflineHandle>,
+    ) -> Vec<(OfflineHandle, Option<OfflineRemoteItem>)> {
         let dirty = self
             .local
             .iter()
-            .filter(|(_, p)| p.status != Status::Clean)
+            .filter(|(_, p)| p.status != OfflineStatus::Clean)
             .map(|(handle, _)| handle.clone());
 
-        let handles: BTreeSet<Handle> = remote
+        let handles: BTreeSet<OfflineHandle> = remote
             .keys()
             .cloned()
             .chain(vanished.iter().cloned())
@@ -225,7 +228,7 @@ impl OfflineSync {
                 } else {
                     self.local.get(&handle).and_then(|p| {
                         let base = p.base.as_ref()?;
-                        Some(RemoteItem {
+                        Some(OfflineRemoteItem {
                             handle: handle.clone(),
                             flags: base.flags.clone(),
                             // NOTE: the best-known remote state: a
@@ -246,14 +249,18 @@ impl OfflineSync {
 
     /// Three-way merges one handle against its remote state, writing the
     /// resolved placement and returning a push when the local side won.
-    fn merge(&mut self, handle: &Handle, remote_item: Option<RemoteItem>) -> Option<Change> {
+    fn merge(
+        &mut self,
+        handle: &OfflineHandle,
+        remote_item: Option<OfflineRemoteItem>,
+    ) -> Option<OfflineChange> {
         let local = self.local.get(handle).cloned();
 
         let based = local.as_ref().map(|p| p.base.is_some()).unwrap_or(false);
 
         let local_tombstone = local
             .as_ref()
-            .map(|p| p.status == Status::Tombstone)
+            .map(|p| p.status == OfflineStatus::Tombstone)
             .unwrap_or(false);
         let local_present = local.is_some() && !local_tombstone;
         let remote_present = remote_item.is_some();
@@ -293,7 +300,7 @@ impl OfflineSync {
                 if edited && local.origin.is_some() {
                     self.pending_content_pushes
                         .insert(handle.clone(), local.clone());
-                    return Some(Change::Update {
+                    return Some(OfflineChange::Update {
                         handle: handle.clone(),
                         object: local.object.clone().expect("a staged edited body"),
                         if_match: base_revision,
@@ -306,7 +313,7 @@ impl OfflineSync {
                 // none, and the consumer routes it to trash.
                 self.pending_drops.insert(handle.clone());
                 let to = local.origin.as_ref().map(|o| o.collection.clone());
-                Some(Change::Remove {
+                Some(OfflineChange::Remove {
                     handle: handle.clone(),
                     to,
                     if_match: base_revision,
@@ -328,7 +335,7 @@ impl OfflineSync {
                 // conflicted placement holds such an edit too, and the
                 // remote deleting its side makes the conflict moot: the
                 // surviving local edit wins by default.
-                let edited = matches!(local.status, Status::Dirty | Status::Conflict)
+                let edited = matches!(local.status, OfflineStatus::Dirty | OfflineStatus::Conflict)
                     && local.object.is_some()
                     && local
                         .base
@@ -336,18 +343,18 @@ impl OfflineSync {
                         .is_some_and(|b| local.object != b.object);
                 if edited {
                     let mut resurrected = local.clone();
-                    resurrected.status = Status::Created;
+                    resurrected.status = OfflineStatus::Created;
                     resurrected.conflict_revision = None;
                     resurrected.base = None;
                     resurrected.origin = None;
                     self.writes
-                        .push(WriteOp::UpsertPlacement(resurrected.clone()));
+                        .push(OfflineWriteOp::UpsertPlacement(resurrected.clone()));
 
                     if !self.opts.push {
                         return None;
                     }
                     self.pending_creates.insert(handle.clone(), resurrected);
-                    return Some(Change::Add {
+                    return Some(OfflineChange::Add {
                         handle: handle.clone(),
                         link_id: local.link_id.clone(),
                         flags: local.flags.clone(),
@@ -389,9 +396,9 @@ impl OfflineSync {
             // base-less placement that is not Created is left untouched.
             (true, false, false) => {
                 let local = local.as_ref().expect("local present");
-                if self.opts.push && local.status == Status::Created {
+                if self.opts.push && local.status == OfflineStatus::Created {
                     self.pending_creates.insert(handle.clone(), local.clone());
-                    return Some(Change::Add {
+                    return Some(OfflineChange::Add {
                         handle: handle.clone(),
                         link_id: local.link_id.clone(),
                         flags: local.flags.clone(),
@@ -414,7 +421,11 @@ impl OfflineSync {
     /// revision differing from the base. An immutable-content backend
     /// produces neither, so it always falls through untouched to the
     /// flags-only merge.
-    fn reconcile_content(&mut self, local: &Placement, item: &RemoteItem) -> ContentOutcome {
+    fn reconcile_content(
+        &mut self,
+        local: &OfflinePlacement,
+        item: &OfflineRemoteItem,
+    ) -> ContentOutcome {
         let Some(base) = &local.base else {
             // A base-less placement that carries a body the remote also
             // holds is a create-collision: both sides minted content for
@@ -428,31 +439,33 @@ impl OfflineSync {
             // falls through to the flag reconciliation.
             if local.object.is_some() && item.revision.is_some() {
                 let mut conflicted = local.clone();
-                conflicted.status = Status::Conflict;
+                conflicted.status = OfflineStatus::Conflict;
                 conflicted.conflict_revision = item.revision.clone();
                 self.writes
-                    .push(WriteOp::UpsertPlacement(conflicted.clone()));
+                    .push(OfflineWriteOp::UpsertPlacement(conflicted.clone()));
                 self.report.conflicts += 1;
                 return ContentOutcome::Rewritten(conflicted);
             }
             return ContentOutcome::Untouched;
         };
 
-        if local.status == Status::Conflict {
+        if local.status == OfflineStatus::Conflict {
             // NOTE: an unresolved conflict is left alone (the local edit
             // must survive), but the observed remote revision is kept
             // current so the consumer resolves against the latest remote.
             if item.revision.is_some() && item.revision != local.conflict_revision {
                 let mut updated = local.clone();
                 updated.conflict_revision = item.revision.clone();
-                self.writes.push(WriteOp::UpsertPlacement(updated.clone()));
+                self.writes
+                    .push(OfflineWriteOp::UpsertPlacement(updated.clone()));
                 return ContentOutcome::Rewritten(updated);
             }
             return ContentOutcome::Untouched;
         }
 
-        let local_changed =
-            local.status == Status::Dirty && local.object.is_some() && local.object != base.object;
+        let local_changed = local.status == OfflineStatus::Dirty
+            && local.object.is_some()
+            && local.object != base.object;
         let remote_changed = item.revision.is_some() && item.revision != base.revision;
 
         match (local_changed, remote_changed) {
@@ -465,7 +478,7 @@ impl OfflineSync {
                 }
                 self.pending_content_pushes
                     .insert(local.handle.clone(), local.clone());
-                ContentOutcome::Push(Change::Update {
+                ContentOutcome::Push(OfflineChange::Update {
                     handle: local.handle.clone(),
                     object: local.object.clone().expect("a staged edited body"),
                     if_match: base.revision.clone(),
@@ -473,10 +486,10 @@ impl OfflineSync {
             }
             (true, true) => {
                 let mut conflicted = local.clone();
-                conflicted.status = Status::Conflict;
+                conflicted.status = OfflineStatus::Conflict;
                 conflicted.conflict_revision = item.revision.clone();
                 self.writes
-                    .push(WriteOp::UpsertPlacement(conflicted.clone()));
+                    .push(OfflineWriteOp::UpsertPlacement(conflicted.clone()));
                 self.report.conflicts += 1;
                 ContentOutcome::Rewritten(conflicted)
             }
@@ -486,10 +499,14 @@ impl OfflineSync {
     /// Reconciles the flag sets of a placement present on both sides,
     /// returning a push when the local side won any flag.
     ///
-    /// Flags merge element-wise ([`Flags::merge`]) and never conflict:
+    /// OfflineFlags merge element-wise ([`OfflineFlags::merge`]) and never conflict:
     /// divergent sets fold into one merged set that both sides converge
     /// on, pulling the remote-won flags and pushing the local-won ones.
-    fn reconcile_flags(&mut self, local: &Placement, remote: &RemoteItem) -> Option<Change> {
+    fn reconcile_flags(
+        &mut self,
+        local: &OfflinePlacement,
+        remote: &OfflineRemoteItem,
+    ) -> Option<OfflineChange> {
         let base_flags = local.base.as_ref().map(|b| b.flags.clone());
 
         let Some(base_flags) = base_flags else {
@@ -499,7 +516,7 @@ impl OfflineSync {
             return None;
         };
 
-        let merged = Flags::merge(&base_flags, &local.flags, &remote.flags);
+        let merged = OfflineFlags::merge(&base_flags, &local.flags, &remote.flags);
         let pull = merged != local.flags;
         let push = merged != remote.flags;
 
@@ -516,7 +533,9 @@ impl OfflineSync {
                         .base
                         .as_ref()
                         .is_some_and(|b| b.object != local.object);
-                if local.flags != base_flags || (local.status == Status::Dirty && !content_edit) {
+                if local.flags != base_flags
+                    || (local.status == OfflineStatus::Dirty && !content_edit)
+                {
                     self.rebase(local, &merged);
                 }
                 None
@@ -535,7 +554,8 @@ impl OfflineSync {
                 let mut updated = local.clone();
                 updated.flags = merged.clone();
                 if pull {
-                    self.writes.push(WriteOp::UpsertPlacement(updated.clone()));
+                    self.writes
+                        .push(OfflineWriteOp::UpsertPlacement(updated.clone()));
                     self.report.pulled += 1;
                 }
 
@@ -549,7 +569,7 @@ impl OfflineSync {
                 // took (which QRESYNC would then never revisit).
                 self.pending_flag_pushes
                     .insert(local.handle.clone(), updated);
-                Some(Change::SetFlags {
+                Some(OfflineChange::SetFlags {
                     handle: local.handle.clone(),
                     flags: merged,
                 })
@@ -557,49 +577,54 @@ impl OfflineSync {
         }
     }
 
-    fn drop(&mut self, handle: &Handle) {
-        self.writes.push(WriteOp::DropPlacement {
+    fn drop(&mut self, handle: &OfflineHandle) {
+        self.writes.push(OfflineWriteOp::DropPlacement {
             collection: self.collection.clone(),
             handle: handle.clone(),
         });
     }
 
-    fn pull_add(&mut self, item: &RemoteItem) {
-        let placement = Placement {
+    fn pull_add(&mut self, item: &OfflineRemoteItem) {
+        let placement = OfflinePlacement {
             collection: self.collection.clone(),
             handle: item.handle.clone(),
             link_id: None,
             object: None,
-            level: Level::Probed,
+            level: OfflineLevel::Probed,
             meta: None,
             flags: item.flags.clone(),
-            status: Status::Clean,
+            status: OfflineStatus::Clean,
             conflict_revision: None,
-            base: Some(Base {
+            base: Some(OfflineBase {
                 flags: item.flags.clone(),
                 revision: item.revision.clone(),
                 object: None,
             }),
             origin: None,
         };
-        self.writes.push(WriteOp::UpsertPlacement(placement));
+        self.writes.push(OfflineWriteOp::UpsertPlacement(placement));
     }
 
     /// Pulls a remote content change: the stale local body is dropped and
     /// the base adopts the new revision. The level falls back to probed
     /// (the cached summary describes the old revision; it is kept as a
-    /// display fallback until a meta upgrade refetches it). Flags and
+    /// display fallback until a meta upgrade refetches it). OfflineFlags and
     /// status are left for the flag reconciliation to settle.
-    fn pull_content(&mut self, local: &Placement, item: &RemoteItem) -> Placement {
+    fn pull_content(
+        &mut self,
+        local: &OfflinePlacement,
+        item: &OfflineRemoteItem,
+    ) -> OfflinePlacement {
         let mut updated = local.clone();
         updated.object = None;
-        updated.level = Level::Probed;
+        updated.level = OfflineLevel::Probed;
         if let Some(base) = &mut updated.base {
             base.revision = item.revision.clone();
             base.object = None;
         }
 
-        self.writes.push(WriteOp::UpsertPlacement(updated.clone()));
+        self.writes
+            .push(OfflineWriteOp::UpsertPlacement(updated.clone()));
         self.report.refreshed += 1;
         updated
     }
@@ -607,41 +632,41 @@ impl OfflineSync {
     /// Adopts `flags` as both the current and the base flag set. An
     /// unresolved content conflict keeps its status (only the flag axis
     /// converged), everything else lands clean.
-    fn pull_flags(&mut self, local: &Placement, flags: &Flags) {
+    fn pull_flags(&mut self, local: &OfflinePlacement, flags: &OfflineFlags) {
         let mut updated = local.clone();
         updated.flags = flags.clone();
-        if updated.status != Status::Conflict {
-            updated.status = Status::Clean;
+        if updated.status != OfflineStatus::Conflict {
+            updated.status = OfflineStatus::Clean;
         }
-        updated.base = Some(Base {
+        updated.base = Some(OfflineBase {
             flags: flags.clone(),
             revision: local.base.as_ref().and_then(|b| b.revision.clone()),
             object: local.base.as_ref().and_then(|b| b.object.clone()),
         });
-        self.writes.push(WriteOp::UpsertPlacement(updated));
+        self.writes.push(OfflineWriteOp::UpsertPlacement(updated));
     }
 
     /// Rebases the flag axis onto `flags`, keeping the current flag set.
     /// An unresolved content conflict keeps its status (its resolution
     /// belongs to an edit), everything else lands clean.
-    fn rebase(&mut self, local: &Placement, flags: &Flags) {
+    fn rebase(&mut self, local: &OfflinePlacement, flags: &OfflineFlags) {
         let mut updated = local.clone();
-        if updated.status != Status::Conflict {
-            updated.status = Status::Clean;
+        if updated.status != OfflineStatus::Conflict {
+            updated.status = OfflineStatus::Clean;
         }
-        updated.base = Some(Base {
+        updated.base = Some(OfflineBase {
             flags: flags.clone(),
             revision: local.base.as_ref().and_then(|b| b.revision.clone()),
             object: local.base.as_ref().and_then(|b| b.object.clone()),
         });
-        self.writes.push(WriteOp::UpsertPlacement(updated));
+        self.writes.push(OfflineWriteOp::UpsertPlacement(updated));
     }
 
     /// Rebases an accepted content push: the base pins the pushed body and
     /// the revision the remote reported. The base flags are left as they
     /// were, so a flag edit that rode along with the content edit stays
     /// derivable and pushes on the next sync.
-    fn rebase_content(&mut self, local: &Placement, revision: Option<String>) {
+    fn rebase_content(&mut self, local: &OfflinePlacement, revision: Option<String>) {
         let base_flags = local
             .base
             .as_ref()
@@ -651,19 +676,19 @@ impl OfflineSync {
         let mut updated = local.clone();
         // NOTE: a tombstone stays a tombstone: its edit pushed ahead of
         // the pending move, which derives on the next sync.
-        updated.status = if local.status == Status::Tombstone {
-            Status::Tombstone
+        updated.status = if local.status == OfflineStatus::Tombstone {
+            OfflineStatus::Tombstone
         } else if local.flags == base_flags {
-            Status::Clean
+            OfflineStatus::Clean
         } else {
-            Status::Dirty
+            OfflineStatus::Dirty
         };
-        updated.base = Some(Base {
+        updated.base = Some(OfflineBase {
             flags: base_flags,
             revision,
             object: local.object.clone(),
         });
-        self.writes.push(WriteOp::UpsertPlacement(updated));
+        self.writes.push(OfflineWriteOp::UpsertPlacement(updated));
     }
 
     /// Rekeys an accepted create: drops the provisional placeholder and
@@ -671,18 +696,23 @@ impl OfflineSync {
     /// and based, so the next enumerate reconciles it as already in sync.
     /// The base records the revision the push reported and pins the pushed
     /// body: the remote now holds exactly that content.
-    fn rekey_create(&mut self, placeholder: Placement, handle: Handle, revision: Option<String>) {
+    fn rekey_create(
+        &mut self,
+        placeholder: OfflinePlacement,
+        handle: OfflineHandle,
+        revision: Option<String>,
+    ) {
         self.drop(&placeholder.handle);
         let mut placed = placeholder;
         placed.handle = handle;
-        placed.status = Status::Clean;
+        placed.status = OfflineStatus::Clean;
         placed.origin = None;
-        placed.base = Some(Base {
+        placed.base = Some(OfflineBase {
             flags: placed.flags.clone(),
             revision,
             object: placed.object.clone(),
         });
-        self.writes.push(WriteOp::UpsertPlacement(placed));
+        self.writes.push(OfflineWriteOp::UpsertPlacement(placed));
     }
 }
 
@@ -764,7 +794,7 @@ impl OfflineCoroutine for OfflineSync {
                         // rekey a confirmed create to its server-assigned
                         // handle, so the local state matches what the
                         // remote now holds.
-                        PushOutcome::Accepted => {
+                        OfflinePushOutcome::Accepted => {
                             self.report.pushed += 1;
                             if let Some(placement) = self.pending_flag_pushes.remove(&result.handle)
                             {
@@ -798,7 +828,7 @@ impl OfflineCoroutine for OfflineSync {
                         // The remote refused it: leave the dirty placement,
                         // tombstone or placeholder untouched so the next sync
                         // retries the push.
-                        PushOutcome::Rejected => self.report.rejected += 1,
+                        OfflinePushOutcome::Rejected => self.report.rejected += 1,
                     }
                 }
                 // Any handle the push never reported on stays pending too.
@@ -840,9 +870,9 @@ enum ContentOutcome {
     /// The placement was rewritten (a remote content pull, a fresh
     /// conflict mark, or conflict tracking): the flag merge runs on the
     /// rewritten copy, never on the stale loaded one.
-    Rewritten(Placement),
+    Rewritten(OfflinePlacement),
     /// The local content won: the change to push.
-    Push(Change),
+    Push(OfflineChange),
 }
 
 enum State {
@@ -867,49 +897,49 @@ impl fmt::Display for State {
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec::Vec;
+    use alloc::{vec, vec::Vec};
 
     use crate::{
-        object::Hash,
-        placement::{LinkId, Origin},
-        remote::{PushOutcome, PushResult, RemoteSnapshot},
-        storage::Loaded,
+        object::OfflineHash,
+        placement::{OfflineLinkId, OfflineOrigin},
+        remote::{OfflinePushOutcome, OfflinePushResult, OfflineRemoteSnapshot},
+        storage::OfflineLoaded,
         sync::*,
     };
 
     /// A pending create staged in "inbox", its body sourced from "sent".
-    fn created(handle: &str) -> Placement {
-        Placement {
+    fn created(handle: &str) -> OfflinePlacement {
+        OfflinePlacement {
             collection: "inbox".into(),
-            handle: Handle::from(handle),
+            handle: OfflineHandle::from(handle),
             link_id: None,
             object: None,
-            level: Level::Probed,
+            level: OfflineLevel::Probed,
             meta: None,
-            flags: Flags::default(),
-            status: Status::Created,
+            flags: OfflineFlags::default(),
+            status: OfflineStatus::Created,
             conflict_revision: None,
             base: None,
-            origin: Some(Origin {
+            origin: Some(OfflineOrigin {
                 collection: "sent".into(),
-                handle: Handle::from("9"),
+                handle: OfflineHandle::from("9"),
             }),
         }
     }
 
-    fn synced(handle: &str, flags: &[&str]) -> Placement {
-        Placement {
+    fn synced(handle: &str, flags: &[&str]) -> OfflinePlacement {
+        OfflinePlacement {
             collection: "inbox".into(),
-            handle: Handle::from(handle),
-            link_id: Some(LinkId::from(handle)),
+            handle: OfflineHandle::from(handle),
+            link_id: Some(OfflineLinkId::from(handle)),
             object: None,
-            level: Level::Probed,
+            level: OfflineLevel::Probed,
             meta: None,
-            flags: Flags::from_iter(flags.iter().copied()),
-            status: Status::Clean,
+            flags: OfflineFlags::from_iter(flags.iter().copied()),
+            status: OfflineStatus::Clean,
             conflict_revision: None,
-            base: Some(Base {
-                flags: Flags::from_iter(flags.iter().copied()),
+            base: Some(OfflineBase {
+                flags: OfflineFlags::from_iter(flags.iter().copied()),
                 revision: None,
                 object: None,
             }),
@@ -917,48 +947,56 @@ mod tests {
         }
     }
 
-    fn remote(handle: &str, flags: &[&str]) -> RemoteItem {
-        RemoteItem {
-            handle: Handle::from(handle),
-            flags: Flags::from_iter(flags.iter().copied()),
+    fn remote(handle: &str, flags: &[&str]) -> OfflineRemoteItem {
+        OfflineRemoteItem {
+            handle: OfflineHandle::from(handle),
+            flags: OfflineFlags::from_iter(flags.iter().copied()),
             revision: None,
         }
     }
 
-    fn full(items: Vec<RemoteItem>) -> RemoteSnapshot {
-        RemoteSnapshot {
+    fn full(items: Vec<OfflineRemoteItem>) -> OfflineRemoteSnapshot {
+        OfflineRemoteSnapshot {
             items,
             vanished: Vec::new(),
             complete: true,
-            checkpoint: Checkpoint(b"c1".to_vec()),
+            checkpoint: OfflineCheckpoint(b"c1".to_vec()),
         }
     }
 
-    fn delta(items: Vec<RemoteItem>, vanished: Vec<Handle>) -> RemoteSnapshot {
-        RemoteSnapshot {
+    fn delta(items: Vec<OfflineRemoteItem>, vanished: Vec<OfflineHandle>) -> OfflineRemoteSnapshot {
+        OfflineRemoteSnapshot {
             items,
             vanished,
             complete: false,
-            checkpoint: Checkpoint(b"c1".to_vec()),
+            checkpoint: OfflineCheckpoint(b"c1".to_vec()),
         }
     }
 
     fn run(
         sync: &mut OfflineSync,
-        local: Vec<Placement>,
-        items: Vec<RemoteItem>,
-    ) -> (Option<Vec<Change>>, Vec<WriteOp>, OfflineSyncReport) {
+        local: Vec<OfflinePlacement>,
+        items: Vec<OfflineRemoteItem>,
+    ) -> (
+        Option<Vec<OfflineChange>>,
+        Vec<OfflineWriteOp>,
+        OfflineSyncReport,
+    ) {
         run_snapshot(sync, local, full(items))
     }
 
     fn run_snapshot(
         sync: &mut OfflineSync,
-        local: Vec<Placement>,
-        snapshot: RemoteSnapshot,
-    ) -> (Option<Vec<Change>>, Vec<WriteOp>, OfflineSyncReport) {
+        local: Vec<OfflinePlacement>,
+        snapshot: OfflineRemoteSnapshot,
+    ) -> (
+        Option<Vec<OfflineChange>>,
+        Vec<OfflineWriteOp>,
+        OfflineSyncReport,
+    ) {
         crate::testlog::init();
         let _ = sync.resume(None);
-        let _ = sync.resume(Some(OfflineArg::Load(Loaded {
+        let _ = sync.resume(Some(OfflineArg::Load(OfflineLoaded {
             placements: local,
             checkpoint: None,
         })));
@@ -971,14 +1009,14 @@ mod tests {
                     .iter()
                     .map(|change| {
                         let handle = match change {
-                            Change::Add { handle, .. } => handle,
-                            Change::Remove { handle, .. } => handle,
-                            Change::SetFlags { handle, .. } => handle,
-                            Change::Update { handle, .. } => handle,
+                            OfflineChange::Add { handle, .. } => handle,
+                            OfflineChange::Remove { handle, .. } => handle,
+                            OfflineChange::SetFlags { handle, .. } => handle,
+                            OfflineChange::Update { handle, .. } => handle,
                         };
-                        PushResult {
+                        OfflinePushResult {
                             handle: handle.clone(),
-                            outcome: PushOutcome::Accepted,
+                            outcome: OfflinePushOutcome::Accepted,
                             assigned: None,
                             revision: None,
                         }
@@ -1010,24 +1048,24 @@ mod tests {
 
         assert!(pushes.is_none());
         assert_eq!(report.pulled, 1);
-        let WriteOp::UpsertPlacement(p) = &writes[0] else {
+        let OfflineWriteOp::UpsertPlacement(p) = &writes[0] else {
             panic!("expected UpsertPlacement, got {:?}", writes[0]);
         };
-        assert_eq!(p.level, Level::Probed);
+        assert_eq!(p.level, OfflineLevel::Probed);
         assert!(p.flags.contains("seen"));
     }
 
     #[test]
     fn local_flag_change_pushes() {
         let mut local = synced("1", &[]);
-        local.flags = Flags::from_iter(["seen"]);
-        local.status = Status::Dirty;
+        local.flags = OfflineFlags::from_iter(["seen"]);
+        local.status = OfflineStatus::Dirty;
 
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
         let (pushes, _writes, report) = run(&mut sync, vec![local], vec![remote("1", &[])]);
 
         let pushes = pushes.expect("a push");
-        assert!(matches!(pushes[0], Change::SetFlags { .. }));
+        assert!(matches!(pushes[0], OfflineChange::SetFlags { .. }));
         assert_eq!(report.pushed, 1);
     }
 
@@ -1035,13 +1073,13 @@ mod tests {
     /// and returns the storage writes the engine then stages and the report.
     fn drive_push(
         sync: &mut OfflineSync,
-        local: Vec<Placement>,
-        items: Vec<RemoteItem>,
-        results: Vec<PushResult>,
-    ) -> (Vec<WriteOp>, OfflineSyncReport) {
+        local: Vec<OfflinePlacement>,
+        items: Vec<OfflineRemoteItem>,
+        results: Vec<OfflinePushResult>,
+    ) -> (Vec<OfflineWriteOp>, OfflineSyncReport) {
         crate::testlog::init();
         let _ = sync.resume(None);
-        let _ = sync.resume(Some(OfflineArg::Load(Loaded {
+        let _ = sync.resume(Some(OfflineArg::Load(OfflineLoaded {
             placements: local,
             checkpoint: None,
         })));
@@ -1061,9 +1099,9 @@ mod tests {
     }
 
     /// Finds the placement an UpsertPlacement op writes for `handle`, if any.
-    fn upserted<'a>(writes: &'a [WriteOp], handle: &str) -> Option<&'a Placement> {
+    fn upserted<'a>(writes: &'a [OfflineWriteOp], handle: &str) -> Option<&'a OfflinePlacement> {
         writes.iter().find_map(|w| match w {
-            WriteOp::UpsertPlacement(p) if p.handle.as_str() == handle => Some(p),
+            OfflineWriteOp::UpsertPlacement(p) if p.handle.as_str() == handle => Some(p),
             _ => None,
         })
     }
@@ -1071,13 +1109,13 @@ mod tests {
     #[test]
     fn rejected_flag_push_keeps_dirty() {
         let mut local = synced("1", &[]);
-        local.flags = Flags::from_iter(["flagged"]);
-        local.status = Status::Dirty;
+        local.flags = OfflineFlags::from_iter(["flagged"]);
+        local.status = OfflineStatus::Dirty;
 
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
-        let results = vec![PushResult {
-            handle: Handle::from("1"),
-            outcome: PushOutcome::Rejected,
+        let results = vec![OfflinePushResult {
+            handle: OfflineHandle::from("1"),
+            outcome: OfflinePushOutcome::Rejected,
             assigned: None,
             revision: None,
         }];
@@ -1093,20 +1131,20 @@ mod tests {
     #[test]
     fn accepted_flag_push_rebases_clean() {
         let mut local = synced("1", &[]);
-        local.flags = Flags::from_iter(["flagged"]);
-        local.status = Status::Dirty;
+        local.flags = OfflineFlags::from_iter(["flagged"]);
+        local.status = OfflineStatus::Dirty;
 
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
-        let results = vec![PushResult {
-            handle: Handle::from("1"),
-            outcome: PushOutcome::Accepted,
+        let results = vec![OfflinePushResult {
+            handle: OfflineHandle::from("1"),
+            outcome: OfflinePushOutcome::Accepted,
             assigned: None,
             revision: None,
         }];
         let (writes, _report) = drive_push(&mut sync, vec![local], vec![remote("1", &[])], results);
 
         let rebased = upserted(&writes, "1").expect("an accepted flag push rebases the placement");
-        assert_eq!(rebased.status, Status::Clean);
+        assert_eq!(rebased.status, OfflineStatus::Clean);
         assert!(
             rebased
                 .base
@@ -1120,23 +1158,23 @@ mod tests {
     #[test]
     fn partial_push_accepts_one_rejects_other() {
         let mut one = synced("1", &[]);
-        one.flags = Flags::from_iter(["flagged"]);
-        one.status = Status::Dirty;
+        one.flags = OfflineFlags::from_iter(["flagged"]);
+        one.status = OfflineStatus::Dirty;
         let mut two = synced("2", &[]);
-        two.flags = Flags::from_iter(["flagged"]);
-        two.status = Status::Dirty;
+        two.flags = OfflineFlags::from_iter(["flagged"]);
+        two.status = OfflineStatus::Dirty;
 
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
         let results = vec![
-            PushResult {
-                handle: Handle::from("1"),
-                outcome: PushOutcome::Accepted,
+            OfflinePushResult {
+                handle: OfflineHandle::from("1"),
+                outcome: OfflinePushOutcome::Accepted,
                 assigned: None,
                 revision: None,
             },
-            PushResult {
-                handle: Handle::from("2"),
-                outcome: PushOutcome::Rejected,
+            OfflinePushResult {
+                handle: OfflineHandle::from("2"),
+                outcome: OfflinePushOutcome::Rejected,
                 assigned: None,
                 revision: None,
             },
@@ -1152,7 +1190,7 @@ mod tests {
         // (no write), so the next sync retries it.
         assert_eq!(
             upserted(&writes, "1").expect("accepted rebases").status,
-            Status::Clean,
+            OfflineStatus::Clean,
         );
         assert!(
             upserted(&writes, "2").is_none(),
@@ -1165,15 +1203,15 @@ mod tests {
     #[test]
     fn rejected_push_retries_on_next_sync() {
         let mut local = synced("1", &[]);
-        local.flags = Flags::from_iter(["flagged"]);
-        local.status = Status::Dirty;
+        local.flags = OfflineFlags::from_iter(["flagged"]);
+        local.status = OfflineStatus::Dirty;
 
         // First sync: the remote rejects the push, so nothing is rebased and
         // the placement stays dirty in storage.
         let mut first = OfflineSync::new("inbox", OfflineSyncOptions::default());
-        let results = vec![PushResult {
-            handle: Handle::from("1"),
-            outcome: PushOutcome::Rejected,
+        let results = vec![OfflinePushResult {
+            handle: OfflineHandle::from("1"),
+            outcome: OfflinePushOutcome::Rejected,
             assigned: None,
             revision: None,
         }];
@@ -1191,7 +1229,7 @@ mod tests {
         let mut second = OfflineSync::new("inbox", OfflineSyncOptions::default());
         let (pushes, _writes, report) = run(&mut second, vec![local], vec![remote("1", &[])]);
         let pushes = pushes.expect("the dirty change is pushed again");
-        assert!(matches!(pushes[0], Change::SetFlags { .. }));
+        assert!(matches!(pushes[0], OfflineChange::SetFlags { .. }));
         assert_eq!(report.pushed, 1);
     }
 
@@ -1203,11 +1241,11 @@ mod tests {
 
         assert!(pushes.is_none());
         assert_eq!(report.pulled, 1);
-        let WriteOp::UpsertPlacement(p) = &writes[0] else {
+        let OfflineWriteOp::UpsertPlacement(p) = &writes[0] else {
             panic!("expected UpsertPlacement, got {:?}", writes[0]);
         };
         assert!(p.flags.contains("seen"));
-        assert_eq!(p.status, Status::Clean);
+        assert_eq!(p.status, OfflineStatus::Clean);
     }
 
     #[test]
@@ -1216,14 +1254,14 @@ mod tests {
         // each side wins its own flag; the merged union is pushed and the
         // remote-won flag folded in locally, with no conflict.
         let mut local = synced("1", &[]);
-        local.flags = Flags::from_iter(["flagged"]);
-        local.status = Status::Dirty;
+        local.flags = OfflineFlags::from_iter(["flagged"]);
+        local.status = OfflineStatus::Dirty;
 
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
         let (pushes, writes, report) = run(&mut sync, vec![local], vec![remote("1", &["seen"])]);
 
         match &pushes.expect("a push")[0] {
-            Change::SetFlags { flags, .. } => {
+            OfflineChange::SetFlags { flags, .. } => {
                 assert!(flags.contains("flagged") && flags.contains("seen"));
             }
             other => panic!("expected a SetFlags push, got {other:?}"),
@@ -1236,11 +1274,11 @@ mod tests {
             .iter()
             .rev()
             .find_map(|w| match w {
-                WriteOp::UpsertPlacement(p) if p.handle.as_str() == "1" => Some(p),
+                OfflineWriteOp::UpsertPlacement(p) if p.handle.as_str() == "1" => Some(p),
                 _ => None,
             })
             .expect("a rebased placement");
-        assert_eq!(rebased.status, Status::Clean);
+        assert_eq!(rebased.status, OfflineStatus::Clean);
         assert!(rebased.flags.contains("flagged") && rebased.flags.contains("seen"));
         let base = rebased.base.as_ref().expect("a base");
         assert!(base.flags.contains("flagged") && base.flags.contains("seen"));
@@ -1251,8 +1289,8 @@ mod tests {
         // Local removed the base flag "seen" while the remote added
         // "important": the local removal and the remote addition both win.
         let mut local = synced("1", &["seen"]);
-        local.flags = Flags::default();
-        local.status = Status::Dirty;
+        local.flags = OfflineFlags::default();
+        local.status = OfflineStatus::Dirty;
 
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
         let (pushes, _writes, report) = run(
@@ -1262,7 +1300,7 @@ mod tests {
         );
 
         match &pushes.expect("a push")[0] {
-            Change::SetFlags { flags, .. } => {
+            OfflineChange::SetFlags { flags, .. } => {
                 assert!(flags.contains("important"), "the remote addition wins");
                 assert!(!flags.contains("seen"), "the local removal wins");
             }
@@ -1274,8 +1312,8 @@ mod tests {
     #[test]
     fn read_only_keeps_local_dirty() {
         let mut local = synced("1", &[]);
-        local.flags = Flags::from_iter(["seen"]);
-        local.status = Status::Dirty;
+        local.flags = OfflineFlags::from_iter(["seen"]);
+        local.status = OfflineStatus::Dirty;
 
         let opts = OfflineSyncOptions {
             push: false,
@@ -1292,13 +1330,13 @@ mod tests {
     fn delta_vanished_drops() {
         let local = synced("1", &["seen"]);
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
-        let snapshot = delta(vec![], vec![Handle::from("1")]);
+        let snapshot = delta(vec![], vec![OfflineHandle::from("1")]);
         let (pushes, writes, report) = run_snapshot(&mut sync, vec![local], snapshot);
 
         assert!(pushes.is_none());
         assert_eq!(report.pulled, 1);
         assert!(
-            matches!(&writes[0], WriteOp::DropPlacement { handle, .. } if handle.as_str() == "1"),
+            matches!(&writes[0], OfflineWriteOp::DropPlacement { handle, .. } if handle.as_str() == "1"),
             "vanished placement dropped, got {:?}",
             writes[0],
         );
@@ -1312,11 +1350,11 @@ mod tests {
 
         assert!(pushes.is_none());
         assert_eq!(report.pulled, 1);
-        let WriteOp::UpsertPlacement(p) = &writes[0] else {
+        let OfflineWriteOp::UpsertPlacement(p) = &writes[0] else {
             panic!("expected UpsertPlacement, got {:?}", writes[0]);
         };
         assert_eq!(p.handle.as_str(), "9");
-        assert_eq!(p.level, Level::Probed);
+        assert_eq!(p.level, OfflineLevel::Probed);
     }
 
     #[test]
@@ -1331,7 +1369,7 @@ mod tests {
         assert!(pushes.is_none());
         assert_eq!(report.pulled, 1);
         assert_eq!(writes.len(), 2, "only the changed placement and checkpoint");
-        let WriteOp::UpsertPlacement(p) = &writes[0] else {
+        let OfflineWriteOp::UpsertPlacement(p) = &writes[0] else {
             panic!("expected UpsertPlacement, got {:?}", writes[0]);
         };
         assert_eq!(p.handle.as_str(), "2");
@@ -1341,8 +1379,8 @@ mod tests {
     #[test]
     fn delta_pushes_unlisted_local_dirty() {
         let mut local = synced("1", &[]);
-        local.flags = Flags::from_iter(["seen"]);
-        local.status = Status::Dirty;
+        local.flags = OfflineFlags::from_iter(["seen"]);
+        local.status = OfflineStatus::Dirty;
 
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
         // the dirty handle is not in the delta, but its pending push must
@@ -1351,7 +1389,7 @@ mod tests {
         let (pushes, _writes, report) = run_snapshot(&mut sync, vec![local], snapshot);
 
         let pushes = pushes.expect("a push");
-        assert!(matches!(pushes[0], Change::SetFlags { .. }));
+        assert!(matches!(pushes[0], OfflineChange::SetFlags { .. }));
         assert_eq!(report.pushed, 1);
     }
 
@@ -1377,8 +1415,8 @@ mod tests {
         // Both sides moved to the same flags from a shared base: converge
         // clean, no push and no conflict.
         let mut local = synced("1", &[]);
-        local.flags = Flags::from_iter(["flagged"]);
-        local.status = Status::Dirty;
+        local.flags = OfflineFlags::from_iter(["flagged"]);
+        local.status = OfflineStatus::Dirty;
 
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
         let (pushes, writes, report) = run(&mut sync, vec![local], vec![remote("1", &["flagged"])]);
@@ -1386,7 +1424,7 @@ mod tests {
         assert!(pushes.is_none(), "no push when both reached the same flags");
         assert_eq!(report.conflicts, 0);
         let rebased = upserted(&writes, "1").expect("a converging rebase");
-        assert_eq!(rebased.status, Status::Clean);
+        assert_eq!(rebased.status, OfflineStatus::Clean);
         assert!(
             rebased
                 .base
@@ -1410,7 +1448,7 @@ mod tests {
         assert!(pushes.is_none());
         assert_eq!(report.pulled, 1);
         let pulled = upserted(&writes, "1").expect("a converged placement");
-        assert_eq!(pulled.status, Status::Clean);
+        assert_eq!(pulled.status, OfflineStatus::Clean);
         assert!(pulled.flags.contains("seen"));
         assert!(!pulled.flags.contains("flagged"), "remote flags win");
     }
@@ -1422,20 +1460,28 @@ mod tests {
         // Conflict and the staged local edit survives, so the next sync
         // never mistakes the placement for clean and drops the edit.
         let mut placement = edited("1");
-        placement.status = Status::Conflict;
+        placement.status = OfflineStatus::Conflict;
         placement.conflict_revision = Some("r2".into());
 
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
         let mut item = remote_rev("1", "r2");
-        item.flags = Flags::from_iter(["seen"]);
+        item.flags = OfflineFlags::from_iter(["seen"]);
         let (pushes, writes, report) = run(&mut sync, vec![placement], vec![item]);
 
         assert!(pushes.is_none());
         assert_eq!(report.pulled, 1);
         let pulled = upserted(&writes, "1").expect("a flag pull");
-        assert_eq!(pulled.status, Status::Conflict, "the conflict survives");
+        assert_eq!(
+            pulled.status,
+            OfflineStatus::Conflict,
+            "the conflict survives"
+        );
         assert!(pulled.flags.contains("seen"));
-        assert_eq!(pulled.object, Some(Hash::from("h2")), "the edit survives");
+        assert_eq!(
+            pulled.object,
+            Some(OfflineHash::from("h2")),
+            "the edit survives"
+        );
     }
 
     #[test]
@@ -1467,12 +1513,12 @@ mod tests {
         // A tombstone present on both sides pushes a Remove; once the remote
         // accepts it, the placement is dropped.
         let mut local = synced("1", &["seen"]);
-        local.status = Status::Tombstone;
+        local.status = OfflineStatus::Tombstone;
 
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
-        let results = vec![PushResult {
-            handle: Handle::from("1"),
-            outcome: PushOutcome::Accepted,
+        let results = vec![OfflinePushResult {
+            handle: OfflineHandle::from("1"),
+            outcome: OfflinePushOutcome::Accepted,
             assigned: None,
             revision: None,
         }];
@@ -1486,7 +1532,7 @@ mod tests {
         assert_eq!(report.pushed, 1);
         assert!(
             writes.iter().any(
-                |w| matches!(w, WriteOp::DropPlacement { handle, .. } if handle.as_str() == "1")
+                |w| matches!(w, OfflineWriteOp::DropPlacement { handle, .. } if handle.as_str() == "1")
             ),
             "an accepted delete drops the tombstone: {writes:?}",
         );
@@ -1497,12 +1543,12 @@ mod tests {
         // A delete the remote refuses (e.g. no trash to move into) must keep
         // the tombstone, not drop a message the server still has.
         let mut local = synced("1", &["seen"]);
-        local.status = Status::Tombstone;
+        local.status = OfflineStatus::Tombstone;
 
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
-        let results = vec![PushResult {
-            handle: Handle::from("1"),
-            outcome: PushOutcome::Rejected,
+        let results = vec![OfflinePushResult {
+            handle: OfflineHandle::from("1"),
+            outcome: OfflinePushOutcome::Rejected,
             assigned: None,
             revision: None,
         }];
@@ -1516,7 +1562,7 @@ mod tests {
         assert_eq!(report.rejected, 1);
         assert!(
             !writes.iter().any(
-                |w| matches!(w, WriteOp::DropPlacement { handle, .. } if handle.as_str() == "1")
+                |w| matches!(w, OfflineWriteOp::DropPlacement { handle, .. } if handle.as_str() == "1")
             ),
             "a rejected delete must not drop the tombstone: {writes:?}",
         );
@@ -1526,7 +1572,7 @@ mod tests {
     fn local_delete_gone_remote_just_drops() {
         // A tombstone whose message already vanished upstream needs no push.
         let mut local = synced("1", &["seen"]);
-        local.status = Status::Tombstone;
+        local.status = OfflineStatus::Tombstone;
 
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
         let (pushes, writes, report) = run(&mut sync, vec![local], vec![]);
@@ -1535,7 +1581,7 @@ mod tests {
         assert_eq!(report.pushed, 0);
         assert!(
             writes.iter().any(
-                |w| matches!(w, WriteOp::DropPlacement { handle, .. } if handle.as_str() == "1")
+                |w| matches!(w, OfflineWriteOp::DropPlacement { handle, .. } if handle.as_str() == "1")
             ),
             "the tombstone is dropped without a push: {writes:?}",
         );
@@ -1553,7 +1599,7 @@ mod tests {
         assert_eq!(report.pulled, 1);
         assert!(
             writes.iter().any(
-                |w| matches!(w, WriteOp::DropPlacement { handle, .. } if handle.as_str() == "1")
+                |w| matches!(w, OfflineWriteOp::DropPlacement { handle, .. } if handle.as_str() == "1")
             ),
             "the vanished placement is dropped: {writes:?}",
         );
@@ -1565,7 +1611,7 @@ mod tests {
         // the sync leaves untouched (its upload belongs to the create path).
         let mut local = synced("1", &["flagged"]);
         local.base = None;
-        local.status = Status::Dirty;
+        local.status = OfflineStatus::Dirty;
 
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
         let (pushes, writes, report) = run(&mut sync, vec![local], vec![]);
@@ -1575,7 +1621,7 @@ mod tests {
         assert!(
             upserted(&writes, "1").is_none()
                 && !writes.iter().any(
-                    |w| matches!(w, WriteOp::DropPlacement { handle, .. } if handle.as_str() == "1")
+                    |w| matches!(w, OfflineWriteOp::DropPlacement { handle, .. } if handle.as_str() == "1")
                 ),
             "an offline-created item is neither rewritten nor dropped: {writes:?}",
         );
@@ -1587,12 +1633,12 @@ mod tests {
         // its origin, so the remote can copy rather than re-upload, and its
         // flag set, so an append creates the member with the right flags.
         let mut local = created("tmp-1");
-        local.flags = Flags::from_iter(["seen"]);
+        local.flags = OfflineFlags::from_iter(["seen"]);
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
         let (pushes, _writes, report) = run(&mut sync, vec![local], vec![]);
 
         match &pushes.expect("a push")[0] {
-            Change::Add { origin, flags, .. } => {
+            OfflineChange::Add { origin, flags, .. } => {
                 assert!(origin.is_some());
                 assert!(flags.contains("seen"), "the flag set rides the add");
             }
@@ -1608,29 +1654,29 @@ mod tests {
         // handle the server returned; the base records the pushed revision
         // and pins the pushed body.
         let mut local = created("tmp-1");
-        local.object = Some(Hash::from("h-1"));
+        local.object = Some(OfflineHash::from("h-1"));
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
-        let results = vec![PushResult {
-            handle: Handle::from("tmp-1"),
-            outcome: PushOutcome::Accepted,
-            assigned: Some(Handle::from("42")),
+        let results = vec![OfflinePushResult {
+            handle: OfflineHandle::from("tmp-1"),
+            outcome: OfflinePushOutcome::Accepted,
+            assigned: Some(OfflineHandle::from("42")),
             revision: Some("r1".into()),
         }];
         let (writes, _report) = drive_push(&mut sync, vec![local], vec![], results);
 
         assert!(
             writes.iter().any(
-                |w| matches!(w, WriteOp::DropPlacement { handle, .. } if handle.as_str() == "tmp-1")
+                |w| matches!(w, OfflineWriteOp::DropPlacement { handle, .. } if handle.as_str() == "tmp-1")
             ),
             "the placeholder is dropped: {writes:?}",
         );
         let real =
             upserted(&writes, "42").expect("the placement is rekeyed to the assigned handle");
-        assert_eq!(real.status, Status::Clean);
+        assert_eq!(real.status, OfflineStatus::Clean);
         assert!(real.origin.is_none());
         let base = real.base.as_ref().expect("a base");
         assert_eq!(base.revision.as_deref(), Some("r1"));
-        assert_eq!(base.object, Some(Hash::from("h-1")));
+        assert_eq!(base.object, Some(OfflineHash::from("h-1")));
     }
 
     #[test]
@@ -1639,9 +1685,9 @@ mod tests {
         // no rekey.
         let local = created("tmp-1");
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
-        let results = vec![PushResult {
-            handle: Handle::from("tmp-1"),
-            outcome: PushOutcome::Rejected,
+        let results = vec![OfflinePushResult {
+            handle: OfflineHandle::from("tmp-1"),
+            outcome: OfflinePushOutcome::Rejected,
             assigned: None,
             revision: None,
         }];
@@ -1651,7 +1697,7 @@ mod tests {
         assert!(
             !writes
                 .iter()
-                .any(|w| matches!(w, WriteOp::DropPlacement { .. })),
+                .any(|w| matches!(w, OfflineWriteOp::DropPlacement { .. })),
             "a rejected create must not drop the placeholder: {writes:?}",
         );
         assert!(upserted(&writes, "tmp-1").is_none());
@@ -1662,17 +1708,17 @@ mod tests {
         // A tombstone carrying an origin is a move: it pushes a Remove naming
         // the destination, so the consumer issues a UID MOVE.
         let mut local = synced("1", &["seen"]);
-        local.status = Status::Tombstone;
-        local.origin = Some(Origin {
+        local.status = OfflineStatus::Tombstone;
+        local.origin = Some(OfflineOrigin {
             collection: "archive".into(),
-            handle: Handle::from("1"),
+            handle: OfflineHandle::from("1"),
         });
 
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
         let (pushes, _writes, report) = run(&mut sync, vec![local], vec![remote("1", &["seen"])]);
 
         match &pushes.expect("a push")[0] {
-            Change::Remove { to: Some(to), .. } => assert_eq!(to.as_str(), "archive"),
+            OfflineChange::Remove { to: Some(to), .. } => assert_eq!(to.as_str(), "archive"),
             other => panic!("expected a move Remove, got {other:?}"),
         }
         assert_eq!(report.pushed, 1);
@@ -1684,9 +1730,9 @@ mod tests {
         // drops the placeholder: the next enumerate re-adds the real handle.
         let local = created("tmp-1");
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
-        let results = vec![PushResult {
-            handle: Handle::from("tmp-1"),
-            outcome: PushOutcome::Accepted,
+        let results = vec![OfflinePushResult {
+            handle: OfflineHandle::from("tmp-1"),
+            outcome: OfflinePushOutcome::Accepted,
             assigned: None,
             revision: None,
         }];
@@ -1694,7 +1740,7 @@ mod tests {
 
         assert!(
             writes.iter().any(
-                |w| matches!(w, WriteOp::DropPlacement { handle, .. } if handle.as_str() == "tmp-1")
+                |w| matches!(w, OfflineWriteOp::DropPlacement { handle, .. } if handle.as_str() == "tmp-1")
             ),
             "the placeholder is dropped once the copy lands: {writes:?}",
         );
@@ -1713,9 +1759,9 @@ mod tests {
             },
         );
         let _ = sync.resume(None);
-        let loaded = Loaded {
+        let loaded = OfflineLoaded {
             placements: Vec::new(),
-            checkpoint: Some(Checkpoint(b"cp".to_vec())),
+            checkpoint: Some(OfflineCheckpoint(b"cp".to_vec())),
         };
         match sync.resume(Some(OfflineArg::Load(loaded))) {
             OfflineCoroutineState::Yielded(OfflineYield::WantsEnumerate { cursor, .. }) => {
@@ -1727,19 +1773,19 @@ mod tests {
 
     /// A synced placement carrying a staged content edit: the body points
     /// at "h2" while the base pins "h1" at revision "r1".
-    fn edited(handle: &str) -> Placement {
+    fn edited(handle: &str) -> OfflinePlacement {
         let mut placement = synced(handle, &[]);
-        placement.status = Status::Dirty;
-        placement.object = Some(Hash::from("h2"));
-        placement.level = Level::Full;
+        placement.status = OfflineStatus::Dirty;
+        placement.object = Some(OfflineHash::from("h2"));
+        placement.level = OfflineLevel::Full;
         let base = placement.base.as_mut().expect("a base");
         base.revision = Some("r1".into());
-        base.object = Some(Hash::from("h1"));
+        base.object = Some(OfflineHash::from("h1"));
         placement
     }
 
     /// A remote item at the given content revision.
-    fn remote_rev(handle: &str, revision: &str) -> RemoteItem {
+    fn remote_rev(handle: &str, revision: &str) -> OfflineRemoteItem {
         let mut item = remote(handle, &[]);
         item.revision = Some(revision.into());
         item
@@ -1752,7 +1798,7 @@ mod tests {
         // body and the revision the remote reported.
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
         let _ = sync.resume(None);
-        let _ = sync.resume(Some(OfflineArg::Load(Loaded {
+        let _ = sync.resume(Some(OfflineArg::Load(OfflineLoaded {
             placements: vec![edited("1")],
             checkpoint: None,
         })));
@@ -1764,21 +1810,21 @@ mod tests {
             state => panic!("expected WantsPush, got {state:?}"),
         };
         match &pushes[0] {
-            Change::Update {
+            OfflineChange::Update {
                 handle,
                 object,
                 if_match,
             } => {
                 assert_eq!(handle.as_str(), "1");
-                assert_eq!(object, &Hash::from("h2"));
+                assert_eq!(object, &OfflineHash::from("h2"));
                 assert_eq!(if_match.as_deref(), Some("r1"));
             }
             other => panic!("expected an Update push, got {other:?}"),
         }
 
-        let results = vec![PushResult {
-            handle: Handle::from("1"),
-            outcome: PushOutcome::Accepted,
+        let results = vec![OfflinePushResult {
+            handle: OfflineHandle::from("1"),
+            outcome: OfflinePushOutcome::Accepted,
             assigned: None,
             revision: Some("r2".into()),
         }];
@@ -1788,10 +1834,10 @@ mod tests {
         };
 
         let rebased = upserted(&writes, "1").expect("a rebased placement");
-        assert_eq!(rebased.status, Status::Clean);
+        assert_eq!(rebased.status, OfflineStatus::Clean);
         let base = rebased.base.as_ref().expect("a base");
         assert_eq!(base.revision.as_deref(), Some("r2"));
-        assert_eq!(base.object, Some(Hash::from("h2")));
+        assert_eq!(base.object, Some(OfflineHash::from("h2")));
     }
 
     #[test]
@@ -1801,12 +1847,12 @@ mod tests {
         // dirty, so the flag push derives on the next sync instead of
         // being silently marked synced.
         let mut placement = edited("1");
-        placement.flags = Flags::from_iter(["seen"]);
+        placement.flags = OfflineFlags::from_iter(["seen"]);
 
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
-        let results = vec![PushResult {
-            handle: Handle::from("1"),
-            outcome: PushOutcome::Accepted,
+        let results = vec![OfflinePushResult {
+            handle: OfflineHandle::from("1"),
+            outcome: OfflinePushOutcome::Accepted,
             assigned: None,
             revision: Some("r2".into()),
         }];
@@ -1818,10 +1864,14 @@ mod tests {
         );
 
         let rebased = upserted(&writes, "1").expect("a rebased placement");
-        assert_eq!(rebased.status, Status::Dirty, "the flag edit stays pending");
+        assert_eq!(
+            rebased.status,
+            OfflineStatus::Dirty,
+            "the flag edit stays pending"
+        );
         let base = rebased.base.as_ref().expect("a base");
         assert!(!base.flags.contains("seen"), "base flags stay as synced");
-        assert_eq!(base.object, Some(Hash::from("h2")));
+        assert_eq!(base.object, Some(OfflineHash::from("h2")));
     }
 
     #[test]
@@ -1829,11 +1879,11 @@ mod tests {
         // A remote edit of a clean placement drops the stale body and
         // rebases the revision; the next upgrade refetches on demand.
         let mut placement = synced("1", &[]);
-        placement.object = Some(Hash::from("h1"));
-        placement.level = Level::Full;
+        placement.object = Some(OfflineHash::from("h1"));
+        placement.level = OfflineLevel::Full;
         let base = placement.base.as_mut().expect("a base");
         base.revision = Some("r1".into());
-        base.object = Some(Hash::from("h1"));
+        base.object = Some(OfflineHash::from("h1"));
 
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
         let (pushes, writes, report) = run(&mut sync, vec![placement], vec![remote_rev("1", "r2")]);
@@ -1842,7 +1892,11 @@ mod tests {
         assert_eq!(report.refreshed, 1);
         let refreshed = upserted(&writes, "1").expect("a refreshed placement");
         assert_eq!(refreshed.object, None, "the stale body is dropped");
-        assert_eq!(refreshed.level, Level::Probed, "the summary is stale too");
+        assert_eq!(
+            refreshed.level,
+            OfflineLevel::Probed,
+            "the summary is stale too"
+        );
         let base = refreshed.base.as_ref().expect("a base");
         assert_eq!(base.revision.as_deref(), Some("r2"));
         assert_eq!(base.object, None);
@@ -1861,11 +1915,11 @@ mod tests {
         assert_eq!(report.conflicts, 1);
         assert_eq!(report.refreshed, 0);
         let conflicted = upserted(&writes, "1").expect("a conflicted placement");
-        assert_eq!(conflicted.status, Status::Conflict);
+        assert_eq!(conflicted.status, OfflineStatus::Conflict);
         assert_eq!(conflicted.conflict_revision.as_deref(), Some("r2"));
         assert_eq!(
             conflicted.object,
-            Some(Hash::from("h2")),
+            Some(OfflineHash::from("h2")),
             "the edit survives"
         );
     }
@@ -1881,8 +1935,8 @@ mod tests {
         // resolution then re-establishes a base, so the state self-heals.
         let mut placement = synced("1", &[]);
         placement.base = None;
-        placement.object = Some(Hash::from("h1"));
-        placement.level = Level::Full;
+        placement.object = Some(OfflineHash::from("h1"));
+        placement.level = OfflineLevel::Full;
 
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
         let (pushes, writes, report) = run(&mut sync, vec![placement], vec![remote_rev("1", "r9")]);
@@ -1890,11 +1944,11 @@ mod tests {
         assert!(pushes.is_none(), "an unresolved conflict pushes nothing");
         assert_eq!(report.conflicts, 1);
         let conflicted = upserted(&writes, "1").expect("a conflicted placement");
-        assert_eq!(conflicted.status, Status::Conflict);
+        assert_eq!(conflicted.status, OfflineStatus::Conflict);
         assert_eq!(conflicted.conflict_revision.as_deref(), Some("r9"));
         assert_eq!(
             conflicted.object,
-            Some(Hash::from("h1")),
+            Some(OfflineHash::from("h1")),
             "the body survives for the resolution"
         );
     }
@@ -1908,12 +1962,13 @@ mod tests {
         placement.base = None;
 
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
-        let (pushes, writes, report) = run(&mut sync, vec![placement], vec![remote("1", &["seen"])]);
+        let (pushes, writes, report) =
+            run(&mut sync, vec![placement], vec![remote("1", &["seen"])]);
 
         assert!(pushes.is_none());
         assert_eq!(report.conflicts, 0);
         let converged = upserted(&writes, "1").expect("a converged placement");
-        assert_eq!(converged.status, Status::Clean);
+        assert_eq!(converged.status, OfflineStatus::Clean);
         assert!(converged.base.is_some(), "it becomes based on the remote");
     }
 
@@ -1923,7 +1978,7 @@ mod tests {
         // revision follows the remote so the consumer resolves against the
         // latest content.
         let mut placement = edited("1");
-        placement.status = Status::Conflict;
+        placement.status = OfflineStatus::Conflict;
         placement.conflict_revision = Some("r2".into());
 
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
@@ -1932,9 +1987,13 @@ mod tests {
         assert!(pushes.is_none());
         assert_eq!(report.conflicts, 0, "no recount");
         let tracked = upserted(&writes, "1").expect("an updated placement");
-        assert_eq!(tracked.status, Status::Conflict);
+        assert_eq!(tracked.status, OfflineStatus::Conflict);
         assert_eq!(tracked.conflict_revision.as_deref(), Some("r3"));
-        assert_eq!(tracked.object, Some(Hash::from("h2")), "the edit survives");
+        assert_eq!(
+            tracked.object,
+            Some(OfflineHash::from("h2")),
+            "the edit survives"
+        );
     }
 
     #[test]
@@ -1945,7 +2004,7 @@ mod tests {
         // diverge the replica for good.
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
         let mut item = remote_rev("1", "r2");
-        item.flags = Flags::from_iter(["seen"]);
+        item.flags = OfflineFlags::from_iter(["seen"]);
         let (pushes, writes, report) = run(&mut sync, vec![edited("1")], vec![item]);
 
         assert!(pushes.is_none());
@@ -1954,16 +2013,16 @@ mod tests {
             .iter()
             .rev()
             .find_map(|w| match w {
-                WriteOp::UpsertPlacement(p) if p.handle.as_str() == "1" => Some(p),
+                OfflineWriteOp::UpsertPlacement(p) if p.handle.as_str() == "1" => Some(p),
                 _ => None,
             })
             .expect("a conflict write");
-        assert_eq!(conflicted.status, Status::Conflict);
+        assert_eq!(conflicted.status, OfflineStatus::Conflict);
         assert_eq!(conflicted.conflict_revision.as_deref(), Some("r2"));
         assert!(conflicted.flags.contains("seen"), "the flag change lands");
         assert_eq!(
             conflicted.object,
-            Some(Hash::from("h2")),
+            Some(OfflineHash::from("h2")),
             "the edit survives"
         );
     }
@@ -1976,7 +2035,7 @@ mod tests {
         // conflict tracking would regress and the resolution would push
         // against the wrong precondition.
         let mut placement = edited("1");
-        placement.status = Status::Conflict;
+        placement.status = OfflineStatus::Conflict;
         placement.conflict_revision = Some("r2".into());
 
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
@@ -1997,7 +2056,7 @@ mod tests {
         // no Remove is pushed and the placement is re-pulled fresh on the
         // new revision.
         let mut placement = edited("1");
-        placement.status = Status::Tombstone;
+        placement.status = OfflineStatus::Tombstone;
 
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
         let (pushes, writes, report) = run(&mut sync, vec![placement], vec![remote_rev("1", "r2")]);
@@ -2005,7 +2064,7 @@ mod tests {
         assert!(pushes.is_none(), "the delete is not pushed");
         assert_eq!(report.pulled, 1);
         let resurrected = upserted(&writes, "1").expect("a resurrected placement");
-        assert_eq!(resurrected.status, Status::Clean);
+        assert_eq!(resurrected.status, OfflineStatus::Clean);
         let base = resurrected.base.as_ref().expect("a base");
         assert_eq!(base.revision.as_deref(), Some("r2"));
     }
@@ -2016,15 +2075,15 @@ mod tests {
         // first, so the relocated member holds the edited body; the
         // tombstone survives the rebase and the move derives next sync.
         let mut placement = edited("1");
-        placement.status = Status::Tombstone;
-        placement.origin = Some(Origin {
+        placement.status = OfflineStatus::Tombstone;
+        placement.origin = Some(OfflineOrigin {
             collection: "archive".into(),
-            handle: Handle::from("1"),
+            handle: OfflineHandle::from("1"),
         });
 
         let mut first = OfflineSync::new("inbox", OfflineSyncOptions::default());
         let _ = first.resume(None);
-        let _ = first.resume(Some(OfflineArg::Load(Loaded {
+        let _ = first.resume(Some(OfflineArg::Load(OfflineLoaded {
             placements: vec![placement],
             checkpoint: None,
         })));
@@ -2035,18 +2094,18 @@ mod tests {
             state => panic!("expected WantsPush, got {state:?}"),
         };
         match &pushes[0] {
-            Change::Update {
+            OfflineChange::Update {
                 object, if_match, ..
             } => {
-                assert_eq!(object, &Hash::from("h2"), "the edit pushes first");
+                assert_eq!(object, &OfflineHash::from("h2"), "the edit pushes first");
                 assert_eq!(if_match.as_deref(), Some("r1"));
             }
             other => panic!("expected an Update push, got {other:?}"),
         }
 
-        let results = vec![PushResult {
-            handle: Handle::from("1"),
-            outcome: PushOutcome::Accepted,
+        let results = vec![OfflinePushResult {
+            handle: OfflineHandle::from("1"),
+            outcome: OfflinePushOutcome::Accepted,
             assigned: None,
             revision: Some("r2".into()),
         }];
@@ -2055,10 +2114,14 @@ mod tests {
             state => panic!("expected WantsWrite, got {state:?}"),
         };
         let rebased = upserted(&writes, "1").expect("a rebased placement");
-        assert_eq!(rebased.status, Status::Tombstone, "the move stays pending");
+        assert_eq!(
+            rebased.status,
+            OfflineStatus::Tombstone,
+            "the move stays pending"
+        );
         let base = rebased.base.as_ref().expect("a base");
         assert_eq!(base.revision.as_deref(), Some("r2"));
-        assert_eq!(base.object, Some(Hash::from("h2")));
+        assert_eq!(base.object, Some(OfflineHash::from("h2")));
 
         // second sync: the edit landed, so the move itself derives now,
         // gated on the pushed revision
@@ -2069,7 +2132,7 @@ mod tests {
             vec![remote_rev("1", "r2")],
         );
         match &pushes.expect("a push")[0] {
-            Change::Remove {
+            OfflineChange::Remove {
                 to: Some(to),
                 if_match,
                 ..
@@ -2086,14 +2149,14 @@ mod tests {
         // A pushed delete is gated on the last-synced revision, so a
         // remote edit racing the delete is rejected server-side.
         let mut placement = edited("1");
-        placement.status = Status::Tombstone;
+        placement.status = OfflineStatus::Tombstone;
 
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
         let (pushes, _writes, _report) =
             run(&mut sync, vec![placement], vec![remote_rev("1", "r1")]);
 
         match &pushes.expect("a push")[0] {
-            Change::Remove { if_match, .. } => assert_eq!(if_match.as_deref(), Some("r1")),
+            OfflineChange::Remove { if_match, .. } => assert_eq!(if_match.as_deref(), Some("r1")),
             other => panic!("expected a Remove push, got {other:?}"),
         }
     }
@@ -2108,16 +2171,16 @@ mod tests {
         let (pushes, writes, _report) = run(&mut sync, vec![edited("1")], vec![]);
 
         match &pushes.expect("a push")[0] {
-            Change::Add { object, origin, .. } => {
-                assert_eq!(object, &Some(Hash::from("h2")), "the edited body");
+            OfflineChange::Add { object, origin, .. } => {
+                assert_eq!(object, &Some(OfflineHash::from("h2")), "the edited body");
                 assert!(origin.is_none(), "an append, not a copy");
             }
             other => panic!("expected an Add push, got {other:?}"),
         }
         let resurrected = upserted(&writes, "1").expect("a resurrected placement");
-        assert_eq!(resurrected.status, Status::Created);
+        assert_eq!(resurrected.status, OfflineStatus::Created);
         assert!(resurrected.base.is_none());
-        assert_eq!(resurrected.object, Some(Hash::from("h2")));
+        assert_eq!(resurrected.object, Some(OfflineHash::from("h2")));
     }
 
     #[test]
@@ -2127,7 +2190,7 @@ mod tests {
         // the surviving local edit wins by resurrecting as a pending
         // create rather than being dropped with the placement.
         let mut placement = edited("1");
-        placement.status = Status::Conflict;
+        placement.status = OfflineStatus::Conflict;
         placement.conflict_revision = Some("r2".into());
 
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
@@ -2135,14 +2198,14 @@ mod tests {
 
         assert!(matches!(
             &pushes.expect("a push")[0],
-            Change::Add { origin: None, .. }
+            OfflineChange::Add { origin: None, .. }
         ));
         let resurrected = upserted(&writes, "1").expect("a resurrected placement");
-        assert_eq!(resurrected.status, Status::Created);
+        assert_eq!(resurrected.status, OfflineStatus::Created);
         assert_eq!(resurrected.conflict_revision, None, "the conflict is moot");
         assert_eq!(
             resurrected.object,
-            Some(Hash::from("h2")),
+            Some(OfflineHash::from("h2")),
             "the edit survives"
         );
     }
@@ -2161,8 +2224,8 @@ mod tests {
 
         assert!(pushes.is_none());
         let resurrected = upserted(&writes, "1").expect("a resurrected placement");
-        assert_eq!(resurrected.status, Status::Created);
-        assert_eq!(resurrected.object, Some(Hash::from("h2")));
+        assert_eq!(resurrected.status, OfflineStatus::Created);
+        assert_eq!(resurrected.object, Some(OfflineHash::from("h2")));
     }
 
     #[test]
@@ -2192,7 +2255,7 @@ mod tests {
         // replica mirrors the source, so the delete is applied locally
         // only and the next enumerate re-adds the member.
         let mut local = synced("1", &["seen"]);
-        local.status = Status::Tombstone;
+        local.status = OfflineStatus::Tombstone;
 
         let opts = OfflineSyncOptions {
             push: false,
@@ -2205,7 +2268,7 @@ mod tests {
         assert_eq!(report.pushed, 0);
         assert!(
             writes.iter().any(
-                |w| matches!(w, WriteOp::DropPlacement { handle, .. } if handle.as_str() == "1")
+                |w| matches!(w, OfflineWriteOp::DropPlacement { handle, .. } if handle.as_str() == "1")
             ),
             "the tombstone is applied locally: {writes:?}",
         );
@@ -2217,13 +2280,13 @@ mod tests {
         // (removed before it was ever enumerated locally): nothing to
         // merge, nothing to write, no panic.
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
-        let snapshot = delta(vec![], vec![Handle::from("ghost")]);
+        let snapshot = delta(vec![], vec![OfflineHandle::from("ghost")]);
         let (pushes, writes, report) = run_snapshot(&mut sync, vec![], snapshot);
 
         assert!(pushes.is_none());
         assert_eq!(report, OfflineSyncReport::default());
         assert_eq!(writes.len(), 1, "only the checkpoint write");
-        assert!(matches!(&writes[0], WriteOp::SetCheckpoint { .. }));
+        assert!(matches!(&writes[0], OfflineWriteOp::SetCheckpoint { .. }));
     }
 
     #[test]
@@ -2232,7 +2295,7 @@ mod tests {
         // to push, but the placement must come out clean rather than stay
         // dirty forever.
         let mut local = synced("1", &["seen"]);
-        local.status = Status::Dirty;
+        local.status = OfflineStatus::Dirty;
 
         let mut sync = OfflineSync::new("inbox", OfflineSyncOptions::default());
         let (pushes, writes, report) = run(&mut sync, vec![local], vec![remote("1", &["seen"])]);
@@ -2240,7 +2303,7 @@ mod tests {
         assert!(pushes.is_none(), "nothing to push");
         assert_eq!(report, OfflineSyncReport::default());
         let cleaned = upserted(&writes, "1").expect("a cleaning rebase");
-        assert_eq!(cleaned.status, Status::Clean);
+        assert_eq!(cleaned.status, OfflineStatus::Clean);
     }
 
     #[test]

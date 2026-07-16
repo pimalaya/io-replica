@@ -12,19 +12,19 @@
 //! services each yield and resumes the coroutine with the matching
 //! [`OfflineArg`].
 //!
-//! Storage is therefore not a trait injected into the engine, which would
+//! OfflineStorage is therefore not a trait injected into the engine, which would
 //! break the I/O-free contract: it is `Wants` variants like everything
 //! else. The optional std [`crate::client`] is one such consumer.
 
 use alloc::{collections::BTreeMap, vec::Vec};
 
 use crate::{
-    change::{Change, WriteOp},
-    collection::{Checkpoint, CollectionId},
-    object::Hash,
-    placement::{Handle, LinkId},
-    remote::{FetchedItem, PushResult, RemoteSnapshot, Tier},
-    storage::Loaded,
+    change::{OfflineChange, OfflineWriteOp},
+    collection::{OfflineCheckpoint, OfflineCollectionId},
+    object::OfflineHash,
+    placement::{OfflineHandle, OfflineLinkId},
+    remote::{OfflineFetchedItem, OfflinePushResult, OfflineRemoteSnapshot, OfflineTier},
+    storage::OfflineLoaded,
 };
 
 /// State yielded by an [`OfflineCoroutine::resume`] step.
@@ -73,43 +73,43 @@ pub enum OfflineYield {
     /// `cursor`) and feed back [`OfflineArg::Enumerate`].
     WantsEnumerate {
         /// The collection to enumerate.
-        collection: CollectionId,
+        collection: OfflineCollectionId,
         /// The last checkpoint to delta from, if any.
-        cursor: Option<Checkpoint>,
+        cursor: Option<OfflineCheckpoint>,
     },
 
     /// Consumer must fetch each handle at `tier` and feed back
     /// [`OfflineArg::Fetch`].
     WantsFetch {
         /// The owning collection.
-        collection: CollectionId,
+        collection: OfflineCollectionId,
         /// The handles to fetch.
-        handles: Vec<Handle>,
+        handles: Vec<OfflineHandle>,
         /// The detail tier.
-        tier: Tier,
+        tier: OfflineTier,
     },
 
     /// Consumer must push each change and feed back
     /// [`OfflineArg::Push`].
     WantsPush {
         /// The owning collection.
-        collection: CollectionId,
+        collection: OfflineCollectionId,
         /// The changes to push.
-        changes: Vec<Change>,
+        changes: Vec<OfflineChange>,
     },
 
     /// Consumer must load the collection's placements and checkpoint and
     /// feed back [`OfflineArg::Load`].
-    WantsLoad(CollectionId),
+    WantsLoad(OfflineCollectionId),
 
     /// Consumer must resolve which link ids already have a stored object
     /// and feed back [`OfflineArg::LookupObject`]. This is the dedup
     /// check that skips re-downloading a body shared across collections.
-    WantsLookupObject(Vec<LinkId>),
+    WantsLookupObject(Vec<OfflineLinkId>),
 
     /// Consumer must apply each write atomically and feed back
     /// [`OfflineArg::Write`].
-    WantsWrite(Vec<WriteOp>),
+    WantsWrite(Vec<OfflineWriteOp>),
 }
 
 /// Reply fed back into [`OfflineCoroutine::resume`] by the driver.
@@ -119,16 +119,16 @@ pub enum OfflineYield {
 #[derive(Clone, Debug)]
 pub enum OfflineArg {
     /// Reply to [`OfflineYield::WantsEnumerate`].
-    Enumerate(RemoteSnapshot),
+    Enumerate(OfflineRemoteSnapshot),
     /// Reply to [`OfflineYield::WantsFetch`].
-    Fetch(Vec<FetchedItem>),
+    Fetch(Vec<OfflineFetchedItem>),
     /// Reply to [`OfflineYield::WantsPush`].
-    Push(Vec<PushResult>),
+    Push(Vec<OfflinePushResult>),
     /// Reply to [`OfflineYield::WantsLoad`].
-    Load(Loaded),
+    Load(OfflineLoaded),
     /// Reply to [`OfflineYield::WantsLookupObject`]: the subset of link
     /// ids that already map to a stored object.
-    LookupObject(BTreeMap<LinkId, Hash>),
+    LookupObject(BTreeMap<OfflineLinkId, OfflineHash>),
     /// Reply to [`OfflineYield::WantsWrite`].
     Write,
 }

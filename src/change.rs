@@ -1,22 +1,22 @@
 //! Outbound remote changes and inbound storage writes.
 //!
-//! [`Change`] is what the engine asks the consumer to push to the remote;
-//! [`WriteOp`] is what it asks the consumer to persist locally. The engine
+//! [`OfflineChange`] is what the engine asks the consumer to push to the remote;
+//! [`OfflineWriteOp`] is what it asks the consumer to persist locally. The engine
 //! itself performs neither: both travel as coroutine yields.
 
 use alloc::{string::String, vec::Vec};
 
 use crate::{
-    collection::{Checkpoint, CollectionId},
-    object::{Hash, Object},
-    placement::{Flags, Handle, LinkId, Origin, Placement},
+    collection::{OfflineCheckpoint, OfflineCollectionId},
+    object::{OfflineHash, OfflineObject},
+    placement::{OfflineFlags, OfflineHandle, OfflineLinkId, OfflineOrigin, OfflinePlacement},
 };
 
 /// A change to push to the remote.
 ///
 /// Membership is add or remove only; a move is the target add plus the
 /// source remove. An add reuses a server-side copy or move when it carries
-/// an [`Origin`], else it uploads the stored body (a genuine append).
+/// an [`OfflineOrigin`], else it uploads the stored body (a genuine append).
 ///
 /// Pushes are at-least-once: a crash between a serviced push and the
 /// storage write that records it makes the next sync push the same change
@@ -25,37 +25,37 @@ use crate::{
 /// already-missing member as accepted, and by using an add's `link_id` to
 /// detect that it already landed instead of duplicating it.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Change {
+pub enum OfflineChange {
     /// Add a member. The push reconciles the provisional `handle` to the
-    /// server-assigned one (returned as [`crate::remote::PushResult::assigned`]).
+    /// server-assigned one (returned as [`crate::remote::OfflinePushResult::assigned`]).
     Add {
         /// The provisional handle the member is staged under locally.
-        handle: Handle,
+        handle: OfflineHandle,
         /// The logical-item identity, when already resolved; the
         /// idempotency key for a retried add.
-        link_id: Option<LinkId>,
+        link_id: Option<OfflineLinkId>,
         /// The flag set to create the member with (an IMAP APPEND flag
         /// list). A server-side copy may ignore it (the copy inherits the
         /// source flags; any skew reconciles on the next sync).
-        flags: Flags,
+        flags: OfflineFlags,
         /// Where the body already lives, for a server-side copy or move;
         /// `None` for an append that uploads `object`. When the server
         /// refuses the copy because the origin is gone (expunged), a
         /// consumer holding `object` may fall back to uploading it;
         /// without a body, rejecting keeps the pending create visible.
-        origin: Option<Origin>,
+        origin: Option<OfflineOrigin>,
         /// The stored body to upload when there is no `origin` (an
         /// append); the consumer resolves the bytes from its object store.
-        object: Option<Hash>,
+        object: Option<OfflineHash>,
     },
     /// Remove a member. `to` is the collection to move it into (an offline
     /// move, a server-side UID MOVE); `None` is a plain delete, which the
     /// consumer routes to trash.
     Remove {
         /// The member to remove.
-        handle: Handle,
+        handle: OfflineHandle,
         /// The move destination, or `None` for a delete.
-        to: Option<CollectionId>,
+        to: Option<OfflineCollectionId>,
         /// The last-synced content revision, as an optimistic-concurrency
         /// precondition (a WebDAV If-Match); `None` where content is
         /// immutable or never synced with one.
@@ -64,16 +64,16 @@ pub enum Change {
     /// Replace a member's flag set.
     SetFlags {
         /// The member to update.
-        handle: Handle,
+        handle: OfflineHandle,
         /// The new flag set.
-        flags: Flags,
+        flags: OfflineFlags,
     },
     /// Replace a member's content in place with a locally edited body.
     Update {
         /// The member to update.
-        handle: Handle,
+        handle: OfflineHandle,
         /// The hash of the new body in the object store.
-        object: Hash,
+        object: OfflineHash,
         /// The last-synced content revision, as an optimistic-concurrency
         /// precondition (a WebDAV If-Match); `None` when never based on
         /// one.
@@ -86,9 +86,9 @@ pub enum Change {
 /// The set the four verbs emit; the consumer applies them atomically
 /// against its index and blob store.
 ///
-/// Object references derive from placement pointers: a stored placement
-/// references an object once per pointing field (`Placement::object` and
-/// `Base::object`). The consumer maintains the counts incrementally, by
+/// OfflineObject references derive from placement pointers: a stored placement
+/// references an object once per pointing field (`OfflinePlacement::object` and
+/// `OfflineBase::object`). The consumer maintains the counts incrementally, by
 /// diffing an upsert against the stored row it replaces and by releasing
 /// both pointers of a dropped row; an object no other placement points at
 /// may be garbage-collected.
@@ -96,31 +96,31 @@ pub enum Change {
 // shrink the enum would only add indirection on the hot variant.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum WriteOp {
+pub enum OfflineWriteOp {
     /// Insert or replace a placement.
-    UpsertPlacement(Placement),
+    UpsertPlacement(OfflinePlacement),
     /// Drop a placement (delete or remote-side disappearance).
     DropPlacement {
         /// The owning collection.
-        collection: CollectionId,
+        collection: OfflineCollectionId,
         /// The handle to drop.
-        handle: Handle,
+        handle: OfflineHandle,
     },
     /// Store an object body. Storing takes no reference of its own:
     /// references come from placement pointers only, and a paired
-    /// [`WriteOp::UpsertPlacement`] pointing at the hash lands in the same
+    /// [`OfflineWriteOp::UpsertPlacement`] pointing at the hash lands in the same
     /// batch.
     StoreObject {
         /// The object metadata.
-        object: Object,
+        object: OfflineObject,
         /// The body bytes.
         body: Vec<u8>,
     },
     /// Set a collection's sync checkpoint.
     SetCheckpoint {
         /// The collection to checkpoint.
-        collection: CollectionId,
+        collection: OfflineCollectionId,
         /// The new checkpoint.
-        checkpoint: Checkpoint,
+        checkpoint: OfflineCheckpoint,
     },
 }

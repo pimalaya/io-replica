@@ -12,9 +12,9 @@ mod common;
 
 use io_offline::{
     client::OfflineClient,
-    mutate::Mutation,
-    placement::{Flags, Handle, Level, Status},
-    remote::Tier,
+    mutate::OfflineMutation,
+    placement::{OfflineFlags, OfflineHandle, OfflineLevel, OfflineStatus},
+    remote::OfflineTier,
     sync::OfflineSyncOptions,
 };
 
@@ -48,7 +48,12 @@ fn full_offline_lifecycle() {
     let calls_before = client.remote().calls;
     let loaded = client.open("inbox").unwrap();
     assert_eq!(loaded.placements.len(), 2);
-    assert!(loaded.placements.iter().all(|p| p.level == Level::Probed));
+    assert!(
+        loaded
+            .placements
+            .iter()
+            .all(|p| p.level == OfflineLevel::Probed)
+    );
     assert_eq!(
         client.remote().calls,
         calls_before,
@@ -59,35 +64,49 @@ fn full_offline_lifecycle() {
     let report = client
         .upgrade(
             "inbox",
-            vec![Handle::from("i1"), Handle::from("i2")],
-            Tier::Meta,
+            vec![OfflineHandle::from("i1"), OfflineHandle::from("i2")],
+            OfflineTier::Meta,
         )
         .unwrap();
     assert_eq!(report.upgraded, 2);
-    assert_eq!(client.storage().placement("inbox", "i1").level, Level::Meta);
+    assert_eq!(
+        client.storage().placement("inbox", "i1").level,
+        OfflineLevel::Meta
+    );
 
     let report = client
-        .upgrade("inbox", vec![Handle::from("i1")], Tier::Full)
+        .upgrade("inbox", vec![OfflineHandle::from("i1")], OfflineTier::Full)
         .unwrap();
     assert_eq!(report.fetched, 1);
     assert_eq!(report.deduped, 0);
-    assert_eq!(client.storage().placement("inbox", "i1").level, Level::Full);
+    assert_eq!(
+        client.storage().placement("inbox", "i1").level,
+        OfflineLevel::Full
+    );
     assert_eq!(client.storage().objects.len(), 1, "one stored body");
 
     // 4. second collection, same logical item: upgrading its body must
     // dedup against the already-stored object, with zero new fetch.
-    // Meta first resolves a1's link id (enumerate does not carry it), then
+    // OfflineMeta first resolves a1's link id (enumerate does not carry it), then
     // the Full upgrade links the shared body by that link id.
     client
         .sync("archive", OfflineSyncOptions::default())
         .unwrap();
     client
-        .upgrade("archive", vec![Handle::from("a1")], Tier::Meta)
+        .upgrade(
+            "archive",
+            vec![OfflineHandle::from("a1")],
+            OfflineTier::Meta,
+        )
         .unwrap();
     let fetches_before = client.remote().full_fetches.len();
 
     let report = client
-        .upgrade("archive", vec![Handle::from("a1")], Tier::Full)
+        .upgrade(
+            "archive",
+            vec![OfflineHandle::from("a1")],
+            OfflineTier::Full,
+        )
         .unwrap();
     assert_eq!(report.deduped, 1, "shared body deduped");
     assert_eq!(report.fetched, 0);
@@ -107,15 +126,15 @@ fn full_offline_lifecycle() {
     client
         .mutate(
             "inbox",
-            Mutation::SetFlags {
-                handle: Handle::from("i1"),
-                flags: Flags::from_iter(["seen"]),
+            OfflineMutation::SetFlags {
+                handle: OfflineHandle::from("i1"),
+                flags: OfflineFlags::from_iter(["seen"]),
             },
         )
         .unwrap();
     assert_eq!(
         client.storage().placement("inbox", "i1").status,
-        Status::Dirty,
+        OfflineStatus::Dirty,
     );
 
     let report = client.sync("inbox", OfflineSyncOptions::default()).unwrap();
@@ -123,7 +142,7 @@ fn full_offline_lifecycle() {
     assert!(client.remote().flags_of("inbox", "i1").contains("seen"));
     assert_eq!(
         client.storage().placement("inbox", "i1").status,
-        Status::Clean,
+        OfflineStatus::Clean,
         "pushed placement is rebased clean",
     );
 
@@ -145,9 +164,9 @@ fn full_offline_lifecycle() {
     client
         .mutate(
             "inbox",
-            Mutation::SetFlags {
-                handle: Handle::from("i1"),
-                flags: Flags::from_iter(["draft"]),
+            OfflineMutation::SetFlags {
+                handle: OfflineHandle::from("i1"),
+                flags: OfflineFlags::from_iter(["draft"]),
             },
         )
         .unwrap();
@@ -171,7 +190,7 @@ fn full_offline_lifecycle() {
     );
     assert_eq!(
         client.storage().placement("inbox", "i1").status,
-        Status::Clean,
+        OfflineStatus::Clean,
     );
 }
 
@@ -188,19 +207,19 @@ fn offline_copy_creates_pushes_and_rekeys() {
     client
         .mutate(
             "inbox",
-            Mutation::Copy {
-                handle: Handle::from("i2"),
+            OfflineMutation::Copy {
+                handle: OfflineHandle::from("i2"),
                 target: "archive".into(),
-                placeholder: Handle::from("tmp-i2"),
+                placeholder: OfflineHandle::from("tmp-i2"),
             },
         )
         .unwrap();
     let staged = client.storage().placement("archive", "tmp-i2");
-    assert_eq!(staged.status, Status::Created);
+    assert_eq!(staged.status, OfflineStatus::Created);
     assert!(staged.origin.is_some());
     assert_eq!(
         client.storage().placement("inbox", "i2").status,
-        Status::Clean,
+        OfflineStatus::Clean,
         "the copy source is untouched",
     );
 
@@ -212,11 +231,11 @@ fn offline_copy_creates_pushes_and_rekeys() {
         !client
             .storage()
             .placements
-            .contains_key(&("archive".into(), Handle::from("tmp-i2"))),
+            .contains_key(&("archive".into(), OfflineHandle::from("tmp-i2"))),
         "the placeholder is dropped once the copy is confirmed",
     );
     let real = client.storage().placement("archive", "i2-copy");
-    assert_eq!(real.status, Status::Clean);
+    assert_eq!(real.status, OfflineStatus::Clean);
     assert!(real.base.is_some());
     assert!(real.origin.is_none());
 }

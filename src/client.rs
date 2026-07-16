@@ -2,92 +2,95 @@
 //!
 //! A driver that runs any standard-shape coroutine to completion by
 //! servicing each [`OfflineYield`] through two consumer-supplied traits:
-//! [`Storage`] for the index and blob store, [`Remote`] for the protocol
+//! [`OfflineStorage`] for the index and blob store, [`OfflineRemote`] for the protocol
 //! seam. These traits live on the consumer side, not inside the engine,
 //! so the I/O-free contract holds: the coroutines still only emit `Wants`.
 //!
-//! A desktop or Neverest consumer backs [`Remote`] with io-email's
-//! blocking clients and [`Storage`] with sqlite plus a blob dir; an
-//! Android consumer backs [`Remote`] with io-imap over JNI.
+//! A desktop or Neverest consumer backs [`OfflineRemote`] with io-email's
+//! blocking clients and [`OfflineStorage`] with sqlite plus a blob dir; an
+//! Android consumer backs [`OfflineRemote`] with io-imap over JNI.
 
 use std::{collections::BTreeMap, fmt, vec::Vec};
 
 use crate::{
-    change::{Change, WriteOp},
-    collection::{Checkpoint, CollectionId},
+    change::{OfflineChange, OfflineWriteOp},
+    collection::{OfflineCheckpoint, OfflineCollectionId},
     coroutine::*,
-    mutate::{Mutation, OfflineMutate, OfflineMutateError},
-    object::Hash,
+    mutate::{OfflineMutate, OfflineMutateError, OfflineMutation},
+    object::OfflineHash,
     open::{OfflineOpen, OfflineOpenError},
-    placement::{Handle, LinkId},
+    placement::{OfflineHandle, OfflineLinkId},
     rekey::{OfflineRekey, OfflineRekeyError, OfflineRekeyReport},
-    remote::{FetchedItem, PushResult, RemoteSnapshot, Tier},
-    storage::Loaded,
+    remote::{OfflineFetchedItem, OfflinePushResult, OfflineRemoteSnapshot, OfflineTier},
+    storage::OfflineLoaded,
     sync::{OfflineSync, OfflineSyncError, OfflineSyncOptions, OfflineSyncReport},
     upgrade::{OfflineUpgrade, OfflineUpgradeError, OfflineUpgradeReport},
 };
 
 /// The local index plus blob store seam.
-pub trait Storage {
+pub trait OfflineStorage {
     /// The error this storage raises.
     type Error;
 
     /// Loads a collection's placements and checkpoint.
-    fn load(&self, collection: &CollectionId) -> Result<Loaded, Self::Error>;
+    fn load(&self, collection: &OfflineCollectionId) -> Result<OfflineLoaded, Self::Error>;
 
     /// Resolves which link ids already map to a stored object.
-    fn lookup_objects(&self, links: &[LinkId]) -> Result<BTreeMap<LinkId, Hash>, Self::Error>;
+    fn lookup_objects(
+        &self,
+        links: &[OfflineLinkId],
+    ) -> Result<BTreeMap<OfflineLinkId, OfflineHash>, Self::Error>;
 
     /// Applies a batch of writes atomically, maintaining the
-    /// pointer-derived object references [`WriteOp`] documents.
+    /// pointer-derived object references [`OfflineWriteOp`] documents.
     ///
     /// The engine assumes a single writer per collection between a load
     /// and the write derived from it: a batch applied over state another
     /// actor changed in between clobbers that change. How the guarantee
     /// is provided is the storage's business (a sqlite transaction, a
     /// lock file, process-level serialization).
-    fn write(&mut self, ops: Vec<WriteOp>) -> Result<(), Self::Error>;
+    fn write(&mut self, ops: Vec<OfflineWriteOp>) -> Result<(), Self::Error>;
 }
 
 /// The remote protocol seam (IMAP, JMAP, WebDAV).
-pub trait Remote {
+pub trait OfflineRemote {
     /// The error this remote raises.
     type Error;
 
     /// Enumerates the collection: a full set, or a delta from `cursor`.
     fn enumerate(
         &mut self,
-        collection: &CollectionId,
-        cursor: Option<Checkpoint>,
-    ) -> Result<RemoteSnapshot, Self::Error>;
+        collection: &OfflineCollectionId,
+        cursor: Option<OfflineCheckpoint>,
+    ) -> Result<OfflineRemoteSnapshot, Self::Error>;
 
     /// Fetches each handle at the requested tier.
     fn fetch(
         &mut self,
-        collection: &CollectionId,
-        handles: Vec<Handle>,
-        tier: Tier,
-    ) -> Result<Vec<FetchedItem>, Self::Error>;
+        collection: &OfflineCollectionId,
+        handles: Vec<OfflineHandle>,
+        tier: OfflineTier,
+    ) -> Result<Vec<OfflineFetchedItem>, Self::Error>;
 
     /// Pushes each change, returning a per-change outcome.
     ///
     /// Pushes are at-least-once: a crash between a serviced push and its
     /// recording write replays the change on the next sync, so the
-    /// consumer keeps retries harmless (see [`Change`]).
+    /// consumer keeps retries harmless (see [`OfflineChange`]).
     fn push(
         &mut self,
-        collection: &CollectionId,
-        changes: Vec<Change>,
-    ) -> Result<Vec<PushResult>, Self::Error>;
+        collection: &OfflineCollectionId,
+        changes: Vec<OfflineChange>,
+    ) -> Result<Vec<OfflinePushResult>, Self::Error>;
 }
 
 /// Errors returned by [`OfflineClient`].
 #[derive(Debug)]
 pub enum OfflineClientError<S, R, C> {
     /// A storage seam call failed.
-    Storage(S),
+    OfflineStorage(S),
     /// A remote seam call failed.
-    Remote(R),
+    OfflineRemote(R),
     /// The coroutine itself completed with an error.
     Coroutine(C),
 }
@@ -100,8 +103,8 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Storage(err) => write!(f, "Storage seam failed: {err}"),
-            Self::Remote(err) => write!(f, "Remote seam failed: {err}"),
+            Self::OfflineStorage(err) => write!(f, "OfflineStorage seam failed: {err}"),
+            Self::OfflineRemote(err) => write!(f, "OfflineRemote seam failed: {err}"),
             Self::Coroutine(err) => write!(f, "Offline engine failed: {err}"),
         }
     }
@@ -123,8 +126,8 @@ pub struct OfflineClient<S, R> {
 
 impl<S, R> OfflineClient<S, R>
 where
-    S: Storage,
-    R: Remote,
+    S: OfflineStorage,
+    R: OfflineRemote,
 {
     /// Builds a client over a storage and a remote.
     pub fn new(storage: S, remote: R) -> Self {
@@ -175,7 +178,7 @@ where
                     let snapshot = self
                         .remote
                         .enumerate(&collection, cursor)
-                        .map_err(OfflineClientError::Remote)?;
+                        .map_err(OfflineClientError::OfflineRemote)?;
                     arg = Some(OfflineArg::Enumerate(snapshot));
                 }
                 OfflineCoroutineState::Yielded(OfflineYield::WantsFetch {
@@ -186,7 +189,7 @@ where
                     let items = self
                         .remote
                         .fetch(&collection, handles, tier)
-                        .map_err(OfflineClientError::Remote)?;
+                        .map_err(OfflineClientError::OfflineRemote)?;
                     arg = Some(OfflineArg::Fetch(items));
                 }
                 OfflineCoroutineState::Yielded(OfflineYield::WantsPush {
@@ -196,27 +199,27 @@ where
                     let results = self
                         .remote
                         .push(&collection, changes)
-                        .map_err(OfflineClientError::Remote)?;
+                        .map_err(OfflineClientError::OfflineRemote)?;
                     arg = Some(OfflineArg::Push(results));
                 }
                 OfflineCoroutineState::Yielded(OfflineYield::WantsLoad(collection)) => {
                     let loaded = self
                         .storage
                         .load(&collection)
-                        .map_err(OfflineClientError::Storage)?;
+                        .map_err(OfflineClientError::OfflineStorage)?;
                     arg = Some(OfflineArg::Load(loaded));
                 }
                 OfflineCoroutineState::Yielded(OfflineYield::WantsLookupObject(links)) => {
                     let known = self
                         .storage
                         .lookup_objects(&links)
-                        .map_err(OfflineClientError::Storage)?;
+                        .map_err(OfflineClientError::OfflineStorage)?;
                     arg = Some(OfflineArg::LookupObject(known));
                 }
                 OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(ops)) => {
                     self.storage
                         .write(ops)
-                        .map_err(OfflineClientError::Storage)?;
+                        .map_err(OfflineClientError::OfflineStorage)?;
                     arg = Some(OfflineArg::Write);
                 }
             }
@@ -226,17 +229,17 @@ where
     /// Opens a collection fully offline.
     pub fn open(
         &mut self,
-        collection: impl Into<CollectionId>,
-    ) -> Result<Loaded, OfflineClientError<S::Error, R::Error, OfflineOpenError>> {
+        collection: impl Into<OfflineCollectionId>,
+    ) -> Result<OfflineLoaded, OfflineClientError<S::Error, R::Error, OfflineOpenError>> {
         self.run(OfflineOpen::new(collection))
     }
 
     /// Raises `handles` in `collection` to `tier`, deduping bodies.
     pub fn upgrade(
         &mut self,
-        collection: impl Into<CollectionId>,
-        handles: Vec<Handle>,
-        tier: Tier,
+        collection: impl Into<OfflineCollectionId>,
+        handles: Vec<OfflineHandle>,
+        tier: OfflineTier,
     ) -> Result<OfflineUpgradeReport, OfflineClientError<S::Error, R::Error, OfflineUpgradeError>>
     {
         self.run(OfflineUpgrade::new(collection, handles, tier))
@@ -245,8 +248,8 @@ where
     /// Applies a local mutation with no network.
     pub fn mutate(
         &mut self,
-        collection: impl Into<CollectionId>,
-        mutation: Mutation,
+        collection: impl Into<OfflineCollectionId>,
+        mutation: OfflineMutation,
     ) -> Result<(), OfflineClientError<S::Error, R::Error, OfflineMutateError>> {
         self.run(OfflineMutate::new(collection, mutation))
     }
@@ -254,7 +257,7 @@ where
     /// Reconciles a collection with its remote.
     pub fn sync(
         &mut self,
-        collection: impl Into<CollectionId>,
+        collection: impl Into<OfflineCollectionId>,
         opts: OfflineSyncOptions,
     ) -> Result<OfflineSyncReport, OfflineClientError<S::Error, R::Error, OfflineSyncError>> {
         self.run(OfflineSync::new(collection, opts))
@@ -264,7 +267,7 @@ where
     /// UIDVALIDITY bump), carrying local state over by link id.
     pub fn rekey(
         &mut self,
-        collection: impl Into<CollectionId>,
+        collection: impl Into<OfflineCollectionId>,
     ) -> Result<OfflineRekeyReport, OfflineClientError<S::Error, R::Error, OfflineRekeyError>> {
         self.run(OfflineRekey::new(collection))
     }

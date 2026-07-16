@@ -1,7 +1,7 @@
 //! I/O-free coroutine to raise placements to a higher detail level.
 //!
 //! A pure pull, never a merge. It loads the targeted placements, then for
-//! [`Tier::Full`] resolves their link ids against the object store first:
+//! [`OfflineTier::Full`] resolves their link ids against the object store first:
 //! a body already stored under another collection is linked without any
 //! network round-trip. This stores one body for an item that appears in
 //! several collections at once, and backs a unified across-collections
@@ -15,12 +15,12 @@ use log::{debug, trace};
 use thiserror::Error;
 
 use crate::{
-    change::WriteOp,
-    collection::CollectionId,
+    change::OfflineWriteOp,
+    collection::OfflineCollectionId,
     coroutine::*,
-    object::Object,
-    placement::{Handle, Level, Placement},
-    remote::Tier,
+    object::OfflineObject,
+    placement::{OfflineHandle, OfflineLevel, OfflinePlacement},
+    remote::OfflineTier,
 };
 
 /// What an upgrade did.
@@ -47,11 +47,11 @@ pub enum OfflineUpgradeError {
 
 /// I/O-free UPGRADE coroutine.
 pub struct OfflineUpgrade {
-    collection: CollectionId,
-    handles: Vec<Handle>,
-    tier: Tier,
-    placements: BTreeMap<Handle, Placement>,
-    ops: Vec<WriteOp>,
+    collection: OfflineCollectionId,
+    handles: Vec<OfflineHandle>,
+    tier: OfflineTier,
+    placements: BTreeMap<OfflineHandle, OfflinePlacement>,
+    ops: Vec<OfflineWriteOp>,
     report: OfflineUpgradeReport,
     state: State,
 }
@@ -59,7 +59,11 @@ pub struct OfflineUpgrade {
 impl OfflineUpgrade {
     /// Creates a coroutine that raises `handles` in `collection` to
     /// `tier`.
-    pub fn new(collection: impl Into<CollectionId>, handles: Vec<Handle>, tier: Tier) -> Self {
+    pub fn new(
+        collection: impl Into<OfflineCollectionId>,
+        handles: Vec<OfflineHandle>,
+        tier: OfflineTier,
+    ) -> Self {
         let collection = collection.into();
         debug!(
             "upgrade {} handles in {} to {tier:?}",
@@ -79,13 +83,13 @@ impl OfflineUpgrade {
     }
 
     /// Requested handles that still need work for the target tier.
-    fn pending_handles(&self) -> Vec<Handle> {
+    fn pending_handles(&self) -> Vec<OfflineHandle> {
         self.handles
             .iter()
             .filter(|h| match self.placements.get(h) {
                 Some(p) => match self.tier {
-                    Tier::Meta => p.level < Level::Meta,
-                    Tier::Full => p.level < Level::Full,
+                    OfflineTier::Meta => p.level < OfflineLevel::Meta,
+                    OfflineTier::Full => p.level < OfflineLevel::Full,
                 },
                 None => false,
             })
@@ -125,16 +129,16 @@ impl OfflineCoroutine for OfflineUpgrade {
                 }
 
                 match self.tier {
-                    Tier::Meta => {
+                    OfflineTier::Meta => {
                         debug!("fetch {} items at meta tier", pending.len());
                         self.state = State::PendingFetch;
                         OfflineCoroutineState::Yielded(OfflineYield::WantsFetch {
                             collection: self.collection.clone(),
                             handles: pending,
-                            tier: Tier::Meta,
+                            tier: OfflineTier::Meta,
                         })
                     }
-                    Tier::Full => {
+                    OfflineTier::Full => {
                         let links: Vec<_> = pending
                             .iter()
                             .filter_map(|h| self.placements.get(h))
@@ -147,7 +151,7 @@ impl OfflineCoroutine for OfflineUpgrade {
                             return OfflineCoroutineState::Yielded(OfflineYield::WantsFetch {
                                 collection: self.collection.clone(),
                                 handles: pending,
-                                tier: Tier::Full,
+                                tier: OfflineTier::Full,
                             });
                         }
 
@@ -175,8 +179,8 @@ impl OfflineCoroutine for OfflineUpgrade {
                         Some(hash) => {
                             let mut patched = placement.clone();
                             patched.object = Some(hash);
-                            patched.level = Level::Full;
-                            self.ops.push(WriteOp::UpsertPlacement(patched));
+                            patched.level = OfflineLevel::Full;
+                            self.ops.push(OfflineWriteOp::UpsertPlacement(patched));
                             self.report.upgraded += 1;
                             self.report.deduped += 1;
                         }
@@ -200,7 +204,7 @@ impl OfflineCoroutine for OfflineUpgrade {
                 OfflineCoroutineState::Yielded(OfflineYield::WantsFetch {
                     collection: self.collection.clone(),
                     handles: to_fetch,
-                    tier: Tier::Full,
+                    tier: OfflineTier::Full,
                 })
             }
 
@@ -215,12 +219,12 @@ impl OfflineCoroutine for OfflineUpgrade {
                     patched.meta = Some(item.meta);
 
                     match (self.tier, item.body) {
-                        (Tier::Full, Some((hash, body))) => {
-                            let object = Object {
+                        (OfflineTier::Full, Some((hash, body))) => {
+                            let object = OfflineObject {
                                 hash: hash.clone(),
                                 size: body.len(),
                             };
-                            self.ops.push(WriteOp::StoreObject { object, body });
+                            self.ops.push(OfflineWriteOp::StoreObject { object, body });
 
                             // NOTE: the revision travels with the body: the
                             // stored object is the remote content as of the
@@ -231,16 +235,16 @@ impl OfflineCoroutine for OfflineUpgrade {
                             }
 
                             patched.object = Some(hash);
-                            patched.level = Level::Full;
+                            patched.level = OfflineLevel::Full;
                             self.report.fetched += 1;
                         }
                         _ => {
-                            patched.level = Level::Meta;
+                            patched.level = OfflineLevel::Meta;
                             self.report.fetched += 1;
                         }
                     }
 
-                    self.ops.push(WriteOp::UpsertPlacement(patched));
+                    self.ops.push(OfflineWriteOp::UpsertPlacement(patched));
                     self.report.upgraded += 1;
                 }
 
@@ -288,26 +292,26 @@ impl fmt::Display for State {
 
 #[cfg(test)]
 mod tests {
-    use alloc::collections::BTreeMap;
+    use alloc::{collections::BTreeMap, vec};
 
     use crate::{
-        object::Hash,
-        placement::{Base, Flags, LinkId, Meta, Status},
-        remote::FetchedItem,
-        storage::Loaded,
+        object::OfflineHash,
+        placement::{OfflineBase, OfflineFlags, OfflineLinkId, OfflineMeta, OfflineStatus},
+        remote::OfflineFetchedItem,
+        storage::OfflineLoaded,
         upgrade::*,
     };
 
-    fn probed(handle: &str, link: Option<&str>, level: Level) -> Placement {
-        Placement {
+    fn probed(handle: &str, link: Option<&str>, level: OfflineLevel) -> OfflinePlacement {
+        OfflinePlacement {
             collection: "inbox".into(),
-            handle: Handle::from(handle),
-            link_id: link.map(LinkId::from),
+            handle: OfflineHandle::from(handle),
+            link_id: link.map(OfflineLinkId::from),
             object: None,
             level,
             meta: None,
-            flags: Flags::default(),
-            status: Status::Clean,
+            flags: OfflineFlags::default(),
+            status: OfflineStatus::Clean,
             conflict_revision: None,
             base: None,
             origin: None,
@@ -317,31 +321,32 @@ mod tests {
     #[test]
     fn full_dedup_links_without_fetch() {
         crate::testlog::init();
-        let loaded = Loaded {
-            placements: vec![probed("2", Some("msg-a"), Level::Meta)],
+        let loaded = OfflineLoaded {
+            placements: vec![probed("2", Some("msg-a"), OfflineLevel::Meta)],
             checkpoint: None,
         };
-        let mut up = OfflineUpgrade::new("inbox", vec![Handle::from("2")], Tier::Full);
+        let mut up =
+            OfflineUpgrade::new("inbox", vec![OfflineHandle::from("2")], OfflineTier::Full);
         let _ = up.resume(None);
 
         let links = match up.resume(Some(OfflineArg::Load(loaded))) {
             OfflineCoroutineState::Yielded(OfflineYield::WantsLookupObject(links)) => links,
             state => panic!("expected WantsLookupObject, got {state:?}"),
         };
-        assert_eq!(links, vec![LinkId::from("msg-a")]);
+        assert_eq!(links, vec![OfflineLinkId::from("msg-a")]);
 
         let mut known = BTreeMap::new();
-        known.insert(LinkId::from("msg-a"), Hash::from("h-a"));
+        known.insert(OfflineLinkId::from("msg-a"), OfflineHash::from("h-a"));
 
         let ops = match up.resume(Some(OfflineArg::LookupObject(known))) {
             OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(ops)) => ops,
             state => panic!("expected WantsWrite (no fetch), got {state:?}"),
         };
-        let WriteOp::UpsertPlacement(p) = &ops[0] else {
+        let OfflineWriteOp::UpsertPlacement(p) = &ops[0] else {
             panic!("expected UpsertPlacement, got {:?}", ops[0]);
         };
-        assert_eq!(p.level, Level::Full);
-        assert_eq!(p.object, Some(Hash::from("h-a")));
+        assert_eq!(p.level, OfflineLevel::Full);
+        assert_eq!(p.object, Some(OfflineHash::from("h-a")));
 
         let report = match up.resume(Some(OfflineArg::Write)) {
             OfflineCoroutineState::Complete(Ok(report)) => report,
@@ -353,35 +358,36 @@ mod tests {
 
     #[test]
     fn full_miss_fetches_and_stores() {
-        let loaded = Loaded {
-            placements: vec![probed("1", Some("msg-b"), Level::Meta)],
+        let loaded = OfflineLoaded {
+            placements: vec![probed("1", Some("msg-b"), OfflineLevel::Meta)],
             checkpoint: None,
         };
-        let mut up = OfflineUpgrade::new("inbox", vec![Handle::from("1")], Tier::Full);
+        let mut up =
+            OfflineUpgrade::new("inbox", vec![OfflineHandle::from("1")], OfflineTier::Full);
         let _ = up.resume(None);
         let _ = up.resume(Some(OfflineArg::Load(loaded)));
 
         let handles = match up.resume(Some(OfflineArg::LookupObject(BTreeMap::new()))) {
             OfflineCoroutineState::Yielded(OfflineYield::WantsFetch { handles, tier, .. }) => {
-                assert_eq!(tier, Tier::Full);
+                assert_eq!(tier, OfflineTier::Full);
                 handles
             }
             state => panic!("expected WantsFetch, got {state:?}"),
         };
-        assert_eq!(handles, vec![Handle::from("1")]);
+        assert_eq!(handles, vec![OfflineHandle::from("1")]);
 
-        let items = vec![FetchedItem {
-            handle: Handle::from("1"),
-            link_id: LinkId::from("msg-b"),
-            meta: Meta("hdr".into()),
-            body: Some((Hash::from("h-b"), b"body".to_vec())),
+        let items = vec![OfflineFetchedItem {
+            handle: OfflineHandle::from("1"),
+            link_id: OfflineLinkId::from("msg-b"),
+            meta: OfflineMeta("hdr".into()),
+            body: Some((OfflineHash::from("h-b"), b"body".to_vec())),
             revision: None,
         }];
         let ops = match up.resume(Some(OfflineArg::Fetch(items))) {
             OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(ops)) => ops,
             state => panic!("expected WantsWrite, got {state:?}"),
         };
-        assert!(matches!(ops[0], WriteOp::StoreObject { .. }));
+        assert!(matches!(ops[0], OfflineWriteOp::StoreObject { .. }));
 
         let report = match up.resume(Some(OfflineArg::Write)) {
             OfflineCoroutineState::Complete(Ok(report)) => report,
@@ -396,27 +402,28 @@ mod tests {
         // A fetched body is the remote content as of the fetch: a based
         // placement records the fetched revision and pins the stored body
         // as its content base.
-        let mut placement = probed("1", Some("msg-b"), Level::Meta);
-        placement.base = Some(Base {
-            flags: Flags::default(),
+        let mut placement = probed("1", Some("msg-b"), OfflineLevel::Meta);
+        placement.base = Some(OfflineBase {
+            flags: OfflineFlags::default(),
             revision: None,
             object: None,
         });
-        let loaded = Loaded {
+        let loaded = OfflineLoaded {
             placements: vec![placement],
             checkpoint: None,
         };
 
-        let mut up = OfflineUpgrade::new("inbox", vec![Handle::from("1")], Tier::Full);
+        let mut up =
+            OfflineUpgrade::new("inbox", vec![OfflineHandle::from("1")], OfflineTier::Full);
         let _ = up.resume(None);
         let _ = up.resume(Some(OfflineArg::Load(loaded)));
         let _ = up.resume(Some(OfflineArg::LookupObject(BTreeMap::new())));
 
-        let items = vec![FetchedItem {
-            handle: Handle::from("1"),
-            link_id: LinkId::from("msg-b"),
-            meta: Meta("hdr".into()),
-            body: Some((Hash::from("h-b"), b"body".to_vec())),
+        let items = vec![OfflineFetchedItem {
+            handle: OfflineHandle::from("1"),
+            link_id: OfflineLinkId::from("msg-b"),
+            meta: OfflineMeta("hdr".into()),
+            body: Some((OfflineHash::from("h-b"), b"body".to_vec())),
             revision: Some("r7".into()),
         }];
         let ops = match up.resume(Some(OfflineArg::Fetch(items))) {
@@ -427,40 +434,42 @@ mod tests {
         let patched = ops
             .iter()
             .find_map(|op| match op {
-                WriteOp::UpsertPlacement(p) => Some(p),
+                OfflineWriteOp::UpsertPlacement(p) => Some(p),
                 _ => None,
             })
             .expect("an upserted placement");
         let base = patched.base.as_ref().expect("a base");
         assert_eq!(base.revision.as_deref(), Some("r7"));
-        assert_eq!(base.object, Some(Hash::from("h-b")));
-        assert_eq!(patched.object, Some(Hash::from("h-b")));
+        assert_eq!(base.object, Some(OfflineHash::from("h-b")));
+        assert_eq!(patched.object, Some(OfflineHash::from("h-b")));
     }
 
     #[test]
     fn meta_upgrade_fetches_headers() {
-        let loaded = Loaded {
-            placements: vec![probed("1", None, Level::Probed)],
+        let loaded = OfflineLoaded {
+            placements: vec![probed("1", None, OfflineLevel::Probed)],
             checkpoint: None,
         };
-        let mut up = OfflineUpgrade::new("inbox", vec![Handle::from("1")], Tier::Meta);
+        let mut up =
+            OfflineUpgrade::new("inbox", vec![OfflineHandle::from("1")], OfflineTier::Meta);
         let _ = up.resume(None);
 
         match up.resume(Some(OfflineArg::Load(loaded))) {
             OfflineCoroutineState::Yielded(OfflineYield::WantsFetch { tier, .. }) => {
-                assert_eq!(tier, Tier::Meta);
+                assert_eq!(tier, OfflineTier::Meta);
             }
-            state => panic!("expected WantsFetch Meta, got {state:?}"),
+            state => panic!("expected WantsFetch OfflineMeta, got {state:?}"),
         }
     }
 
     #[test]
     fn already_full_completes_without_work() {
-        let loaded = Loaded {
-            placements: vec![probed("1", Some("x"), Level::Full)],
+        let loaded = OfflineLoaded {
+            placements: vec![probed("1", Some("x"), OfflineLevel::Full)],
             checkpoint: None,
         };
-        let mut up = OfflineUpgrade::new("inbox", vec![Handle::from("1")], Tier::Full);
+        let mut up =
+            OfflineUpgrade::new("inbox", vec![OfflineHandle::from("1")], OfflineTier::Full);
         let _ = up.resume(None);
 
         match up.resume(Some(OfflineArg::Load(loaded))) {
@@ -471,7 +480,8 @@ mod tests {
 
     #[test]
     fn missing_arg_errors() {
-        let mut up = OfflineUpgrade::new("inbox", vec![Handle::from("1")], Tier::Meta);
+        let mut up =
+            OfflineUpgrade::new("inbox", vec![OfflineHandle::from("1")], OfflineTier::Meta);
         let _ = up.resume(None);
         match up.resume(None) {
             OfflineCoroutineState::Complete(Err(OfflineUpgradeError::MissingArg)) => {}
@@ -481,7 +491,8 @@ mod tests {
 
     #[test]
     fn unexpected_arg_errors() {
-        let mut up = OfflineUpgrade::new("inbox", vec![Handle::from("1")], Tier::Meta);
+        let mut up =
+            OfflineUpgrade::new("inbox", vec![OfflineHandle::from("1")], OfflineTier::Meta);
         let _ = up.resume(None);
         match up.resume(Some(OfflineArg::Write)) {
             OfflineCoroutineState::Complete(Err(OfflineUpgradeError::UnexpectedArg)) => {}
@@ -493,11 +504,15 @@ mod tests {
     fn unknown_handle_completes_without_work() {
         // A requested handle with no placement is not the upgrade's to
         // invent: it is skipped, not fetched.
-        let loaded = Loaded {
-            placements: vec![probed("1", None, Level::Probed)],
+        let loaded = OfflineLoaded {
+            placements: vec![probed("1", None, OfflineLevel::Probed)],
             checkpoint: None,
         };
-        let mut up = OfflineUpgrade::new("inbox", vec![Handle::from("nope")], Tier::Meta);
+        let mut up = OfflineUpgrade::new(
+            "inbox",
+            vec![OfflineHandle::from("nope")],
+            OfflineTier::Meta,
+        );
         let _ = up.resume(None);
 
         match up.resume(Some(OfflineArg::Load(loaded))) {
@@ -510,17 +525,18 @@ mod tests {
     fn full_without_link_ids_fetches_directly() {
         // Probed placements carry no link id yet, so there is nothing to
         // look up in the object store: the full upgrade fetches directly.
-        let loaded = Loaded {
-            placements: vec![probed("1", None, Level::Probed)],
+        let loaded = OfflineLoaded {
+            placements: vec![probed("1", None, OfflineLevel::Probed)],
             checkpoint: None,
         };
-        let mut up = OfflineUpgrade::new("inbox", vec![Handle::from("1")], Tier::Full);
+        let mut up =
+            OfflineUpgrade::new("inbox", vec![OfflineHandle::from("1")], OfflineTier::Full);
         let _ = up.resume(None);
 
         match up.resume(Some(OfflineArg::Load(loaded))) {
             OfflineCoroutineState::Yielded(OfflineYield::WantsFetch { tier, handles, .. }) => {
-                assert_eq!(tier, Tier::Full);
-                assert_eq!(handles, vec![Handle::from("1")]);
+                assert_eq!(tier, OfflineTier::Full);
+                assert_eq!(handles, vec![OfflineHandle::from("1")]);
             }
             state => panic!("expected WantsFetch Full, got {state:?}"),
         }
@@ -530,18 +546,19 @@ mod tests {
     fn fetched_unknown_handle_is_skipped() {
         // A fetch reply naming a handle with no placement (a lagging or
         // buggy consumer) is ignored rather than upserted or panicking.
-        let loaded = Loaded {
-            placements: vec![probed("1", None, Level::Probed)],
+        let loaded = OfflineLoaded {
+            placements: vec![probed("1", None, OfflineLevel::Probed)],
             checkpoint: None,
         };
-        let mut up = OfflineUpgrade::new("inbox", vec![Handle::from("1")], Tier::Meta);
+        let mut up =
+            OfflineUpgrade::new("inbox", vec![OfflineHandle::from("1")], OfflineTier::Meta);
         let _ = up.resume(None);
         let _ = up.resume(Some(OfflineArg::Load(loaded)));
 
-        let items = vec![FetchedItem {
-            handle: Handle::from("ghost"),
-            link_id: LinkId::from("msg-x"),
-            meta: Meta("hdr".into()),
+        let items = vec![OfflineFetchedItem {
+            handle: OfflineHandle::from("ghost"),
+            link_id: OfflineLinkId::from("msg-x"),
+            meta: OfflineMeta("hdr".into()),
             body: None,
             revision: None,
         }];
@@ -562,35 +579,39 @@ mod tests {
         crate::testlog::init();
         // Two placements at meta level: one link id resolves in the object
         // store (linked without a fetch), the other misses and is fetched.
-        let loaded = Loaded {
+        let loaded = OfflineLoaded {
             placements: vec![
-                probed("1", Some("msg-a"), Level::Meta),
-                probed("2", Some("msg-b"), Level::Meta),
+                probed("1", Some("msg-a"), OfflineLevel::Meta),
+                probed("2", Some("msg-b"), OfflineLevel::Meta),
             ],
             checkpoint: None,
         };
         let mut up = OfflineUpgrade::new(
             "inbox",
-            vec![Handle::from("1"), Handle::from("2")],
-            Tier::Full,
+            vec![OfflineHandle::from("1"), OfflineHandle::from("2")],
+            OfflineTier::Full,
         );
         let _ = up.resume(None);
         let _ = up.resume(Some(OfflineArg::Load(loaded)));
 
         let mut known = BTreeMap::new();
-        known.insert(LinkId::from("msg-a"), Hash::from("h-a"));
+        known.insert(OfflineLinkId::from("msg-a"), OfflineHash::from("h-a"));
 
         let handles = match up.resume(Some(OfflineArg::LookupObject(known))) {
             OfflineCoroutineState::Yielded(OfflineYield::WantsFetch { handles, .. }) => handles,
             state => panic!("expected WantsFetch for the miss, got {state:?}"),
         };
-        assert_eq!(handles, vec![Handle::from("2")], "only the miss fetches");
+        assert_eq!(
+            handles,
+            vec![OfflineHandle::from("2")],
+            "only the miss fetches"
+        );
 
-        let items = vec![FetchedItem {
-            handle: Handle::from("2"),
-            link_id: LinkId::from("msg-b"),
-            meta: Meta("hdr".into()),
-            body: Some((Hash::from("h-b"), b"body".to_vec())),
+        let items = vec![OfflineFetchedItem {
+            handle: OfflineHandle::from("2"),
+            link_id: OfflineLinkId::from("msg-b"),
+            meta: OfflineMeta("hdr".into()),
+            body: Some((OfflineHash::from("h-b"), b"body".to_vec())),
             revision: None,
         }];
         let _ = up.resume(Some(OfflineArg::Fetch(items)));
