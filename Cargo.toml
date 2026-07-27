@@ -1,5 +1,5 @@
 [package]
-name = "io-offline"
+name = "io-replica"
 description = "Offline-first replica engine library for Rust"
 version = "0.1.0"
 authors = ["soywod <pimalaya.org@posteo.net>"]
@@ -9,8 +9,8 @@ license = "MIT OR Apache-2.0"
 categories = ["api-bindings", "no-std"]
 keywords = ["io-free", "no-std", "coroutine", "offline", "sync"]
 homepage = "https://pimalaya.org"
-documentation = "https://docs.rs/io-offline/latest/io_offline"
-repository = "https://github.com/pimalaya/io-offline"
+documentation = "https://docs.rs/io-replica/latest/io_replica"
+repository = "https://github.com/pimalaya/io-replica"
 
 [package.metadata.docs.rs]
 all-features = true

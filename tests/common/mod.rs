@@ -10,40 +10,40 @@
 
 use std::{collections::BTreeMap, convert::Infallible};
 
-use io_offline::{
-    change::{OfflineChange, OfflineWriteOp},
-    client::{OfflineRemote, OfflineStorage},
-    collection::{OfflineCheckpoint, OfflineCollectionId},
-    object::{OfflineHash, OfflineObject},
-    placement::{OfflineFlags, OfflineHandle, OfflineLinkId, OfflineMeta, OfflinePlacement},
+use io_replica::{
+    change::{ReplicaChange, ReplicaWriteOp},
+    client::{ReplicaRemote, ReplicaStorage},
+    collection::{ReplicaCheckpoint, ReplicaCollectionId},
+    object::{ReplicaHash, ReplicaObject},
+    placement::{ReplicaFlags, ReplicaHandle, ReplicaLinkId, ReplicaMeta, ReplicaPlacement},
     remote::{
-        OfflineFetchedItem, OfflinePushOutcome, OfflinePushResult, OfflineRemoteItem,
-        OfflineRemoteSnapshot, OfflineTier,
+        ReplicaFetchedItem, ReplicaPushOutcome, ReplicaPushResult, ReplicaRemoteItem,
+        ReplicaRemoteSnapshot, ReplicaTier,
     },
-    storage::OfflineLoaded,
+    storage::ReplicaLoaded,
 };
 
 // ---- in-memory storage ------------------------------------------------
 
 #[derive(Default)]
 pub struct MemStorage {
-    pub placements: BTreeMap<(OfflineCollectionId, OfflineHandle), OfflinePlacement>,
-    pub objects: BTreeMap<OfflineHash, (OfflineObject, Vec<u8>)>,
-    pub checkpoints: BTreeMap<OfflineCollectionId, OfflineCheckpoint>,
+    pub placements: BTreeMap<(ReplicaCollectionId, ReplicaHandle), ReplicaPlacement>,
+    pub objects: BTreeMap<ReplicaHash, (ReplicaObject, Vec<u8>)>,
+    pub checkpoints: BTreeMap<ReplicaCollectionId, ReplicaCheckpoint>,
 }
 
 impl MemStorage {
-    pub fn placement(&self, collection: &str, handle: &str) -> &OfflinePlacement {
+    pub fn placement(&self, collection: &str, handle: &str) -> &ReplicaPlacement {
         self.placements
-            .get(&(collection.into(), OfflineHandle::from(handle)))
+            .get(&(collection.into(), ReplicaHandle::from(handle)))
             .expect("placement exists")
     }
 }
 
-impl OfflineStorage for MemStorage {
+impl ReplicaStorage for MemStorage {
     type Error = Infallible;
 
-    fn load(&self, collection: &OfflineCollectionId) -> Result<OfflineLoaded, Infallible> {
+    fn load(&self, collection: &ReplicaCollectionId) -> Result<ReplicaLoaded, Infallible> {
         let placements = self
             .placements
             .iter()
@@ -52,7 +52,7 @@ impl OfflineStorage for MemStorage {
             .collect();
         let checkpoint = self.checkpoints.get(collection).cloned();
 
-        Ok(OfflineLoaded {
+        Ok(ReplicaLoaded {
             placements,
             checkpoint,
         })
@@ -60,8 +60,8 @@ impl OfflineStorage for MemStorage {
 
     fn lookup_objects(
         &self,
-        links: &[OfflineLinkId],
-    ) -> Result<BTreeMap<OfflineLinkId, OfflineHash>, Infallible> {
+        links: &[ReplicaLinkId],
+    ) -> Result<BTreeMap<ReplicaLinkId, ReplicaHash>, Infallible> {
         let mut known = BTreeMap::new();
 
         for link in links {
@@ -79,20 +79,20 @@ impl OfflineStorage for MemStorage {
         Ok(known)
     }
 
-    fn write(&mut self, ops: Vec<OfflineWriteOp>) -> Result<(), Infallible> {
+    fn write(&mut self, ops: Vec<ReplicaWriteOp>) -> Result<(), Infallible> {
         for op in ops {
             match op {
-                OfflineWriteOp::UpsertPlacement(p) => {
+                ReplicaWriteOp::UpsertPlacement(p) => {
                     self.placements
                         .insert((p.collection.clone(), p.handle.clone()), p);
                 }
-                OfflineWriteOp::DropPlacement { collection, handle } => {
+                ReplicaWriteOp::DropPlacement { collection, handle } => {
                     self.placements.remove(&(collection, handle));
                 }
-                OfflineWriteOp::StoreObject { object, body } => {
+                ReplicaWriteOp::StoreObject { object, body } => {
                     self.objects.insert(object.hash.clone(), (object, body));
                 }
-                OfflineWriteOp::SetCheckpoint {
+                ReplicaWriteOp::SetCheckpoint {
                     collection,
                     checkpoint,
                 } => {
@@ -109,8 +109,8 @@ impl OfflineStorage for MemStorage {
 
 #[derive(Clone)]
 pub struct ServerItem {
-    pub link_id: OfflineLinkId,
-    pub flags: OfflineFlags,
+    pub link_id: ReplicaLinkId,
+    pub flags: ReplicaFlags,
     pub body: Vec<u8>,
     /// The global change counter value of the item's last change; drives
     /// delta snapshots.
@@ -122,8 +122,8 @@ pub struct ServerItem {
 
 #[derive(Default)]
 pub struct MemRemote {
-    pub items: BTreeMap<OfflineCollectionId, BTreeMap<OfflineHandle, ServerItem>>,
-    pub full_fetches: Vec<OfflineHandle>,
+    pub items: BTreeMap<ReplicaCollectionId, BTreeMap<ReplicaHandle, ServerItem>>,
+    pub full_fetches: Vec<ReplicaHandle>,
     pub calls: usize,
     /// The handle assigned to the next accepted append (an add with no
     /// origin); incremented per append.
@@ -136,7 +136,7 @@ pub struct MemRemote {
     /// snapshot serves everything past the cursor's value.
     seq: usize,
     /// Handles removed, stamped with the counter value of their removal.
-    vanished: BTreeMap<OfflineCollectionId, Vec<(usize, OfflineHandle)>>,
+    vanished: BTreeMap<ReplicaCollectionId, Vec<(usize, ReplicaHandle)>>,
 }
 
 impl MemRemote {
@@ -162,15 +162,15 @@ impl MemRemote {
         // re-seeding an existing handle is a content change, never a
         // revision regression
         let rev = collection
-            .get(&OfflineHandle::from(handle))
+            .get(&ReplicaHandle::from(handle))
             .map(|i| i.rev + 1)
             .unwrap_or(0);
 
         collection.insert(
-            OfflineHandle::from(handle),
+            ReplicaHandle::from(handle),
             ServerItem {
-                link_id: OfflineLinkId::from(link),
-                flags: OfflineFlags::from_iter(flags.iter().copied()),
+                link_id: ReplicaLinkId::from(link),
+                flags: ReplicaFlags::from_iter(flags.iter().copied()),
                 body: body.to_vec(),
                 seq,
                 rev,
@@ -183,9 +183,9 @@ impl MemRemote {
         let item = self
             .items
             .get_mut(&collection.into())
-            .and_then(|c| c.get_mut(&OfflineHandle::from(handle)))
+            .and_then(|c| c.get_mut(&ReplicaHandle::from(handle)))
             .expect("server item exists");
-        item.flags = OfflineFlags::from_iter(flags.iter().copied());
+        item.flags = ReplicaFlags::from_iter(flags.iter().copied());
         item.seq = seq;
     }
 
@@ -195,7 +195,7 @@ impl MemRemote {
         let item = self
             .items
             .get_mut(&collection.into())
-            .and_then(|c| c.get_mut(&OfflineHandle::from(handle)))
+            .and_then(|c| c.get_mut(&ReplicaHandle::from(handle)))
             .expect("server item exists");
         item.body = body.to_vec();
         item.seq = seq;
@@ -204,15 +204,15 @@ impl MemRemote {
 
     pub fn remove(&mut self, collection: &str, handle: &str) {
         let seq = self.bump();
-        let collection = OfflineCollectionId::from(collection);
+        let collection = ReplicaCollectionId::from(collection);
         self.items
             .get_mut(&collection)
-            .and_then(|c| c.remove(&OfflineHandle::from(handle)))
+            .and_then(|c| c.remove(&ReplicaHandle::from(handle)))
             .expect("server item exists");
         self.vanished
             .entry(collection)
             .or_default()
-            .push((seq, OfflineHandle::from(handle)));
+            .push((seq, ReplicaHandle::from(handle)));
     }
 
     /// A handle-space change (an IMAP UIDVALIDITY bump): every member is
@@ -223,14 +223,14 @@ impl MemRemote {
         &mut self,
         collection: &str,
         generation: usize,
-    ) -> BTreeMap<OfflineHandle, OfflineHandle> {
+    ) -> BTreeMap<ReplicaHandle, ReplicaHandle> {
         let seq = self.bump();
         let members = self.items.entry(collection.into()).or_default();
         let mut mapping = BTreeMap::new();
 
         let old = std::mem::take(members);
         for (index, (handle, mut item)) in old.into_iter().enumerate() {
-            let new = OfflineHandle::from(format!("v{generation}-{index}"));
+            let new = ReplicaHandle::from(format!("v{generation}-{index}"));
             item.seq = seq;
             mapping.insert(handle, new.clone());
             members.insert(new, item);
@@ -239,7 +239,7 @@ impl MemRemote {
         mapping
     }
 
-    pub fn flags_of(&self, collection: &str, handle: &str) -> &OfflineFlags {
+    pub fn flags_of(&self, collection: &str, handle: &str) -> &ReplicaFlags {
         &self.item(collection, handle).flags
     }
 
@@ -250,12 +250,12 @@ impl MemRemote {
     fn item(&self, collection: &str, handle: &str) -> &ServerItem {
         self.items
             .get(&collection.into())
-            .and_then(|c| c.get(&OfflineHandle::from(handle)))
+            .and_then(|c| c.get(&ReplicaHandle::from(handle)))
             .expect("server item exists")
     }
 }
 
-pub fn hash(body: &[u8]) -> OfflineHash {
+pub fn hash(body: &[u8]) -> ReplicaHash {
     // tiny deterministic content hash: identical bytes collapse to one
     // object, which is exactly what the dedup path keys on
     let mut acc: u64 = 1469598103934665603;
@@ -263,19 +263,19 @@ pub fn hash(body: &[u8]) -> OfflineHash {
         acc ^= *byte as u64;
         acc = acc.wrapping_mul(1099511628211);
     }
-    OfflineHash::from(format!("{acc:016x}"))
+    ReplicaHash::from(format!("{acc:016x}"))
 }
 
-impl OfflineRemote for MemRemote {
+impl ReplicaRemote for MemRemote {
     type Error = Infallible;
 
     fn enumerate(
         &mut self,
-        collection: &OfflineCollectionId,
-        cursor: Option<OfflineCheckpoint>,
-    ) -> Result<OfflineRemoteSnapshot, Infallible> {
+        collection: &ReplicaCollectionId,
+        cursor: Option<ReplicaCheckpoint>,
+    ) -> Result<ReplicaRemoteSnapshot, Infallible> {
         self.calls += 1;
-        let checkpoint = OfflineCheckpoint(self.seq.to_string().into_bytes());
+        let checkpoint = ReplicaCheckpoint(self.seq.to_string().into_bytes());
 
         // a cursor that parses as a counter value yields a delta from it;
         // anything else falls back to a complete snapshot
@@ -292,7 +292,7 @@ impl OfflineRemote for MemRemote {
                     .into_iter()
                     .flatten()
                     .filter(|(_, item)| item.seq > since)
-                    .map(|(handle, item)| OfflineRemoteItem {
+                    .map(|(handle, item)| ReplicaRemoteItem {
                         handle: handle.clone(),
                         flags: item.flags.clone(),
                         revision: self.revision(item.rev),
@@ -317,7 +317,7 @@ impl OfflineRemote for MemRemote {
                 let items = members
                     .into_iter()
                     .flatten()
-                    .map(|(handle, item)| OfflineRemoteItem {
+                    .map(|(handle, item)| ReplicaRemoteItem {
                         handle: handle.clone(),
                         flags: item.flags.clone(),
                         revision: self.revision(item.rev),
@@ -327,7 +327,7 @@ impl OfflineRemote for MemRemote {
             }
         };
 
-        Ok(OfflineRemoteSnapshot {
+        Ok(ReplicaRemoteSnapshot {
             items,
             vanished,
             complete,
@@ -337,10 +337,10 @@ impl OfflineRemote for MemRemote {
 
     fn fetch(
         &mut self,
-        collection: &OfflineCollectionId,
-        handles: Vec<OfflineHandle>,
-        tier: OfflineTier,
-    ) -> Result<Vec<OfflineFetchedItem>, Infallible> {
+        collection: &ReplicaCollectionId,
+        handles: Vec<ReplicaHandle>,
+        tier: ReplicaTier,
+    ) -> Result<Vec<ReplicaFetchedItem>, Infallible> {
         self.calls += 1;
 
         let collection = self.items.get(collection).cloned().unwrap_or_default();
@@ -351,17 +351,17 @@ impl OfflineRemote for MemRemote {
             let Some(item) = collection.get(&handle) else {
                 continue;
             };
-            let meta = OfflineMeta(format!("headers:{}", handle.as_str()));
+            let meta = ReplicaMeta(format!("headers:{}", handle.as_str()));
 
             let body = match tier {
-                OfflineTier::Meta => None,
-                OfflineTier::Full => {
+                ReplicaTier::Meta => None,
+                ReplicaTier::Full => {
                     self.full_fetches.push(handle.clone());
                     Some((hash(&item.body), item.body.clone()))
                 }
             };
 
-            out.push(OfflineFetchedItem {
+            out.push(ReplicaFetchedItem {
                 handle,
                 link_id: item.link_id.clone(),
                 meta,
@@ -375,15 +375,15 @@ impl OfflineRemote for MemRemote {
 
     fn push(
         &mut self,
-        collection: &OfflineCollectionId,
-        changes: Vec<OfflineChange>,
-    ) -> Result<Vec<OfflinePushResult>, Infallible> {
+        collection: &ReplicaCollectionId,
+        changes: Vec<ReplicaChange>,
+    ) -> Result<Vec<ReplicaPushResult>, Infallible> {
         self.calls += 1;
         let mut results = Vec::new();
 
         for change in changes {
             let result = match change {
-                OfflineChange::SetFlags { handle, flags } => {
+                ReplicaChange::SetFlags { handle, flags } => {
                     let seq = self.bump();
                     if let Some(item) = self
                         .items
@@ -395,7 +395,7 @@ impl OfflineRemote for MemRemote {
                     }
                     accepted(handle, None, None)
                 }
-                OfflineChange::Remove {
+                ReplicaChange::Remove {
                     handle,
                     to,
                     if_match,
@@ -428,7 +428,7 @@ impl OfflineRemote for MemRemote {
                                 .push((seq, handle.clone()));
                             if let Some(target) = to {
                                 let moved =
-                                    OfflineHandle::from(format!("{}-moved", handle.as_str()));
+                                    ReplicaHandle::from(format!("{}-moved", handle.as_str()));
                                 let mut item = item;
                                 item.seq = seq;
                                 self.items.entry(target).or_default().insert(moved, item);
@@ -437,7 +437,7 @@ impl OfflineRemote for MemRemote {
                         accepted(handle, None, None)
                     }
                 }
-                OfflineChange::Update {
+                ReplicaChange::Update {
                     handle,
                     object,
                     if_match,
@@ -474,7 +474,7 @@ impl OfflineRemote for MemRemote {
                 // append the uploaded body under a fresh handle. A copy
                 // whose origin is gone is rejected (a real server errors
                 // on copying an expunged message).
-                OfflineChange::Add {
+                ReplicaChange::Add {
                     handle,
                     link_id,
                     flags,
@@ -493,7 +493,7 @@ impl OfflineRemote for MemRemote {
                                 continue;
                             };
                             let seq = self.bump();
-                            let new = OfflineHandle::from(format!("{}-copy", o.handle.as_str()));
+                            let new = ReplicaHandle::from(format!("{}-copy", o.handle.as_str()));
                             item.seq = seq;
                             self.items
                                 .entry(collection.clone())
@@ -504,10 +504,10 @@ impl OfflineRemote for MemRemote {
                         None => object.as_ref().map(|object| {
                             let seq = self.bump();
                             self.next_appended += 1;
-                            let new = OfflineHandle::from(format!("app-{}", self.next_appended));
+                            let new = ReplicaHandle::from(format!("app-{}", self.next_appended));
                             let link = link_id
                                 .clone()
-                                .unwrap_or_else(|| OfflineLinkId::from(new.as_str()));
+                                .unwrap_or_else(|| ReplicaLinkId::from(new.as_str()));
                             self.items.entry(collection.clone()).or_default().insert(
                                 new.clone(),
                                 ServerItem {
@@ -538,22 +538,22 @@ impl OfflineRemote for MemRemote {
 }
 
 fn accepted(
-    handle: OfflineHandle,
-    assigned: Option<OfflineHandle>,
+    handle: ReplicaHandle,
+    assigned: Option<ReplicaHandle>,
     revision: Option<String>,
-) -> OfflinePushResult {
-    OfflinePushResult {
+) -> ReplicaPushResult {
+    ReplicaPushResult {
         handle,
-        outcome: OfflinePushOutcome::Accepted,
+        outcome: ReplicaPushOutcome::Accepted,
         assigned,
         revision,
     }
 }
 
-fn rejected(handle: OfflineHandle) -> OfflinePushResult {
-    OfflinePushResult {
+fn rejected(handle: ReplicaHandle) -> ReplicaPushResult {
+    ReplicaPushResult {
         handle,
-        outcome: OfflinePushOutcome::Rejected,
+        outcome: ReplicaPushOutcome::Rejected,
         assigned: None,
         revision: None,
     }

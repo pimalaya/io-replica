@@ -1,7 +1,7 @@
 #![no_std]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-//! # io-offline
+//! # io-replica
 //!
 //! I/O-free offline-first replica engine. It maintains a local
 //! replica of remote collections of items (mail first, contacts and
@@ -24,23 +24,23 @@
 //! The engine separates what an item is from where it sits, and never
 //! folds the two together; this split is what makes dedup, the unified
 //! across-collections view and a safe partial cache fall out for free.
-//! An [`object::OfflineObject`] is the content-addressed body, stored
+//! An [`object::ReplicaObject`] is the content-addressed body, stored
 //! once and refcounted so copy, move and undelete are reference edits.
-//! A [`placement::OfflinePlacement`] is one item's presence in one
-//! collection, pinned through a protocol [`placement::OfflineHandle`]
+//! A [`placement::ReplicaPlacement`] is one item's presence in one
+//! collection, pinned through a protocol [`placement::ReplicaHandle`]
 //! (an IMAP UID, a WebDAV href, a JMAP id, always a string). Many
 //! placements may point at one object, keyed across collections by a
-//! stable [`placement::OfflineLinkId`] (a Message-ID header, a vCard or
+//! stable [`placement::ReplicaLinkId`] (a Message-ID header, a vCard or
 //! iCalendar UID), so a copied or shared item is fetched and stored
 //! once.
 //!
 //! Each placement sits at one rung of a strict level ladder
-//! ([`placement::OfflineLevel`]), each rung including the one below:
+//! ([`placement::ReplicaLevel`]), each rung including the one below:
 //! probed (the handle is known and the spine is kept complete per
 //! collection, so a missing item means deleted only when the base says
 //! so, never inferred from a missing body), meta (a minimal summary
 //! cached), and full (linked to a stored object body). The completeness
-//! of the probed spine plus the per-placement [`placement::OfflineBase`],
+//! of the probed spine plus the per-placement [`placement::ReplicaBase`],
 //! not the presence of a cached body, is what tells deleted from
 //! not-cached, and keeps a partial body cache safe to sync.
 //!
@@ -84,8 +84,8 @@
 //! [`mutate`], [`sync`] and [`rekey`], all built on the [`coroutine`]
 //! contract. The optional [`client`] module (`client` feature) is the
 //! reference std-blocking driver, servicing every yield through a
-//! consumer-implemented [`client::OfflineStorage`] and
-//! [`client::OfflineRemote`].
+//! consumer-implemented [`client::ReplicaStorage`] and
+//! [`client::ReplicaRemote`].
 //!
 //! ## Conventions
 //!

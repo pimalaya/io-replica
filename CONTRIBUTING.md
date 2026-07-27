@@ -13,7 +13,7 @@ Everything below documents only what differs from the Pimalaya standards.
 
 ## Feature matrix
 
-io-offline is a no_std library (with alloc). The I/O-free coroutine core is always present; the blocking driver sits behind the client feature (on by default), which is the only thing pulling in std. Build both ways so no std-only code leaks into the always-on core:
+io-replica is a no_std library (with alloc). The I/O-free coroutine core is always present; the blocking driver sits behind the client feature (on by default), which is the only thing pulling in std. Build both ways so no std-only code leaks into the always-on core:
 
 ```sh
 cargo build --no-default-features    # I/O-free coroutine core, no std leak

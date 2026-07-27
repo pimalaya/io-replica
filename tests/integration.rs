@@ -10,17 +10,17 @@
 #[allow(dead_code)]
 mod common;
 
-use io_offline::{
-    client::OfflineClient,
-    mutate::OfflineMutation,
-    placement::{OfflineFlags, OfflineHandle, OfflineLevel, OfflineStatus},
-    remote::OfflineTier,
-    sync::OfflineSyncOptions,
+use io_replica::{
+    client::ReplicaClient,
+    mutate::ReplicaMutation,
+    placement::{ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaStatus},
+    remote::ReplicaTier,
+    sync::ReplicaSyncOptions,
 };
 
 use crate::common::{MemRemote, MemStorage};
 
-fn seeded_client() -> OfflineClient<MemStorage, MemRemote> {
+fn seeded_client() -> ReplicaClient<MemStorage, MemRemote> {
     let body_a = b"From: a\r\nMessage-ID: <msg-a>\r\n\r\nshared body\r\n";
     let body_b = b"From: b\r\nMessage-ID: <msg-b>\r\n\r\nother body\r\n";
 
@@ -31,7 +31,7 @@ fn seeded_client() -> OfflineClient<MemStorage, MemRemote> {
     remote.seed("inbox", "i2", "msg-b", &[], body_b);
     remote.seed("archive", "a1", "msg-a", &["seen"], body_a);
 
-    OfflineClient::new(MemStorage::default(), remote)
+    ReplicaClient::new(MemStorage::default(), remote)
 }
 
 #[test]
@@ -39,7 +39,7 @@ fn full_offline_lifecycle() {
     let mut client = seeded_client();
 
     // 1. initial sync pulls a complete probed spine
-    let report = client.sync("inbox", OfflineSyncOptions::default()).unwrap();
+    let report = client.sync("inbox", ReplicaSyncOptions::default()).unwrap();
     assert_eq!(report.pulled, 2, "both inbox items pulled");
     assert_eq!(report.pushed, 0);
 
@@ -52,7 +52,7 @@ fn full_offline_lifecycle() {
         loaded
             .placements
             .iter()
-            .all(|p| p.level == OfflineLevel::Probed)
+            .all(|p| p.level == ReplicaLevel::Probed)
     );
     assert_eq!(
         client.remote().calls,
@@ -64,39 +64,39 @@ fn full_offline_lifecycle() {
     let report = client
         .upgrade(
             "inbox",
-            vec![OfflineHandle::from("i1"), OfflineHandle::from("i2")],
-            OfflineTier::Meta,
+            vec![ReplicaHandle::from("i1"), ReplicaHandle::from("i2")],
+            ReplicaTier::Meta,
         )
         .unwrap();
     assert_eq!(report.upgraded, 2);
     assert_eq!(
         client.storage().placement("inbox", "i1").level,
-        OfflineLevel::Meta
+        ReplicaLevel::Meta
     );
 
     let report = client
-        .upgrade("inbox", vec![OfflineHandle::from("i1")], OfflineTier::Full)
+        .upgrade("inbox", vec![ReplicaHandle::from("i1")], ReplicaTier::Full)
         .unwrap();
     assert_eq!(report.fetched, 1);
     assert_eq!(report.deduped, 0);
     assert_eq!(
         client.storage().placement("inbox", "i1").level,
-        OfflineLevel::Full
+        ReplicaLevel::Full
     );
     assert_eq!(client.storage().objects.len(), 1, "one stored body");
 
     // 4. second collection, same logical item: upgrading its body must
     // dedup against the already-stored object, with zero new fetch.
-    // OfflineMeta first resolves a1's link id (enumerate does not carry it), then
+    // ReplicaMeta first resolves a1's link id (enumerate does not carry it), then
     // the Full upgrade links the shared body by that link id.
     client
-        .sync("archive", OfflineSyncOptions::default())
+        .sync("archive", ReplicaSyncOptions::default())
         .unwrap();
     client
         .upgrade(
             "archive",
-            vec![OfflineHandle::from("a1")],
-            OfflineTier::Meta,
+            vec![ReplicaHandle::from("a1")],
+            ReplicaTier::Meta,
         )
         .unwrap();
     let fetches_before = client.remote().full_fetches.len();
@@ -104,8 +104,8 @@ fn full_offline_lifecycle() {
     let report = client
         .upgrade(
             "archive",
-            vec![OfflineHandle::from("a1")],
-            OfflineTier::Full,
+            vec![ReplicaHandle::from("a1")],
+            ReplicaTier::Full,
         )
         .unwrap();
     assert_eq!(report.deduped, 1, "shared body deduped");
@@ -126,29 +126,29 @@ fn full_offline_lifecycle() {
     client
         .mutate(
             "inbox",
-            OfflineMutation::SetFlags {
-                handle: OfflineHandle::from("i1"),
-                flags: OfflineFlags::from_iter(["seen"]),
+            ReplicaMutation::SetFlags {
+                handle: ReplicaHandle::from("i1"),
+                flags: ReplicaFlags::from_iter(["seen"]),
             },
         )
         .unwrap();
     assert_eq!(
         client.storage().placement("inbox", "i1").status,
-        OfflineStatus::Dirty,
+        ReplicaStatus::Dirty,
     );
 
-    let report = client.sync("inbox", OfflineSyncOptions::default()).unwrap();
+    let report = client.sync("inbox", ReplicaSyncOptions::default()).unwrap();
     assert_eq!(report.pushed, 1, "local seen flag pushed");
     assert!(client.remote().flags_of("inbox", "i1").contains("seen"));
     assert_eq!(
         client.storage().placement("inbox", "i1").status,
-        OfflineStatus::Clean,
+        ReplicaStatus::Clean,
         "pushed placement is rebased clean",
     );
 
     // 6. a remote-side change is pulled on the next sync
     client.remote_mut().set_flags("inbox", "i2", &["flagged"]);
-    let report = client.sync("inbox", OfflineSyncOptions::default()).unwrap();
+    let report = client.sync("inbox", ReplicaSyncOptions::default()).unwrap();
     assert_eq!(report.pulled, 1);
     assert!(
         client
@@ -164,9 +164,9 @@ fn full_offline_lifecycle() {
     client
         .mutate(
             "inbox",
-            OfflineMutation::SetFlags {
-                handle: OfflineHandle::from("i1"),
-                flags: OfflineFlags::from_iter(["draft"]),
+            ReplicaMutation::SetFlags {
+                handle: ReplicaHandle::from("i1"),
+                flags: ReplicaFlags::from_iter(["draft"]),
             },
         )
         .unwrap();
@@ -174,7 +174,7 @@ fn full_offline_lifecycle() {
         .remote_mut()
         .set_flags("inbox", "i1", &["seen", "important"]);
 
-    let report = client.sync("inbox", OfflineSyncOptions::default()).unwrap();
+    let report = client.sync("inbox", ReplicaSyncOptions::default()).unwrap();
     assert_eq!(report.conflicts, 0, "flags never conflict");
     assert_eq!(report.pushed, 1);
     assert_eq!(report.pulled, 1);
@@ -190,14 +190,14 @@ fn full_offline_lifecycle() {
     );
     assert_eq!(
         client.storage().placement("inbox", "i1").status,
-        OfflineStatus::Clean,
+        ReplicaStatus::Clean,
     );
 }
 
 #[test]
 fn offline_copy_creates_pushes_and_rekeys() {
     let mut client = seeded_client();
-    let opts = OfflineSyncOptions::default();
+    let opts = ReplicaSyncOptions::default();
 
     // Know the inbox spine, so inbox/i2 is a real placement to copy.
     client.sync("inbox", opts).unwrap();
@@ -207,19 +207,19 @@ fn offline_copy_creates_pushes_and_rekeys() {
     client
         .mutate(
             "inbox",
-            OfflineMutation::Copy {
-                handle: OfflineHandle::from("i2"),
+            ReplicaMutation::Copy {
+                handle: ReplicaHandle::from("i2"),
                 target: "archive".into(),
-                placeholder: OfflineHandle::from("tmp-i2"),
+                placeholder: ReplicaHandle::from("tmp-i2"),
             },
         )
         .unwrap();
     let staged = client.storage().placement("archive", "tmp-i2");
-    assert_eq!(staged.status, OfflineStatus::Created);
+    assert_eq!(staged.status, ReplicaStatus::Created);
     assert!(staged.origin.is_some());
     assert_eq!(
         client.storage().placement("inbox", "i2").status,
-        OfflineStatus::Clean,
+        ReplicaStatus::Clean,
         "the copy source is untouched",
     );
 
@@ -231,11 +231,11 @@ fn offline_copy_creates_pushes_and_rekeys() {
         !client
             .storage()
             .placements
-            .contains_key(&("archive".into(), OfflineHandle::from("tmp-i2"))),
+            .contains_key(&("archive".into(), ReplicaHandle::from("tmp-i2"))),
         "the placeholder is dropped once the copy is confirmed",
     );
     let real = client.storage().placement("archive", "i2-copy");
-    assert_eq!(real.status, OfflineStatus::Clean);
+    assert_eq!(real.status, ReplicaStatus::Clean);
     assert!(real.base.is_some());
     assert!(real.origin.is_none());
 }

@@ -13,13 +13,13 @@ use log::{debug, trace};
 use thiserror::Error;
 
 use crate::{
-    change::OfflineWriteOp,
-    collection::OfflineCollectionId,
+    change::ReplicaWriteOp,
+    collection::ReplicaCollectionId,
     coroutine::*,
-    object::OfflineObject,
+    object::ReplicaObject,
     placement::{
-        OfflineFlags, OfflineHandle, OfflineLevel, OfflineMeta, OfflineOrigin, OfflinePlacement,
-        OfflineStatus,
+        ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaMeta, ReplicaOrigin, ReplicaPlacement,
+        ReplicaStatus,
     },
 };
 
@@ -27,18 +27,18 @@ use crate::{
 ///
 /// Each mutation reads one source placement in the coroutine's collection
 /// and stages the resulting writes; the remote is reconciled on the next
-/// sync. A copy stages a [`OfflineStatus::Created`] placement in another collection.
+/// sync. A copy stages a [`ReplicaStatus::Created`] placement in another collection.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum OfflineMutation {
+pub enum ReplicaMutation {
     /// Replace a placement's flag set.
     SetFlags {
         /// The placement to update.
-        handle: OfflineHandle,
+        handle: ReplicaHandle,
         /// The new flag set.
-        flags: OfflineFlags,
+        flags: ReplicaFlags,
     },
     /// Mark a placement deleted, keeping it as a tombstone until synced.
-    Remove(OfflineHandle),
+    Remove(ReplicaHandle),
     /// Replace a placement's body with locally edited content: the new
     /// object is stored, the placement repointed at it and marked dirty;
     /// the base keeps the previously synced body, so the next sync derives
@@ -49,25 +49,25 @@ pub enum OfflineMutation {
     /// resolution was merged against.
     Edit {
         /// The placement to update.
-        handle: OfflineHandle,
+        handle: ReplicaHandle,
         /// The new body's object metadata.
-        object: OfflineObject,
+        object: ReplicaObject,
         /// The new body bytes.
         body: Vec<u8>,
         /// The refreshed summary, when the consumer projects one; `None`
         /// keeps the cached summary.
-        meta: Option<OfflineMeta>,
+        meta: Option<ReplicaMeta>,
     },
     /// Copy a placement into `target` as a pending create that the next
     /// sync pushes with a server-side copy (no body re-upload). The source
     /// is left untouched.
     Copy {
         /// The source placement to copy.
-        handle: OfflineHandle,
+        handle: ReplicaHandle,
         /// The collection to copy it into.
-        target: OfflineCollectionId,
+        target: ReplicaCollectionId,
         /// The provisional handle the copy is staged under in `target`.
-        placeholder: OfflineHandle,
+        placeholder: ReplicaHandle,
     },
     /// Move a placement into `target`: tombstone the source carrying its
     /// destination, so the next sync pushes one atomic server-side UID MOVE
@@ -75,15 +75,15 @@ pub enum OfflineMutation {
     /// picks it up on its own next enumerate.
     Move {
         /// The source placement to move.
-        handle: OfflineHandle,
+        handle: ReplicaHandle,
         /// The collection to move it into.
-        target: OfflineCollectionId,
+        target: ReplicaCollectionId,
     },
 }
 
-impl OfflineMutation {
+impl ReplicaMutation {
     /// The source handle the mutation reads in the coroutine's collection.
-    fn handle(&self) -> &OfflineHandle {
+    fn handle(&self) -> &ReplicaHandle {
         match self {
             Self::SetFlags { handle, .. } => handle,
             Self::Remove(handle) => handle,
@@ -96,7 +96,7 @@ impl OfflineMutation {
 
 /// Failure causes during a MUTATE flow.
 #[derive(Clone, Debug, Error)]
-pub enum OfflineMutateError {
+pub enum ReplicaMutateError {
     /// The targeted handle has no placement in the collection.
     #[error("Offline MUTATE failed: unknown handle {0}")]
     UnknownHandle(String),
@@ -109,15 +109,15 @@ pub enum OfflineMutateError {
 }
 
 /// I/O-free MUTATE coroutine.
-pub struct OfflineMutate {
-    collection: OfflineCollectionId,
-    mutation: OfflineMutation,
+pub struct ReplicaMutate {
+    collection: ReplicaCollectionId,
+    mutation: ReplicaMutation,
     state: State,
 }
 
-impl OfflineMutate {
+impl ReplicaMutate {
     /// Creates a coroutine that applies `mutation` to `collection`.
-    pub fn new(collection: impl Into<OfflineCollectionId>, mutation: OfflineMutation) -> Self {
+    pub fn new(collection: impl Into<ReplicaCollectionId>, mutation: ReplicaMutation) -> Self {
         let collection = collection.into();
         debug!("mutate collection {}", collection.as_str());
 
@@ -129,29 +129,29 @@ impl OfflineMutate {
     }
 
     /// Stages the writes for the mutation given its loaded source placement.
-    /// OfflineFlags and removes rewrite the source in place; a copy leaves the
+    /// ReplicaFlags and removes rewrite the source in place; a copy leaves the
     /// source untouched and stages a pending create in the target.
-    fn writes(&self, mut source: OfflinePlacement) -> Vec<OfflineWriteOp> {
+    fn writes(&self, mut source: ReplicaPlacement) -> Vec<ReplicaWriteOp> {
         match &self.mutation {
-            OfflineMutation::SetFlags { flags, .. } => {
+            ReplicaMutation::SetFlags { flags, .. } => {
                 source.flags = flags.clone();
                 // NOTE: a pending create stays a create and an unresolved
                 // content conflict stays a conflict (its resolution is an
                 // edit); the flag change rides along either way.
-                if source.status == OfflineStatus::Clean {
-                    source.status = OfflineStatus::Dirty;
+                if source.status == ReplicaStatus::Clean {
+                    source.status = ReplicaStatus::Dirty;
                 }
-                vec![OfflineWriteOp::UpsertPlacement(source)]
+                vec![ReplicaWriteOp::UpsertPlacement(source)]
             }
-            OfflineMutation::Remove(_) => {
-                source.status = OfflineStatus::Tombstone;
-                vec![OfflineWriteOp::UpsertPlacement(source)]
+            ReplicaMutation::Remove(_) => {
+                source.status = ReplicaStatus::Tombstone;
+                vec![ReplicaWriteOp::UpsertPlacement(source)]
             }
-            OfflineMutation::Edit {
+            ReplicaMutation::Edit {
                 object, body, meta, ..
             } => {
                 source.object = Some(object.hash.clone());
-                source.level = OfflineLevel::Full;
+                source.level = ReplicaLevel::Full;
                 if meta.is_some() {
                     source.meta = meta.clone();
                 }
@@ -159,31 +159,31 @@ impl OfflineMutate {
                 // NOTE: editing a conflict is its resolution: the base
                 // adopts the remote revision the resolution was merged
                 // against.
-                if source.status == OfflineStatus::Conflict {
+                if source.status == ReplicaStatus::Conflict {
                     let revision = source.conflict_revision.take();
                     if let (Some(base), Some(revision)) = (source.base.as_mut(), revision) {
                         base.revision = Some(revision);
                     }
                 }
 
-                if source.status != OfflineStatus::Created {
-                    source.status = OfflineStatus::Dirty;
+                if source.status != ReplicaStatus::Created {
+                    source.status = ReplicaStatus::Dirty;
                 }
 
                 vec![
-                    OfflineWriteOp::StoreObject {
+                    ReplicaWriteOp::StoreObject {
                         object: object.clone(),
                         body: body.clone(),
                     },
-                    OfflineWriteOp::UpsertPlacement(source),
+                    ReplicaWriteOp::UpsertPlacement(source),
                 ]
             }
-            OfflineMutation::Copy {
+            ReplicaMutation::Copy {
                 target,
                 placeholder,
                 ..
             } => {
-                let create = OfflinePlacement {
+                let create = ReplicaPlacement {
                     collection: target.clone(),
                     handle: placeholder.clone(),
                     link_id: source.link_id.clone(),
@@ -191,55 +191,55 @@ impl OfflineMutate {
                     level: source.level,
                     meta: source.meta.clone(),
                     flags: source.flags.clone(),
-                    status: OfflineStatus::Created,
+                    status: ReplicaStatus::Created,
                     conflict_revision: None,
                     base: None,
-                    origin: Some(OfflineOrigin {
+                    origin: Some(ReplicaOrigin {
                         collection: source.collection.clone(),
                         handle: source.handle.clone(),
                     }),
                 };
-                vec![OfflineWriteOp::UpsertPlacement(create)]
+                vec![ReplicaWriteOp::UpsertPlacement(create)]
             }
-            OfflineMutation::Move { target, .. } => {
+            ReplicaMutation::Move { target, .. } => {
                 // Tombstone the source, carrying the move destination in its
                 // origin so the sync pushes a UID MOVE rather than a trash
                 // delete. No target placement: it appears there on the next
                 // enumerate.
-                source.status = OfflineStatus::Tombstone;
-                source.origin = Some(OfflineOrigin {
+                source.status = ReplicaStatus::Tombstone;
+                source.origin = Some(ReplicaOrigin {
                     collection: target.clone(),
                     handle: source.handle.clone(),
                 });
-                vec![OfflineWriteOp::UpsertPlacement(source)]
+                vec![ReplicaWriteOp::UpsertPlacement(source)]
             }
         }
     }
 }
 
-impl OfflineCoroutine for OfflineMutate {
-    type Yield = OfflineYield;
-    type Return = Result<(), OfflineMutateError>;
+impl ReplicaCoroutine for ReplicaMutate {
+    type Yield = ReplicaYield;
+    type Return = Result<(), ReplicaMutateError>;
 
     fn resume(
         &mut self,
-        arg: Option<OfflineArg>,
-    ) -> OfflineCoroutineState<Self::Yield, Self::Return> {
+        arg: Option<ReplicaArg>,
+    ) -> ReplicaCoroutineState<Self::Yield, Self::Return> {
         trace!("mutate: {}", self.state);
 
         match (&mut self.state, arg) {
             (State::Start, None) => {
                 debug!("load target item from storage");
                 self.state = State::PendingLoad;
-                OfflineCoroutineState::Yielded(OfflineYield::WantsLoad(self.collection.clone()))
+                ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad(self.collection.clone()))
             }
-            (State::PendingLoad, Some(OfflineArg::Load(loaded))) => {
+            (State::PendingLoad, Some(ReplicaArg::Load(loaded))) => {
                 let handle = self.mutation.handle();
 
                 let Some(placement) = loaded.placements.into_iter().find(|p| &p.handle == handle)
                 else {
-                    let err = OfflineMutateError::UnknownHandle(handle.as_str().into());
-                    return OfflineCoroutineState::Complete(Err(err));
+                    let err = ReplicaMutateError::UnknownHandle(handle.as_str().into());
+                    return ReplicaCoroutineState::Complete(Err(err));
                 };
 
                 let ops = self.writes(placement);
@@ -251,14 +251,14 @@ impl OfflineCoroutine for OfflineMutate {
                 trace!("writes: {ops:?}");
 
                 self.state = State::PendingWrite;
-                OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(ops))
+                ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops))
             }
-            (State::PendingWrite, Some(OfflineArg::Write)) => {
+            (State::PendingWrite, Some(ReplicaArg::Write)) => {
                 debug!("local change written");
-                OfflineCoroutineState::Complete(Ok(()))
+                ReplicaCoroutineState::Complete(Ok(()))
             }
-            (_, Some(_)) => OfflineCoroutineState::Complete(Err(OfflineMutateError::UnexpectedArg)),
-            (_, None) => OfflineCoroutineState::Complete(Err(OfflineMutateError::MissingArg)),
+            (_, Some(_)) => ReplicaCoroutineState::Complete(Err(ReplicaMutateError::UnexpectedArg)),
+            (_, None) => ReplicaCoroutineState::Complete(Err(ReplicaMutateError::MissingArg)),
         }
     }
 }
@@ -285,25 +285,25 @@ mod tests {
 
     use crate::{
         mutate::*,
-        placement::{OfflineBase, OfflineLevel, OfflineStatus},
-        storage::OfflineLoaded,
+        placement::{ReplicaBase, ReplicaLevel, ReplicaStatus},
+        storage::ReplicaLoaded,
     };
 
-    fn loaded(handle: &str) -> OfflineLoaded {
+    fn loaded(handle: &str) -> ReplicaLoaded {
         crate::testlog::init();
-        OfflineLoaded {
-            placements: vec![OfflinePlacement {
+        ReplicaLoaded {
+            placements: vec![ReplicaPlacement {
                 collection: "inbox".into(),
-                handle: OfflineHandle::from(handle),
+                handle: ReplicaHandle::from(handle),
                 link_id: None,
                 object: None,
-                level: OfflineLevel::Meta,
+                level: ReplicaLevel::Meta,
                 meta: None,
-                flags: OfflineFlags::default(),
+                flags: ReplicaFlags::default(),
                 conflict_revision: None,
-                status: OfflineStatus::Clean,
-                base: Some(OfflineBase {
-                    flags: OfflineFlags::default(),
+                status: ReplicaStatus::Clean,
+                base: Some(ReplicaBase {
+                    flags: ReplicaFlags::default(),
                     revision: None,
                     object: None,
                 }),
@@ -315,21 +315,21 @@ mod tests {
 
     #[test]
     fn set_flags_marks_dirty() {
-        let mutation = OfflineMutation::SetFlags {
-            handle: OfflineHandle::from("1"),
-            flags: OfflineFlags::from_iter(["seen"]),
+        let mutation = ReplicaMutation::SetFlags {
+            handle: ReplicaHandle::from("1"),
+            flags: ReplicaFlags::from_iter(["seen"]),
         };
-        let mut mutate = OfflineMutate::new("inbox", mutation);
+        let mut mutate = ReplicaMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
 
-        let ops = match mutate.resume(Some(OfflineArg::Load(loaded("1")))) {
-            OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(ops)) => ops,
+        let ops = match mutate.resume(Some(ReplicaArg::Load(loaded("1")))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
             state => panic!("expected WantsWrite, got {state:?}"),
         };
-        let OfflineWriteOp::UpsertPlacement(p) = &ops[0] else {
+        let ReplicaWriteOp::UpsertPlacement(p) = &ops[0] else {
             panic!("expected UpsertPlacement, got {:?}", ops[0]);
         };
-        assert_eq!(p.status, OfflineStatus::Dirty);
+        assert_eq!(p.status, ReplicaStatus::Dirty);
         assert!(p.flags.contains("seen"));
         assert!(p.base.is_some(), "base must be preserved for sync");
     }
@@ -339,25 +339,25 @@ mod tests {
         // The flag edit rides along; the content conflict stays unresolved
         // (its resolution is an edit), so the sync never mistakes the
         // placement for a plain dirty one.
-        let mutation = OfflineMutation::SetFlags {
-            handle: OfflineHandle::from("1"),
-            flags: OfflineFlags::from_iter(["seen"]),
+        let mutation = ReplicaMutation::SetFlags {
+            handle: ReplicaHandle::from("1"),
+            flags: ReplicaFlags::from_iter(["seen"]),
         };
-        let mut mutate = OfflineMutate::new("inbox", mutation);
+        let mut mutate = ReplicaMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
 
         let mut loaded = loaded("1");
-        loaded.placements[0].status = OfflineStatus::Conflict;
+        loaded.placements[0].status = ReplicaStatus::Conflict;
         loaded.placements[0].conflict_revision = Some("r2".into());
 
-        let ops = match mutate.resume(Some(OfflineArg::Load(loaded))) {
-            OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(ops)) => ops,
+        let ops = match mutate.resume(Some(ReplicaArg::Load(loaded))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
             state => panic!("expected WantsWrite, got {state:?}"),
         };
-        let OfflineWriteOp::UpsertPlacement(p) = &ops[0] else {
+        let ReplicaWriteOp::UpsertPlacement(p) = &ops[0] else {
             panic!("expected UpsertPlacement, got {:?}", ops[0]);
         };
-        assert_eq!(p.status, OfflineStatus::Conflict);
+        assert_eq!(p.status, ReplicaStatus::Conflict);
         assert_eq!(p.conflict_revision.as_deref(), Some("r2"));
         assert!(p.flags.contains("seen"));
     }
@@ -366,52 +366,52 @@ mod tests {
     fn set_flags_on_a_created_placement_stays_created() {
         // A pending create keeps its status, else the sync would never
         // push the add.
-        let mutation = OfflineMutation::SetFlags {
-            handle: OfflineHandle::from("1"),
-            flags: OfflineFlags::from_iter(["seen"]),
+        let mutation = ReplicaMutation::SetFlags {
+            handle: ReplicaHandle::from("1"),
+            flags: ReplicaFlags::from_iter(["seen"]),
         };
-        let mut mutate = OfflineMutate::new("inbox", mutation);
+        let mut mutate = ReplicaMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
 
         let mut loaded = loaded("1");
-        loaded.placements[0].status = OfflineStatus::Created;
+        loaded.placements[0].status = ReplicaStatus::Created;
         loaded.placements[0].base = None;
 
-        let ops = match mutate.resume(Some(OfflineArg::Load(loaded))) {
-            OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(ops)) => ops,
+        let ops = match mutate.resume(Some(ReplicaArg::Load(loaded))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
             state => panic!("expected WantsWrite, got {state:?}"),
         };
-        let OfflineWriteOp::UpsertPlacement(p) = &ops[0] else {
+        let ReplicaWriteOp::UpsertPlacement(p) = &ops[0] else {
             panic!("expected UpsertPlacement, got {:?}", ops[0]);
         };
-        assert_eq!(p.status, OfflineStatus::Created);
+        assert_eq!(p.status, ReplicaStatus::Created);
         assert!(p.flags.contains("seen"));
     }
 
     #[test]
     fn remove_marks_tombstone() {
-        let mutation = OfflineMutation::Remove(OfflineHandle::from("1"));
-        let mut mutate = OfflineMutate::new("inbox", mutation);
+        let mutation = ReplicaMutation::Remove(ReplicaHandle::from("1"));
+        let mut mutate = ReplicaMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
 
-        let ops = match mutate.resume(Some(OfflineArg::Load(loaded("1")))) {
-            OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(ops)) => ops,
+        let ops = match mutate.resume(Some(ReplicaArg::Load(loaded("1")))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
             state => panic!("expected WantsWrite, got {state:?}"),
         };
-        let OfflineWriteOp::UpsertPlacement(p) = &ops[0] else {
+        let ReplicaWriteOp::UpsertPlacement(p) = &ops[0] else {
             panic!("expected UpsertPlacement, got {:?}", ops[0]);
         };
-        assert_eq!(p.status, OfflineStatus::Tombstone);
+        assert_eq!(p.status, ReplicaStatus::Tombstone);
     }
 
     #[test]
     fn unknown_handle_errors() {
-        let mutation = OfflineMutation::Remove(OfflineHandle::from("nope"));
-        let mut mutate = OfflineMutate::new("inbox", mutation);
+        let mutation = ReplicaMutation::Remove(ReplicaHandle::from("nope"));
+        let mut mutate = ReplicaMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
 
-        match mutate.resume(Some(OfflineArg::Load(loaded("1")))) {
-            OfflineCoroutineState::Complete(Err(OfflineMutateError::UnknownHandle(h))) => {
+        match mutate.resume(Some(ReplicaArg::Load(loaded("1")))) {
+            ReplicaCoroutineState::Complete(Err(ReplicaMutateError::UnknownHandle(h))) => {
                 assert_eq!(h, "nope");
             }
             state => panic!("expected UnknownHandle, got {state:?}"),
@@ -420,37 +420,37 @@ mod tests {
 
     #[test]
     fn write_completes() {
-        let mutation = OfflineMutation::Remove(OfflineHandle::from("1"));
-        let mut mutate = OfflineMutate::new("inbox", mutation);
+        let mutation = ReplicaMutation::Remove(ReplicaHandle::from("1"));
+        let mut mutate = ReplicaMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
-        let _ = mutate.resume(Some(OfflineArg::Load(loaded("1"))));
+        let _ = mutate.resume(Some(ReplicaArg::Load(loaded("1"))));
 
-        match mutate.resume(Some(OfflineArg::Write)) {
-            OfflineCoroutineState::Complete(Ok(())) => {}
+        match mutate.resume(Some(ReplicaArg::Write)) {
+            ReplicaCoroutineState::Complete(Ok(())) => {}
             state => panic!("expected Complete(Ok), got {state:?}"),
         }
     }
 
     #[test]
     fn missing_arg_errors() {
-        let mutation = OfflineMutation::Remove(OfflineHandle::from("1"));
-        let mut mutate = OfflineMutate::new("inbox", mutation);
+        let mutation = ReplicaMutation::Remove(ReplicaHandle::from("1"));
+        let mut mutate = ReplicaMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
 
         match mutate.resume(None) {
-            OfflineCoroutineState::Complete(Err(OfflineMutateError::MissingArg)) => {}
+            ReplicaCoroutineState::Complete(Err(ReplicaMutateError::MissingArg)) => {}
             state => panic!("expected MissingArg, got {state:?}"),
         }
     }
 
     #[test]
     fn unexpected_arg_errors() {
-        let mutation = OfflineMutation::Remove(OfflineHandle::from("1"));
-        let mut mutate = OfflineMutate::new("inbox", mutation);
+        let mutation = ReplicaMutation::Remove(ReplicaHandle::from("1"));
+        let mut mutate = ReplicaMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
 
-        match mutate.resume(Some(OfflineArg::Write)) {
-            OfflineCoroutineState::Complete(Err(OfflineMutateError::UnexpectedArg)) => {}
+        match mutate.resume(Some(ReplicaArg::Write)) {
+            ReplicaCoroutineState::Complete(Err(ReplicaMutateError::UnexpectedArg)) => {}
             state => panic!("expected UnexpectedArg, got {state:?}"),
         }
     }
@@ -460,34 +460,34 @@ mod tests {
         // An edit stores the new object, repoints the placement at it at
         // full level and marks it dirty; the base keeps the synced state so
         // the next sync derives the push.
-        use crate::object::{OfflineHash, OfflineObject};
+        use crate::object::{ReplicaHash, ReplicaObject};
 
-        let mutation = OfflineMutation::Edit {
-            handle: OfflineHandle::from("1"),
-            object: OfflineObject {
-                hash: OfflineHash::from("h2"),
+        let mutation = ReplicaMutation::Edit {
+            handle: ReplicaHandle::from("1"),
+            object: ReplicaObject {
+                hash: ReplicaHash::from("h2"),
                 size: 4,
             },
             body: b"body".to_vec(),
             meta: None,
         };
-        let mut mutate = OfflineMutate::new("inbox", mutation);
+        let mut mutate = ReplicaMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
 
-        let ops = match mutate.resume(Some(OfflineArg::Load(loaded("1")))) {
-            OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(ops)) => ops,
+        let ops = match mutate.resume(Some(ReplicaArg::Load(loaded("1")))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
             state => panic!("expected WantsWrite, got {state:?}"),
         };
 
         assert!(
-            matches!(&ops[0], OfflineWriteOp::StoreObject { object, .. } if object.hash == OfflineHash::from("h2"))
+            matches!(&ops[0], ReplicaWriteOp::StoreObject { object, .. } if object.hash == ReplicaHash::from("h2"))
         );
-        let OfflineWriteOp::UpsertPlacement(p) = &ops[1] else {
+        let ReplicaWriteOp::UpsertPlacement(p) = &ops[1] else {
             panic!("expected UpsertPlacement, got {:?}", ops[1]);
         };
-        assert_eq!(p.status, OfflineStatus::Dirty);
-        assert_eq!(p.object, Some(OfflineHash::from("h2")));
-        assert_eq!(p.level, OfflineLevel::Full);
+        assert_eq!(p.status, ReplicaStatus::Dirty);
+        assert_eq!(p.object, Some(ReplicaHash::from("h2")));
+        assert_eq!(p.level, ReplicaLevel::Full);
         assert!(p.base.is_some(), "base must be preserved for sync");
     }
 
@@ -495,28 +495,28 @@ mod tests {
     fn edit_refreshes_the_projected_meta() {
         // A consumer that projects a fresh summary from the edited body
         // passes it along; the cached one is replaced.
-        use crate::object::{OfflineHash, OfflineObject};
+        use crate::object::{ReplicaHash, ReplicaObject};
 
-        let mutation = OfflineMutation::Edit {
-            handle: OfflineHandle::from("1"),
-            object: OfflineObject {
-                hash: OfflineHash::from("h2"),
+        let mutation = ReplicaMutation::Edit {
+            handle: ReplicaHandle::from("1"),
+            object: ReplicaObject {
+                hash: ReplicaHash::from("h2"),
                 size: 4,
             },
             body: b"body".to_vec(),
-            meta: Some(OfflineMeta("fresh".into())),
+            meta: Some(ReplicaMeta("fresh".into())),
         };
-        let mut mutate = OfflineMutate::new("inbox", mutation);
+        let mut mutate = ReplicaMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
 
-        let ops = match mutate.resume(Some(OfflineArg::Load(loaded("1")))) {
-            OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(ops)) => ops,
+        let ops = match mutate.resume(Some(ReplicaArg::Load(loaded("1")))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
             state => panic!("expected WantsWrite, got {state:?}"),
         };
-        let OfflineWriteOp::UpsertPlacement(p) = &ops[1] else {
+        let ReplicaWriteOp::UpsertPlacement(p) = &ops[1] else {
             panic!("expected UpsertPlacement, got {:?}", ops[1]);
         };
-        assert_eq!(p.meta, Some(OfflineMeta("fresh".into())));
+        assert_eq!(p.meta, Some(ReplicaMeta("fresh".into())));
     }
 
     #[test]
@@ -524,33 +524,33 @@ mod tests {
         // Editing a conflicted placement is its resolution: the base adopts
         // the remote revision observed at conflict time, so the resolving
         // push is gated on the remote state the merge was made against.
-        use crate::object::{OfflineHash, OfflineObject};
+        use crate::object::{ReplicaHash, ReplicaObject};
 
-        let mutation = OfflineMutation::Edit {
-            handle: OfflineHandle::from("1"),
-            object: OfflineObject {
-                hash: OfflineHash::from("h3"),
+        let mutation = ReplicaMutation::Edit {
+            handle: ReplicaHandle::from("1"),
+            object: ReplicaObject {
+                hash: ReplicaHash::from("h3"),
                 size: 6,
             },
             body: b"merged".to_vec(),
             meta: None,
         };
-        let mut mutate = OfflineMutate::new("inbox", mutation);
+        let mut mutate = ReplicaMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
 
         let mut loaded = loaded("1");
-        loaded.placements[0].status = OfflineStatus::Conflict;
+        loaded.placements[0].status = ReplicaStatus::Conflict;
         loaded.placements[0].conflict_revision = Some("r2".into());
 
-        let ops = match mutate.resume(Some(OfflineArg::Load(loaded))) {
-            OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(ops)) => ops,
+        let ops = match mutate.resume(Some(ReplicaArg::Load(loaded))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
             state => panic!("expected WantsWrite, got {state:?}"),
         };
-        let OfflineWriteOp::UpsertPlacement(p) = &ops[1] else {
+        let ReplicaWriteOp::UpsertPlacement(p) = &ops[1] else {
             panic!("expected UpsertPlacement, got {:?}", ops[1]);
         };
 
-        assert_eq!(p.status, OfflineStatus::Dirty);
+        assert_eq!(p.status, ReplicaStatus::Dirty);
         assert_eq!(p.conflict_revision, None);
         let base = p.base.as_ref().expect("a base");
         assert_eq!(base.revision.as_deref(), Some("r2"));
@@ -560,24 +560,24 @@ mod tests {
     fn copy_stages_created_placement_in_target() {
         // A copy leaves the source untouched and stages a Created placement
         // in the target under the placeholder, carrying its origin.
-        let mutation = OfflineMutation::Copy {
-            handle: OfflineHandle::from("1"),
+        let mutation = ReplicaMutation::Copy {
+            handle: ReplicaHandle::from("1"),
             target: "archive".into(),
-            placeholder: OfflineHandle::from("tmp-1"),
+            placeholder: ReplicaHandle::from("tmp-1"),
         };
-        let mut mutate = OfflineMutate::new("inbox", mutation);
+        let mut mutate = ReplicaMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
 
-        let ops = match mutate.resume(Some(OfflineArg::Load(loaded("1")))) {
-            OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(ops)) => ops,
+        let ops = match mutate.resume(Some(ReplicaArg::Load(loaded("1")))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
             state => panic!("expected WantsWrite, got {state:?}"),
         };
-        let OfflineWriteOp::UpsertPlacement(p) = &ops[0] else {
+        let ReplicaWriteOp::UpsertPlacement(p) = &ops[0] else {
             panic!("expected UpsertPlacement, got {:?}", ops[0]);
         };
         assert_eq!(p.collection.as_str(), "archive");
         assert_eq!(p.handle.as_str(), "tmp-1");
-        assert_eq!(p.status, OfflineStatus::Created);
+        assert_eq!(p.status, ReplicaStatus::Created);
         assert!(p.base.is_none());
         let origin = p.origin.as_ref().expect("the copy carries its origin");
         assert_eq!(origin.collection.as_str(), "inbox");
@@ -588,18 +588,18 @@ mod tests {
     fn move_tombstones_source_with_target() {
         // A move tombstones the source and records its destination in origin,
         // so the sync pushes a UID MOVE rather than a trash delete.
-        let mutation = OfflineMutation::Move {
-            handle: OfflineHandle::from("1"),
+        let mutation = ReplicaMutation::Move {
+            handle: ReplicaHandle::from("1"),
             target: "archive".into(),
         };
-        let mut mutate = OfflineMutate::new("inbox", mutation);
+        let mut mutate = ReplicaMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
 
-        let ops = match mutate.resume(Some(OfflineArg::Load(loaded("1")))) {
-            OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(ops)) => ops,
+        let ops = match mutate.resume(Some(ReplicaArg::Load(loaded("1")))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
             state => panic!("expected WantsWrite, got {state:?}"),
         };
-        let OfflineWriteOp::UpsertPlacement(p) = &ops[0] else {
+        let ReplicaWriteOp::UpsertPlacement(p) = &ops[0] else {
             panic!("expected UpsertPlacement, got {:?}", ops[0]);
         };
         assert_eq!(
@@ -607,7 +607,7 @@ mod tests {
             "inbox",
             "the source row, not a target one"
         );
-        assert_eq!(p.status, OfflineStatus::Tombstone);
+        assert_eq!(p.status, ReplicaStatus::Tombstone);
         assert_eq!(
             p.origin
                 .as_ref()

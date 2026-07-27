@@ -19,29 +19,29 @@ use std::{
     rc::Rc,
 };
 
-use io_offline::{
-    change::{OfflineChange, OfflineWriteOp},
-    client::{OfflineClient, OfflineRemote, OfflineStorage},
-    collection::{OfflineCheckpoint, OfflineCollectionId},
-    coroutine::{OfflineArg, OfflineCoroutine, OfflineCoroutineState},
-    mutate::{OfflineMutate, OfflineMutation},
-    object::{OfflineHash, OfflineObject},
-    open::OfflineOpen,
-    placement::{OfflineFlags, OfflineHandle, OfflineLinkId, OfflinePlacement, OfflineStatus},
-    remote::{OfflineFetchedItem, OfflinePushResult, OfflineRemoteSnapshot, OfflineTier},
-    storage::OfflineLoaded,
-    sync::{OfflineSync, OfflineSyncOptions, OfflineSyncReport},
-    upgrade::OfflineUpgrade,
+use io_replica::{
+    change::{ReplicaChange, ReplicaWriteOp},
+    client::{ReplicaClient, ReplicaRemote, ReplicaStorage},
+    collection::{ReplicaCheckpoint, ReplicaCollectionId},
+    coroutine::{ReplicaArg, ReplicaCoroutine, ReplicaCoroutineState},
+    mutate::{ReplicaMutate, ReplicaMutation},
+    object::{ReplicaHash, ReplicaObject},
+    open::ReplicaOpen,
+    placement::{ReplicaFlags, ReplicaHandle, ReplicaLinkId, ReplicaPlacement, ReplicaStatus},
+    remote::{ReplicaFetchedItem, ReplicaPushResult, ReplicaRemoteSnapshot, ReplicaTier},
+    storage::ReplicaLoaded,
+    sync::{ReplicaSync, ReplicaSyncOptions, ReplicaSyncReport},
+    upgrade::ReplicaUpgrade,
 };
 use proptest::{prelude::*, test_runner::TestCaseError};
 
 use crate::common::{MemRemote, MemStorage, hash};
 
-// ---- OfflineFlags::merge: element-wise merge loses no intent ------------------
+// ---- ReplicaFlags::merge: element-wise merge loses no intent ------------------
 
 /// A small flag universe keeps the sets overlapping, which is where the
 /// merge actually has work to do.
-fn arb_flags() -> impl Strategy<Value = OfflineFlags> {
+fn arb_flags() -> impl Strategy<Value = ReplicaFlags> {
     proptest::collection::btree_set(
         prop_oneof![
             Just("seen"),
@@ -51,7 +51,7 @@ fn arb_flags() -> impl Strategy<Value = OfflineFlags> {
         ],
         0..4,
     )
-    .prop_map(OfflineFlags::from_iter)
+    .prop_map(ReplicaFlags::from_iter)
 }
 
 proptest! {
@@ -64,7 +64,7 @@ proptest! {
         local in arb_flags(),
         remote in arb_flags(),
     ) {
-        let merged = OfflineFlags::merge(&base, &local, &remote);
+        let merged = ReplicaFlags::merge(&base, &local, &remote);
 
         // NOTE: a removal always wins: the other side cannot concurrently
         // re-add a flag it already held in the shared base.
@@ -85,11 +85,11 @@ proptest! {
         local in arb_flags(),
         remote in arb_flags(),
     ) {
-        let ab = OfflineFlags::merge(&base, &local, &remote);
-        let ba = OfflineFlags::merge(&base, &remote, &local);
+        let ab = ReplicaFlags::merge(&base, &local, &remote);
+        let ba = ReplicaFlags::merge(&base, &remote, &local);
         prop_assert_eq!(&ab, &ba);
 
-        let stable = OfflineFlags::merge(&base, &base, &base);
+        let stable = ReplicaFlags::merge(&base, &base, &base);
         prop_assert_eq!(&stable, &base);
     }
 }
@@ -98,15 +98,15 @@ proptest! {
 
 /// Any coroutine arg, mostly empty payloads: the point is protocol
 /// misuse (wrong variant, missing arg), not payload realism.
-fn arb_arg() -> impl Strategy<Value = Option<OfflineArg>> {
+fn arb_arg() -> impl Strategy<Value = Option<ReplicaArg>> {
     prop_oneof![
         Just(None),
-        Just(Some(OfflineArg::Write)),
-        Just(Some(OfflineArg::Push(vec![]))),
-        Just(Some(OfflineArg::Fetch(vec![]))),
-        Just(Some(OfflineArg::LookupObject(Default::default()))),
-        Just(Some(OfflineArg::Load(OfflineLoaded::default()))),
-        Just(Some(OfflineArg::Enumerate(OfflineRemoteSnapshot {
+        Just(Some(ReplicaArg::Write)),
+        Just(Some(ReplicaArg::Push(vec![]))),
+        Just(Some(ReplicaArg::Fetch(vec![]))),
+        Just(Some(ReplicaArg::LookupObject(Default::default()))),
+        Just(Some(ReplicaArg::Load(ReplicaLoaded::default()))),
+        Just(Some(ReplicaArg::Enumerate(ReplicaRemoteSnapshot {
             items: vec![],
             vanished: vec![],
             complete: true,
@@ -117,9 +117,9 @@ fn arb_arg() -> impl Strategy<Value = Option<OfflineArg>> {
 
 /// Feeds the sequence until the coroutine completes; the property is that
 /// it always returns (never panics, never runs past its state machine).
-fn feed<C: OfflineCoroutine>(mut coroutine: C, args: Vec<Option<OfflineArg>>) {
+fn feed<C: ReplicaCoroutine>(mut coroutine: C, args: Vec<Option<ReplicaArg>>) {
     for arg in args {
-        if let OfflineCoroutineState::Complete(_) = coroutine.resume(arg) {
+        if let ReplicaCoroutineState::Complete(_) = coroutine.resume(arg) {
             return;
         }
     }
@@ -128,32 +128,32 @@ fn feed<C: OfflineCoroutine>(mut coroutine: C, args: Vec<Option<OfflineArg>>) {
 proptest! {
     #[test]
     fn coroutines_survive_any_arg_sequence(args in proptest::collection::vec(arb_arg(), 1..8)) {
-        feed(OfflineOpen::new("inbox"), args.clone());
+        feed(ReplicaOpen::new("inbox"), args.clone());
         feed(
-            OfflineMutate::new("inbox", OfflineMutation::Remove(OfflineHandle::from("1"))),
+            ReplicaMutate::new("inbox", ReplicaMutation::Remove(ReplicaHandle::from("1"))),
             args.clone(),
         );
         feed(
-            OfflineUpgrade::new("inbox", vec![OfflineHandle::from("1")], OfflineTier::Full),
+            ReplicaUpgrade::new("inbox", vec![ReplicaHandle::from("1")], ReplicaTier::Full),
             args.clone(),
         );
-        feed(OfflineSync::new("inbox", OfflineSyncOptions::default()), args);
+        feed(ReplicaSync::new("inbox", ReplicaSyncOptions::default()), args);
     }
 }
 
 // ---- model: random op interleavings converge without loss --------------
 
-/// One step of the random scenario. OfflineHandle picks are indices resolved
+/// One step of the random scenario. ReplicaHandle picks are indices resolved
 /// modulo the live set at execution time, so every generated op is valid
 /// by construction and shrinking stays meaningful.
 #[derive(Clone, Debug)]
 enum Op {
     /// Replace the flags of the i-th local placement.
-    LocalSetFlags(usize, OfflineFlags),
+    LocalSetFlags(usize, ReplicaFlags),
     /// Delete the i-th local placement offline.
     LocalRemove(usize),
     /// Replace the flags of the i-th server item.
-    ServerSetFlags(usize, OfflineFlags),
+    ServerSetFlags(usize, ReplicaFlags),
     /// Delete the i-th server item.
     ServerRemove(usize),
     /// A new message arrives server-side.
@@ -173,7 +173,7 @@ fn arb_op() -> impl Strategy<Value = Op> {
     ]
 }
 
-fn nth(handles: &BTreeSet<OfflineHandle>, i: usize) -> Option<OfflineHandle> {
+fn nth(handles: &BTreeSet<ReplicaHandle>, i: usize) -> Option<ReplicaHandle> {
     if handles.is_empty() {
         return None;
     }
@@ -188,47 +188,47 @@ proptest! {
     /// immutable, so no conflict can remain to excuse a divergence.
     #[test]
     fn random_interleavings_converge(ops in proptest::collection::vec(arb_op(), 0..25)) {
-        let mut client = OfflineClient::new(MemStorage::default(), MemRemote::default());
+        let mut client = ReplicaClient::new(MemStorage::default(), MemRemote::default());
         client.remote_mut().seed("inbox", "m1", "l1", &[], b"one");
         client.remote_mut().seed("inbox", "m2", "l2", &["seen"], b"two");
-        let opts = OfflineSyncOptions::default();
+        let opts = ReplicaSyncOptions::default();
         client.sync("inbox", opts).unwrap();
 
         for op in ops {
             match op {
                 Op::LocalSetFlags(i, flags) => {
-                    let local: BTreeSet<OfflineHandle> = client
+                    let local: BTreeSet<ReplicaHandle> = client
                         .open("inbox").unwrap().placements
                         .into_iter()
-                        .filter(|p| p.status != OfflineStatus::Tombstone)
+                        .filter(|p| p.status != ReplicaStatus::Tombstone)
                         .map(|p| p.handle)
                         .collect();
                     if let Some(handle) = nth(&local, i) {
                         client
-                            .mutate("inbox", OfflineMutation::SetFlags { handle, flags })
+                            .mutate("inbox", ReplicaMutation::SetFlags { handle, flags })
                             .unwrap();
                     }
                 }
                 Op::LocalRemove(i) => {
-                    let local: BTreeSet<OfflineHandle> = client
+                    let local: BTreeSet<ReplicaHandle> = client
                         .open("inbox").unwrap().placements
                         .into_iter()
-                        .filter(|p| p.status != OfflineStatus::Tombstone)
+                        .filter(|p| p.status != ReplicaStatus::Tombstone)
                         .map(|p| p.handle)
                         .collect();
                     if let Some(handle) = nth(&local, i) {
-                        client.mutate("inbox", OfflineMutation::Remove(handle)).unwrap();
+                        client.mutate("inbox", ReplicaMutation::Remove(handle)).unwrap();
                     }
                 }
                 Op::ServerSetFlags(i, flags) => {
-                    let handles: BTreeSet<OfflineHandle> = server_handles(&client);
+                    let handles: BTreeSet<ReplicaHandle> = server_handles(&client);
                     if let Some(handle) = nth(&handles, i) {
                         let flags: Vec<&str> = flags.0.iter().map(|f| f.as_str()).collect();
                         client.remote_mut().set_flags("inbox", handle.as_str(), &flags);
                     }
                 }
                 Op::ServerRemove(i) => {
-                    let handles: BTreeSet<OfflineHandle> = server_handles(&client);
+                    let handles: BTreeSet<ReplicaHandle> = server_handles(&client);
                     if let Some(handle) = nth(&handles, i) {
                         client.remote_mut().remove("inbox", handle.as_str());
                     }
@@ -249,14 +249,14 @@ proptest! {
         client.sync("inbox", opts).unwrap();
 
         let placements = client.open("inbox").unwrap().placements;
-        let local: BTreeSet<OfflineHandle> = placements.iter().map(|p| p.handle.clone()).collect();
+        let local: BTreeSet<ReplicaHandle> = placements.iter().map(|p| p.handle.clone()).collect();
         let server = server_handles(&client);
         prop_assert_eq!(&local, &server, "replica mirrors the server members");
 
         for placement in &placements {
             prop_assert_eq!(
                 placement.status,
-                OfflineStatus::Clean,
+                ReplicaStatus::Clean,
                 "nothing left dirty after quiescence: {:?}",
                 placement,
             );
@@ -268,11 +268,11 @@ proptest! {
 
         // idempotence: a quiescent sync changes nothing
         let report = client.sync("inbox", opts).unwrap();
-        prop_assert_eq!(report, OfflineSyncReport::default());
+        prop_assert_eq!(report, ReplicaSyncReport::default());
     }
 }
 
-fn server_handles(client: &OfflineClient<MemStorage, MemRemote>) -> BTreeSet<OfflineHandle> {
+fn server_handles(client: &ReplicaClient<MemStorage, MemRemote>) -> BTreeSet<ReplicaHandle> {
     client
         .remote()
         .items
@@ -292,21 +292,21 @@ struct CrashyStorage {
     remaining: Option<usize>,
 }
 
-impl OfflineStorage for CrashyStorage {
+impl ReplicaStorage for CrashyStorage {
     type Error = &'static str;
 
-    fn load(&self, collection: &OfflineCollectionId) -> Result<OfflineLoaded, Self::Error> {
+    fn load(&self, collection: &ReplicaCollectionId) -> Result<ReplicaLoaded, Self::Error> {
         Ok(self.inner.load(collection).unwrap())
     }
 
     fn lookup_objects(
         &self,
-        links: &[OfflineLinkId],
-    ) -> Result<BTreeMap<OfflineLinkId, OfflineHash>, Self::Error> {
+        links: &[ReplicaLinkId],
+    ) -> Result<BTreeMap<ReplicaLinkId, ReplicaHash>, Self::Error> {
         Ok(self.inner.lookup_objects(links).unwrap())
     }
 
-    fn write(&mut self, ops: Vec<OfflineWriteOp>) -> Result<(), Self::Error> {
+    fn write(&mut self, ops: Vec<ReplicaWriteOp>) -> Result<(), Self::Error> {
         match &mut self.remaining {
             Some(0) => {
                 self.remaining = None;
@@ -331,7 +331,7 @@ impl OfflineStorage for CrashyStorage {
 /// changes exclusively through engine pushes.
 #[derive(Clone, Debug)]
 enum MutOp {
-    LocalSetFlags(usize, OfflineFlags),
+    LocalSetFlags(usize, ReplicaFlags),
     LocalRemove(usize),
     /// Stage a local content edit on the i-th placement (a fresh body
     /// derived from the byte).
@@ -340,7 +340,7 @@ enum MutOp {
     LocalCopy(usize),
     /// Move the i-th live inbox placement into the archive.
     LocalMove(usize),
-    ServerSetFlags(usize, OfflineFlags),
+    ServerSetFlags(usize, ReplicaFlags),
     ServerRemove(usize),
     /// A server-side content edit: the revision advances.
     ServerEdit(usize, u8),
@@ -382,34 +382,34 @@ fn arb_mut_op() -> impl Strategy<Value = MutOp> {
 #[derive(Default)]
 struct Ledger {
     /// Last staged edit per inbox handle: the body's hash.
-    edits: BTreeMap<OfflineHandle, OfflineHash>,
+    edits: BTreeMap<ReplicaHandle, ReplicaHash>,
     /// Last staged flag change per inbox handle, as the per-element delta
     /// against the base the replica held: (added, removed). Only changed
     /// elements carry an obligation; setting a flag the base already has
     /// claims nothing (the element-wise merge owes nothing for it).
-    flags: BTreeMap<OfflineHandle, (BTreeSet<String>, BTreeSet<String>)>,
+    flags: BTreeMap<ReplicaHandle, (BTreeSet<String>, BTreeSet<String>)>,
     /// Staged copies: the placeholder and the source's server link.
-    copies: Vec<(OfflineHandle, Option<OfflineLinkId>)>,
+    copies: Vec<(ReplicaHandle, Option<ReplicaLinkId>)>,
     /// Staged moves: the source handle, its server link, and whether a
     /// later server action on the source voided the move.
-    moves: Vec<(OfflineHandle, Option<OfflineLinkId>, bool)>,
+    moves: Vec<(ReplicaHandle, Option<ReplicaLinkId>, bool)>,
 }
 
-type ModelClient = OfflineClient<CrashyStorage, MemRemote>;
+type ModelClient = ReplicaClient<CrashyStorage, MemRemote>;
 
 /// The live (non-tombstoned) inbox placements.
-fn live(client: &ModelClient) -> BTreeSet<OfflineHandle> {
+fn live(client: &ModelClient) -> BTreeSet<ReplicaHandle> {
     client
         .storage()
         .inner
         .placements
         .iter()
-        .filter(|((c, _), p)| c.as_str() == "inbox" && p.status != OfflineStatus::Tombstone)
+        .filter(|((c, _), p)| c.as_str() == "inbox" && p.status != ReplicaStatus::Tombstone)
         .map(|((_, h), _)| h.clone())
         .collect()
 }
 
-fn on_server(client: &ModelClient, collection: &str) -> BTreeSet<OfflineHandle> {
+fn on_server(client: &ModelClient, collection: &str) -> BTreeSet<ReplicaHandle> {
     client
         .remote()
         .items
@@ -418,7 +418,7 @@ fn on_server(client: &ModelClient, collection: &str) -> BTreeSet<OfflineHandle> 
         .unwrap_or_default()
 }
 
-fn server_link(client: &ModelClient, handle: &OfflineHandle) -> Option<OfflineLinkId> {
+fn server_link(client: &ModelClient, handle: &ReplicaHandle) -> Option<ReplicaLinkId> {
     client
         .remote()
         .items
@@ -428,7 +428,7 @@ fn server_link(client: &ModelClient, handle: &OfflineHandle) -> Option<OfflineLi
 }
 
 /// The current server-side body of an inbox member.
-fn server_body(client: &ModelClient, handle: &OfflineHandle) -> Vec<u8> {
+fn server_body(client: &ModelClient, handle: &ReplicaHandle) -> Vec<u8> {
     client
         .remote()
         .items
@@ -439,7 +439,7 @@ fn server_body(client: &ModelClient, handle: &OfflineHandle) -> Vec<u8> {
 }
 
 /// The object hash an inbox placement currently points at.
-fn held_object(client: &ModelClient, handle: &OfflineHandle) -> Option<OfflineHash> {
+fn held_object(client: &ModelClient, handle: &ReplicaHandle) -> Option<ReplicaHash> {
     client
         .storage()
         .inner
@@ -464,15 +464,15 @@ fn void_superseded_edits(ledger: &mut Ledger, client: &ModelClient, destroyed: &
         let pending = placements.iter().any(|((c, _), p)| {
             c.as_str() == "inbox"
                 && p.object.as_ref() == Some(staged)
-                && (p.status == OfflineStatus::Created
-                    || (matches!(p.status, OfflineStatus::Dirty | OfflineStatus::Conflict)
+                && (p.status == ReplicaStatus::Created
+                    || (matches!(p.status, ReplicaStatus::Dirty | ReplicaStatus::Conflict)
                         && p.base.as_ref().is_none_or(|b| b.object != p.object)))
         });
         !landed_here || pending
     });
 }
 
-fn collection_has_link(client: &ModelClient, collection: &str, link: &OfflineLinkId) -> bool {
+fn collection_has_link(client: &ModelClient, collection: &str, link: &ReplicaLinkId) -> bool {
     client
         .remote()
         .items
@@ -496,8 +496,8 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
     remote.seed("inbox", "m1", "l1", &[], b"one");
     remote.seed("inbox", "m2", "l2", &["seen"], b"two");
 
-    let mut client = OfflineClient::new(storage, remote);
-    let opts = OfflineSyncOptions::default();
+    let mut client = ReplicaClient::new(storage, remote);
+    let opts = ReplicaSyncOptions::default();
     let _ = client.sync("inbox", opts);
 
     let mut ledger = Ledger::default();
@@ -521,7 +521,7 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
                     let removed = base.0.difference(&flags.0).cloned().collect();
                     let staged = client.mutate(
                         "inbox",
-                        OfflineMutation::SetFlags {
+                        ReplicaMutation::SetFlags {
                             handle: handle.clone(),
                             flags,
                         },
@@ -536,7 +536,7 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
                     let held = held_object(&client, &handle);
                     let server_body = server_body(&client, &handle);
                     if client
-                        .mutate("inbox", OfflineMutation::Remove(handle.clone()))
+                        .mutate("inbox", ReplicaMutation::Remove(handle.clone()))
                         .is_ok()
                     {
                         // the user's own delete supersedes their edits:
@@ -558,13 +558,13 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
                     let held = held_object(&client, &handle);
                     let server_body = server_body(&client, &handle);
                     let body = format!("edit-{n}-{}", handle.as_str()).into_bytes();
-                    let object = OfflineObject {
+                    let object = ReplicaObject {
                         hash: hash(&body),
                         size: body.len(),
                     };
                     let staged = client.mutate(
                         "inbox",
-                        OfflineMutation::Edit {
+                        ReplicaMutation::Edit {
                             handle: handle.clone(),
                             object,
                             body: body.clone(),
@@ -587,11 +587,11 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
             MutOp::LocalCopy(i) => {
                 if let Some(handle) = nth(&live(&client), i) {
                     placeholders += 1;
-                    let placeholder = OfflineHandle::from(format!("tmp-{placeholders}"));
+                    let placeholder = ReplicaHandle::from(format!("tmp-{placeholders}"));
                     let link = server_link(&client, &handle);
                     let staged = client.mutate(
                         "inbox",
-                        OfflineMutation::Copy {
+                        ReplicaMutation::Copy {
                             handle,
                             target: "archive".into(),
                             placeholder: placeholder.clone(),
@@ -626,7 +626,7 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
                     let held = held_object(&client, &handle);
                     let staged = client.mutate(
                         "inbox",
-                        OfflineMutation::Move {
+                        ReplicaMutation::Move {
                             handle: handle.clone(),
                             target: "archive".into(),
                         },
@@ -706,7 +706,7 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
             }
             MutOp::Upgrade(i) => {
                 if let Some(handle) = nth(&live(&client), i) {
-                    let _ = client.upgrade("inbox", vec![handle], OfflineTier::Full);
+                    let _ = client.upgrade("inbox", vec![handle], ReplicaTier::Full);
                 }
             }
             MutOp::Bump => {
@@ -716,7 +716,7 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
                 // tombstones on link-less placements are dropped by
                 // design, so their ledger claims void with them (staged
                 // edits always survive, through carry or resurrect)
-                let linked: BTreeSet<OfflineHandle> = client
+                let linked: BTreeSet<ReplicaHandle> = client
                     .storage()
                     .inner
                     .placements
@@ -775,12 +775,12 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
     // crashed), the way a consumer would: merge with an edit. Resolutions
     // are local edits, so they register in the ledger like any other.
     for round in 0..3 {
-        let conflicted: Vec<OfflineHandle> = client
+        let conflicted: Vec<ReplicaHandle> = client
             .storage()
             .inner
             .placements
             .values()
-            .filter(|p| p.status == OfflineStatus::Conflict)
+            .filter(|p| p.status == ReplicaStatus::Conflict)
             .map(|p| p.handle.clone())
             .collect();
         if conflicted.is_empty() {
@@ -791,7 +791,7 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
             let held = held_object(&client, &handle);
             let server_body = server_body(&client, &handle);
             let body = format!("resolved-{}", handle.as_str()).into_bytes();
-            let object = OfflineObject {
+            let object = ReplicaObject {
                 hash: hash(&body),
                 size: body.len(),
             };
@@ -805,7 +805,7 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
             client
                 .mutate(
                     "inbox",
-                    OfflineMutation::Edit {
+                    ReplicaMutation::Edit {
                         handle,
                         object,
                         body,
@@ -827,8 +827,8 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
     // a copy whose source vanished can never land: its placeholder stays
     // visibly pending (Created), which is the accounted end state
     let inbox_server = on_server(&client, "inbox");
-    let lingering = |p: &OfflinePlacement| {
-        p.status == OfflineStatus::Created
+    let lingering = |p: &ReplicaPlacement| {
+        p.status == ReplicaStatus::Created
             && p.origin
                 .as_ref()
                 .is_some_and(|o| !inbox_server.contains(&o.handle))
@@ -837,7 +837,7 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
     // convergence: each collection mirrors its server side exactly, dead
     // placeholders aside
     for collection in ["inbox", "archive"] {
-        let placements: Vec<OfflinePlacement> = client
+        let placements: Vec<ReplicaPlacement> = client
             .storage()
             .inner
             .placements
@@ -846,7 +846,7 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
             .map(|(_, p)| p.clone())
             .collect();
 
-        let local: BTreeSet<OfflineHandle> = placements
+        let local: BTreeSet<ReplicaHandle> = placements
             .iter()
             .filter(|p| !lingering(p))
             .map(|p| p.handle.clone())
@@ -861,7 +861,7 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
         for placement in placements.iter().filter(|p| !lingering(p)) {
             prop_assert_eq!(
                 placement.status,
-                OfflineStatus::Clean,
+                ReplicaStatus::Clean,
                 "nothing pending after resolution: {:?}",
                 placement,
             );
@@ -923,7 +923,7 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
             .inner
             .placements
             .get(&("archive".into(), placeholder.clone()))
-            .is_some_and(|p| p.status == OfflineStatus::Created);
+            .is_some_and(|p| p.status == ReplicaStatus::Created);
         prop_assert!(
             collection_has_link(&client, "archive", link) || pending,
             "copy intent {placeholder:?} lost",
@@ -951,7 +951,7 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
     // idempotence: a quiescent sync changes nothing, except the retried
     // adds of dead placeholders, which the remote keeps rejecting
     let report = client.sync("inbox", opts).unwrap();
-    prop_assert_eq!(report, OfflineSyncReport::default());
+    prop_assert_eq!(report, ReplicaSyncReport::default());
     let dead_placeholders = client
         .storage()
         .inner
@@ -960,7 +960,7 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
         .filter(|((c, _), p)| c.as_str() == "archive" && lingering(p))
         .count();
     let report = client.sync("archive", opts).unwrap();
-    let expected = OfflineSyncReport {
+    let expected = ReplicaSyncReport {
         rejected: dead_placeholders,
         ..Default::default()
     };
@@ -1001,31 +1001,31 @@ proptest! {
 #[derive(Clone)]
 struct SharedRemote(Rc<RefCell<MemRemote>>);
 
-impl OfflineRemote for SharedRemote {
+impl ReplicaRemote for SharedRemote {
     type Error = Infallible;
 
     fn enumerate(
         &mut self,
-        collection: &OfflineCollectionId,
-        cursor: Option<OfflineCheckpoint>,
-    ) -> Result<OfflineRemoteSnapshot, Infallible> {
+        collection: &ReplicaCollectionId,
+        cursor: Option<ReplicaCheckpoint>,
+    ) -> Result<ReplicaRemoteSnapshot, Infallible> {
         self.0.borrow_mut().enumerate(collection, cursor)
     }
 
     fn fetch(
         &mut self,
-        collection: &OfflineCollectionId,
-        handles: Vec<OfflineHandle>,
-        tier: OfflineTier,
-    ) -> Result<Vec<OfflineFetchedItem>, Infallible> {
+        collection: &ReplicaCollectionId,
+        handles: Vec<ReplicaHandle>,
+        tier: ReplicaTier,
+    ) -> Result<Vec<ReplicaFetchedItem>, Infallible> {
         self.0.borrow_mut().fetch(collection, handles, tier)
     }
 
     fn push(
         &mut self,
-        collection: &OfflineCollectionId,
-        changes: Vec<OfflineChange>,
-    ) -> Result<Vec<OfflinePushResult>, Infallible> {
+        collection: &ReplicaCollectionId,
+        changes: Vec<ReplicaChange>,
+    ) -> Result<Vec<ReplicaPushResult>, Infallible> {
         self.0.borrow_mut().push(collection, changes)
     }
 }
@@ -1034,9 +1034,9 @@ impl OfflineRemote for SharedRemote {
 /// syncs full every time; replica B is a passive incremental mirror.
 #[derive(Clone, Debug)]
 enum PairOp {
-    LocalASetFlags(usize, OfflineFlags),
+    LocalASetFlags(usize, ReplicaFlags),
     LocalARemove(usize),
-    ServerSetFlags(usize, OfflineFlags),
+    ServerSetFlags(usize, ReplicaFlags),
     ServerEdit(usize, u8),
     ServerRemove(usize),
     ServerAdd(u8),
@@ -1070,25 +1070,25 @@ proptest! {
         server.seed("inbox", "m2", "l2", &["seen"], b"two");
         let server = Rc::new(RefCell::new(server));
 
-        let full_opts = OfflineSyncOptions {
+        let full_opts = ReplicaSyncOptions {
             full: true,
-            ..OfflineSyncOptions::default()
+            ..ReplicaSyncOptions::default()
         };
-        let delta_opts = OfflineSyncOptions::default();
-        let mut a = OfflineClient::new(MemStorage::default(), SharedRemote(server.clone()));
-        let mut b = OfflineClient::new(MemStorage::default(), SharedRemote(server.clone()));
+        let delta_opts = ReplicaSyncOptions::default();
+        let mut a = ReplicaClient::new(MemStorage::default(), SharedRemote(server.clone()));
+        let mut b = ReplicaClient::new(MemStorage::default(), SharedRemote(server.clone()));
         a.sync("inbox", full_opts).unwrap();
         b.sync("inbox", delta_opts).unwrap();
 
-        let live_a = |a: &OfflineClient<MemStorage, SharedRemote>| -> BTreeSet<OfflineHandle> {
+        let live_a = |a: &ReplicaClient<MemStorage, SharedRemote>| -> BTreeSet<ReplicaHandle> {
             a.storage()
                 .placements
                 .values()
-                .filter(|p| p.status != OfflineStatus::Tombstone)
+                .filter(|p| p.status != ReplicaStatus::Tombstone)
                 .map(|p| p.handle.clone())
                 .collect()
         };
-        let on_server = || -> BTreeSet<OfflineHandle> {
+        let on_server = || -> BTreeSet<ReplicaHandle> {
             server
                 .borrow()
                 .items
@@ -1101,12 +1101,12 @@ proptest! {
             match op {
                 PairOp::LocalASetFlags(i, flags) => {
                     if let Some(handle) = nth(&live_a(&a), i) {
-                        a.mutate("inbox", OfflineMutation::SetFlags { handle, flags }).unwrap();
+                        a.mutate("inbox", ReplicaMutation::SetFlags { handle, flags }).unwrap();
                     }
                 }
                 PairOp::LocalARemove(i) => {
                     if let Some(handle) = nth(&live_a(&a), i) {
-                        a.mutate("inbox", OfflineMutation::Remove(handle)).unwrap();
+                        a.mutate("inbox", ReplicaMutation::Remove(handle)).unwrap();
                     }
                 }
                 PairOp::ServerSetFlags(i, flags) => {
@@ -1146,8 +1146,8 @@ proptest! {
             b.sync("inbox", delta_opts).unwrap();
         }
 
-        let placements_a: Vec<OfflinePlacement> = a.storage().placements.values().cloned().collect();
-        let placements_b: Vec<OfflinePlacement> = b.storage().placements.values().cloned().collect();
+        let placements_a: Vec<ReplicaPlacement> = a.storage().placements.values().cloned().collect();
+        let placements_b: Vec<ReplicaPlacement> = b.storage().placements.values().cloned().collect();
         prop_assert_eq!(
             placements_a,
             placements_b,
@@ -1161,10 +1161,10 @@ proptest! {
 /// One step with two replicas editing the same server concurrently.
 #[derive(Clone, Debug)]
 enum DuoOp {
-    ASetFlags(usize, OfflineFlags),
+    ASetFlags(usize, ReplicaFlags),
     AEdit(usize, u8),
     ARemove(usize),
-    BSetFlags(usize, OfflineFlags),
+    BSetFlags(usize, ReplicaFlags),
     BEdit(usize, u8),
     BRemove(usize),
     ServerAdd(u8),
@@ -1186,14 +1186,14 @@ fn arb_duo_op() -> impl Strategy<Value = DuoOp> {
     ]
 }
 
-type DuoClient = OfflineClient<MemStorage, SharedRemote>;
+type DuoClient = ReplicaClient<MemStorage, SharedRemote>;
 
-fn duo_live(client: &DuoClient) -> BTreeSet<OfflineHandle> {
+fn duo_live(client: &DuoClient) -> BTreeSet<ReplicaHandle> {
     client
         .storage()
         .placements
         .values()
-        .filter(|p| p.status != OfflineStatus::Tombstone)
+        .filter(|p| p.status != ReplicaStatus::Tombstone)
         .map(|p| p.handle.clone())
         .collect()
 }
@@ -1201,7 +1201,7 @@ fn duo_live(client: &DuoClient) -> BTreeSet<OfflineHandle> {
 fn duo_mutate(
     client: &mut DuoClient,
     index: usize,
-    mutation: impl Fn(OfflineHandle) -> OfflineMutation,
+    mutation: impl Fn(ReplicaHandle) -> ReplicaMutation,
 ) {
     if let Some(handle) = nth(&duo_live(client), index) {
         client.mutate("inbox", mutation(handle)).unwrap();
@@ -1211,14 +1211,14 @@ fn duo_mutate(
 fn duo_edit(client: &mut DuoClient, index: usize, tag: &str, n: u8) {
     if let Some(handle) = nth(&duo_live(client), index) {
         let body = format!("edit-{tag}-{n}-{}", handle.as_str()).into_bytes();
-        let object = OfflineObject {
+        let object = ReplicaObject {
             hash: hash(&body),
             size: body.len(),
         };
         client
             .mutate(
                 "inbox",
-                OfflineMutation::Edit {
+                ReplicaMutation::Edit {
                     handle,
                     object,
                     body,
@@ -1231,11 +1231,11 @@ fn duo_edit(client: &mut DuoClient, index: usize, tag: &str, n: u8) {
 
 /// Resolves every content conflict on one replica with an edit.
 fn duo_resolve(client: &mut DuoClient, tag: &str) -> bool {
-    let conflicted: Vec<OfflineHandle> = client
+    let conflicted: Vec<ReplicaHandle> = client
         .storage()
         .placements
         .values()
-        .filter(|p| p.status == OfflineStatus::Conflict)
+        .filter(|p| p.status == ReplicaStatus::Conflict)
         .map(|p| p.handle.clone())
         .collect();
     if conflicted.is_empty() {
@@ -1243,14 +1243,14 @@ fn duo_resolve(client: &mut DuoClient, tag: &str) -> bool {
     }
     for handle in conflicted {
         let body = format!("resolved-{tag}-{}", handle.as_str()).into_bytes();
-        let object = OfflineObject {
+        let object = ReplicaObject {
             hash: hash(&body),
             size: body.len(),
         };
         client
             .mutate(
                 "inbox",
-                OfflineMutation::Edit {
+                ReplicaMutation::Edit {
                     handle,
                     object,
                     body,
@@ -1276,9 +1276,9 @@ proptest! {
         server.seed("inbox", "m2", "l2", &["seen"], b"two");
         let server = Rc::new(RefCell::new(server));
 
-        let opts = OfflineSyncOptions::default();
-        let mut a = OfflineClient::new(MemStorage::default(), SharedRemote(server.clone()));
-        let mut b = OfflineClient::new(MemStorage::default(), SharedRemote(server.clone()));
+        let opts = ReplicaSyncOptions::default();
+        let mut a = ReplicaClient::new(MemStorage::default(), SharedRemote(server.clone()));
+        let mut b = ReplicaClient::new(MemStorage::default(), SharedRemote(server.clone()));
         a.sync("inbox", opts).unwrap();
         b.sync("inbox", opts).unwrap();
 
@@ -1286,21 +1286,21 @@ proptest! {
         for op in ops {
             match op {
                 DuoOp::ASetFlags(i, flags) => {
-                    duo_mutate(&mut a, i, |handle| OfflineMutation::SetFlags {
+                    duo_mutate(&mut a, i, |handle| ReplicaMutation::SetFlags {
                         handle,
                         flags: flags.clone(),
                     });
                 }
                 DuoOp::AEdit(i, n) => duo_edit(&mut a, i, "a", n),
-                DuoOp::ARemove(i) => duo_mutate(&mut a, i, OfflineMutation::Remove),
+                DuoOp::ARemove(i) => duo_mutate(&mut a, i, ReplicaMutation::Remove),
                 DuoOp::BSetFlags(i, flags) => {
-                    duo_mutate(&mut b, i, |handle| OfflineMutation::SetFlags {
+                    duo_mutate(&mut b, i, |handle| ReplicaMutation::SetFlags {
                         handle,
                         flags: flags.clone(),
                     });
                 }
                 DuoOp::BEdit(i, n) => duo_edit(&mut b, i, "b", n),
-                DuoOp::BRemove(i) => duo_mutate(&mut b, i, OfflineMutation::Remove),
+                DuoOp::BRemove(i) => duo_mutate(&mut b, i, ReplicaMutation::Remove),
                 DuoOp::ServerAdd(n) => {
                     arrivals += 1;
                     let handle = format!("srv-{arrivals}");
@@ -1348,7 +1348,7 @@ proptest! {
         }
 
         // convergence: both replicas mirror the same server state
-        let on_server: BTreeSet<OfflineHandle> = server
+        let on_server: BTreeSet<ReplicaHandle> = server
             .borrow()
             .items
             .get(&"inbox".into())
@@ -1356,7 +1356,7 @@ proptest! {
             .unwrap_or_default();
 
         for (name, replica) in [("a", &a), ("b", &b)] {
-            let handles: BTreeSet<OfflineHandle> = replica
+            let handles: BTreeSet<ReplicaHandle> = replica
                 .storage()
                 .placements
                 .values()
@@ -1367,7 +1367,7 @@ proptest! {
             for placement in replica.storage().placements.values() {
                 prop_assert_eq!(
                     placement.status,
-                    OfflineStatus::Clean,
+                    ReplicaStatus::Clean,
                     "nothing pending on replica {}: {:?}",
                     name,
                     placement,
@@ -1390,8 +1390,8 @@ proptest! {
 
         // idempotence on both sides
         let report = a.sync("inbox", opts).unwrap();
-        prop_assert_eq!(report, OfflineSyncReport::default());
+        prop_assert_eq!(report, ReplicaSyncReport::default());
         let report = b.sync("inbox", opts).unwrap();
-        prop_assert_eq!(report, OfflineSyncReport::default());
+        prop_assert_eq!(report, ReplicaSyncReport::default());
     }
 }

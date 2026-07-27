@@ -1,4 +1,4 @@
-# I/O offline [![Documentation](https://img.shields.io/docsrs/io-offline?style=flat&logo=docs.rs&logoColor=white)](https://docs.rs/io-offline/latest/io_offline) [![Matrix](https://img.shields.io/badge/chat-%23pimalaya-blue?style=flat&logo=matrix&logoColor=white)](https://matrix.to/#/#pimalaya:matrix.org) [![Mastodon](https://img.shields.io/badge/news-%40pimalaya-blue?style=flat&logo=mastodon&logoColor=white)](https://fosstodon.org/@pimalaya)
+# I/O offline [![Documentation](https://img.shields.io/docsrs/io-replica?style=flat&logo=docs.rs&logoColor=white)](https://docs.rs/io-replica/latest/io_replica) [![Matrix](https://img.shields.io/badge/chat-%23pimalaya-blue?style=flat&logo=matrix&logoColor=white)](https://matrix.to/#/#pimalaya:matrix.org) [![Mastodon](https://img.shields.io/badge/news-%40pimalaya-blue?style=flat&logo=mastodon&logoColor=white)](https://fosstodon.org/@pimalaya)
 
 Offline-first replica engine library for Rust
 
@@ -29,11 +29,11 @@ This library is composed of 2 feature-gated layers:
 - Standard, blocking driver servicing the storage and remote seams through two traits you implement, enabled by the default `client` feature.
 
 > [!TIP]
-> I/O offline is written in [Rust](https://www.rust-lang.org/) and uses [cargo features](https://doc.rust-lang.org/cargo/reference/features.html) to gate the std client layer. The default feature set is declared in [Cargo.toml](./Cargo.toml) or on [docs.rs](https://docs.rs/crate/io-offline/latest/features).
+> I/O offline is written in [Rust](https://www.rust-lang.org/) and uses [cargo features](https://doc.rust-lang.org/cargo/reference/features.html) to gate the std client layer. The default feature set is declared in [Cargo.toml](./Cargo.toml) or on [docs.rs](https://docs.rs/crate/io-replica/latest/features).
 
 ## Usage
 
-The whole API is documented on [docs.rs](https://docs.rs/io-offline/latest/io_offline), including runnable snippets for every coroutine and for the std client.
+The whole API is documented on [docs.rs](https://docs.rs/io-replica/latest/io_replica), including runnable snippets for every coroutine and for the std client.
 
 ## Examples
 

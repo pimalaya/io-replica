@@ -14,22 +14,22 @@ use alloc::string::String;
 /// Size is a valid cheap pre-check only: identical bytes have identical
 /// size, but equal size does not imply equal bytes.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
-pub struct OfflineHash(pub String);
+pub struct ReplicaHash(pub String);
 
-impl OfflineHash {
+impl ReplicaHash {
     /// Borrows the hash as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-impl From<&str> for OfflineHash {
+impl From<&str> for ReplicaHash {
     fn from(value: &str) -> Self {
         Self(value.into())
     }
 }
 
-impl From<String> for OfflineHash {
+impl From<String> for ReplicaHash {
     fn from(value: String) -> Self {
         Self(value)
     }
@@ -40,9 +40,9 @@ impl From<String> for OfflineHash {
 /// The bytes live out of band at `blobdir/<hash>`; the store keeps a
 /// refcount so copy, move and undelete are reference edits.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OfflineObject {
+pub struct ReplicaObject {
     /// The content hash naming the bytes.
-    pub hash: OfflineHash,
+    pub hash: ReplicaHash,
     /// The byte size of the content.
     pub size: usize,
 }
@@ -51,12 +51,12 @@ pub struct OfflineObject {
 mod tests {
     use alloc::string::String;
 
-    use crate::object::OfflineHash;
+    use crate::object::ReplicaHash;
 
     #[test]
     fn hash_converts_from_owned_and_borrowed_strings() {
-        let owned = OfflineHash::from(String::from("abc"));
-        let borrowed = OfflineHash::from("abc");
+        let owned = ReplicaHash::from(String::from("abc"));
+        let borrowed = ReplicaHash::from("abc");
         assert_eq!(owned, borrowed);
         assert_eq!(owned.as_str(), "abc");
     }

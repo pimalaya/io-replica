@@ -30,19 +30,19 @@ use log::{debug, trace};
 use thiserror::Error;
 
 use crate::{
-    change::OfflineWriteOp,
-    collection::{OfflineCheckpoint, OfflineCollectionId},
+    change::ReplicaWriteOp,
+    collection::{ReplicaCheckpoint, ReplicaCollectionId},
     coroutine::*,
     placement::{
-        OfflineBase, OfflineFlags, OfflineHandle, OfflineLevel, OfflineLinkId, OfflineMeta,
-        OfflinePlacement, OfflineStatus,
+        ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta,
+        ReplicaPlacement, ReplicaStatus,
     },
-    remote::{OfflineRemoteItem, OfflineTier},
+    remote::{ReplicaRemoteItem, ReplicaTier},
 };
 
 /// What a rekey did.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct OfflineRekeyReport {
+pub struct ReplicaRekeyReport {
     /// Old placements carried over to their new handle.
     pub rekeyed: usize,
     /// New members with no old placement to carry, pulled fresh.
@@ -55,7 +55,7 @@ pub struct OfflineRekeyReport {
 
 /// Failure causes during a REKEY flow.
 #[derive(Clone, Debug, Error)]
-pub enum OfflineRekeyError {
+pub enum ReplicaRekeyError {
     /// The driver fed back an arg that does not match the pending yield.
     #[error("Offline REKEY failed: unexpected coroutine arg")]
     UnexpectedArg,
@@ -65,19 +65,19 @@ pub enum OfflineRekeyError {
 }
 
 /// I/O-free REKEY coroutine.
-pub struct OfflineRekey {
-    collection: OfflineCollectionId,
-    old: Vec<OfflinePlacement>,
-    items: Vec<OfflineRemoteItem>,
-    checkpoint: Option<OfflineCheckpoint>,
-    report: OfflineRekeyReport,
+pub struct ReplicaRekey {
+    collection: ReplicaCollectionId,
+    old: Vec<ReplicaPlacement>,
+    items: Vec<ReplicaRemoteItem>,
+    checkpoint: Option<ReplicaCheckpoint>,
+    report: ReplicaRekeyReport,
     state: State,
 }
 
-impl OfflineRekey {
+impl ReplicaRekey {
     /// Creates a coroutine that rebuilds `collection` onto its new
     /// handle space.
-    pub fn new(collection: impl Into<OfflineCollectionId>) -> Self {
+    pub fn new(collection: impl Into<ReplicaCollectionId>) -> Self {
         let collection = collection.into();
         debug!("rekey collection {}", collection.as_str());
 
@@ -86,7 +86,7 @@ impl OfflineRekey {
             old: Vec::new(),
             items: Vec::new(),
             checkpoint: None,
-            report: OfflineRekeyReport::default(),
+            report: ReplicaRekeyReport::default(),
             state: State::Start,
         }
     }
@@ -96,23 +96,23 @@ impl OfflineRekey {
     /// placement resolves to the same logical item.
     fn rebuild(
         &mut self,
-        links: BTreeMap<OfflineHandle, (OfflineLinkId, OfflineMeta)>,
-    ) -> Vec<OfflineWriteOp> {
+        links: BTreeMap<ReplicaHandle, (ReplicaLinkId, ReplicaMeta)>,
+    ) -> Vec<ReplicaWriteOp> {
         let mut writes = Vec::new();
 
         // pending creates are local staging, not spine: left untouched
-        let old: Vec<OfflinePlacement> = core::mem::take(&mut self.old)
+        let old: Vec<ReplicaPlacement> = core::mem::take(&mut self.old)
             .into_iter()
-            .filter(|p| p.status != OfflineStatus::Created)
+            .filter(|p| p.status != ReplicaStatus::Created)
             .collect();
 
-        let mut old_by_link: BTreeMap<OfflineLinkId, OfflinePlacement> = old
+        let mut old_by_link: BTreeMap<ReplicaLinkId, ReplicaPlacement> = old
             .iter()
             .filter_map(|p| Some((p.link_id.clone()?, p.clone())))
             .collect();
 
         for placement in &old {
-            writes.push(OfflineWriteOp::DropPlacement {
+            writes.push(ReplicaWriteOp::DropPlacement {
                 collection: self.collection.clone(),
                 handle: placement.handle.clone(),
             });
@@ -126,13 +126,13 @@ impl OfflineRekey {
             match carried {
                 Some(old) => {
                     carried_over.insert(old.handle.clone());
-                    writes.push(OfflineWriteOp::UpsertPlacement(
+                    writes.push(ReplicaWriteOp::UpsertPlacement(
                         self.carry(old, &item, resolved),
                     ));
                     self.report.rekeyed += 1;
                 }
                 None => {
-                    writes.push(OfflineWriteOp::UpsertPlacement(self.fresh(&item, resolved)));
+                    writes.push(ReplicaWriteOp::UpsertPlacement(self.fresh(&item, resolved)));
                     self.report.pulled += 1;
                 }
             }
@@ -148,7 +148,7 @@ impl OfflineRekey {
             }
             let edited = matches!(
                 placement.status,
-                OfflineStatus::Dirty | OfflineStatus::Conflict
+                ReplicaStatus::Dirty | ReplicaStatus::Conflict
             ) && placement.object.is_some()
                 && placement
                     .base
@@ -156,21 +156,21 @@ impl OfflineRekey {
                     .is_none_or(|b| b.object != placement.object);
             if edited {
                 let mut resurrected = placement.clone();
-                resurrected.status = OfflineStatus::Created;
+                resurrected.status = ReplicaStatus::Created;
                 resurrected.conflict_revision = None;
                 resurrected.base = None;
                 resurrected.origin = None;
-                writes.push(OfflineWriteOp::UpsertPlacement(resurrected));
+                writes.push(ReplicaWriteOp::UpsertPlacement(resurrected));
                 carried_over.insert(placement.handle.clone());
                 self.report.rekeyed += 1;
             }
         }
         self.report.dropped += old
             .iter()
-            .filter(|p| p.status != OfflineStatus::Clean && !carried_over.contains(&p.handle))
+            .filter(|p| p.status != ReplicaStatus::Clean && !carried_over.contains(&p.handle))
             .count();
 
-        writes.push(OfflineWriteOp::SetCheckpoint {
+        writes.push(ReplicaWriteOp::SetCheckpoint {
             collection: self.collection.clone(),
             checkpoint: self.checkpoint.take().expect("an enumerated checkpoint"),
         });
@@ -183,34 +183,34 @@ impl OfflineRekey {
     /// stay pending.
     fn carry(
         &self,
-        old: OfflinePlacement,
-        item: &OfflineRemoteItem,
-        resolved: Option<&(OfflineLinkId, OfflineMeta)>,
-    ) -> OfflinePlacement {
+        old: ReplicaPlacement,
+        item: &ReplicaRemoteItem,
+        resolved: Option<&(ReplicaLinkId, ReplicaMeta)>,
+    ) -> ReplicaPlacement {
         let old_base_flags = old
             .base
             .as_ref()
             .map(|b| b.flags.clone())
             .unwrap_or_default();
-        let flags = OfflineFlags::merge(&old_base_flags, &old.flags, &item.flags);
+        let flags = ReplicaFlags::merge(&old_base_flags, &old.flags, &item.flags);
 
-        let content_edit = old.status == OfflineStatus::Dirty
+        let content_edit = old.status == ReplicaStatus::Dirty
             && old.object.is_some()
             && old.base.as_ref().is_none_or(|b| b.object != old.object);
         let status = match old.status {
-            OfflineStatus::Tombstone => OfflineStatus::Tombstone,
-            OfflineStatus::Conflict => OfflineStatus::Conflict,
-            _ if content_edit => OfflineStatus::Dirty,
-            _ if flags != item.flags => OfflineStatus::Dirty,
-            _ => OfflineStatus::Clean,
+            ReplicaStatus::Tombstone => ReplicaStatus::Tombstone,
+            ReplicaStatus::Conflict => ReplicaStatus::Conflict,
+            _ if content_edit => ReplicaStatus::Dirty,
+            _ if flags != item.flags => ReplicaStatus::Dirty,
+            _ => ReplicaStatus::Clean,
         };
-        let conflict_revision = if status == OfflineStatus::Conflict {
+        let conflict_revision = if status == ReplicaStatus::Conflict {
             item.revision.clone()
         } else {
             None
         };
 
-        OfflinePlacement {
+        ReplicaPlacement {
             collection: self.collection.clone(),
             handle: item.handle.clone(),
             link_id: old.link_id.clone(),
@@ -222,7 +222,7 @@ impl OfflineRekey {
             flags,
             status,
             conflict_revision,
-            base: Some(OfflineBase {
+            base: Some(ReplicaBase {
                 flags: item.flags.clone(),
                 revision: item.revision.clone(),
                 object: old.base.as_ref().and_then(|b| b.object.clone()),
@@ -235,24 +235,24 @@ impl OfflineRekey {
     /// enriched with the link id and summary the meta fetch resolved.
     fn fresh(
         &self,
-        item: &OfflineRemoteItem,
-        resolved: Option<&(OfflineLinkId, OfflineMeta)>,
-    ) -> OfflinePlacement {
-        OfflinePlacement {
+        item: &ReplicaRemoteItem,
+        resolved: Option<&(ReplicaLinkId, ReplicaMeta)>,
+    ) -> ReplicaPlacement {
+        ReplicaPlacement {
             collection: self.collection.clone(),
             handle: item.handle.clone(),
             link_id: resolved.map(|(link, _)| link.clone()),
             object: None,
             level: if resolved.is_some() {
-                OfflineLevel::Meta
+                ReplicaLevel::Meta
             } else {
-                OfflineLevel::Probed
+                ReplicaLevel::Probed
             },
             meta: resolved.map(|(_, meta)| meta.clone()),
             flags: item.flags.clone(),
-            status: OfflineStatus::Clean,
+            status: ReplicaStatus::Clean,
             conflict_revision: None,
-            base: Some(OfflineBase {
+            base: Some(ReplicaBase {
                 flags: item.flags.clone(),
                 revision: item.revision.clone(),
                 object: None,
@@ -262,36 +262,36 @@ impl OfflineRekey {
     }
 }
 
-impl OfflineCoroutine for OfflineRekey {
-    type Yield = OfflineYield;
-    type Return = Result<OfflineRekeyReport, OfflineRekeyError>;
+impl ReplicaCoroutine for ReplicaRekey {
+    type Yield = ReplicaYield;
+    type Return = Result<ReplicaRekeyReport, ReplicaRekeyError>;
 
     fn resume(
         &mut self,
-        arg: Option<OfflineArg>,
-    ) -> OfflineCoroutineState<Self::Yield, Self::Return> {
+        arg: Option<ReplicaArg>,
+    ) -> ReplicaCoroutineState<Self::Yield, Self::Return> {
         trace!("rekey: {}", self.state);
 
         match (&self.state, arg) {
             (State::Start, None) => {
                 debug!("load local state from storage");
                 self.state = State::PendingLoad;
-                OfflineCoroutineState::Yielded(OfflineYield::WantsLoad(self.collection.clone()))
+                ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad(self.collection.clone()))
             }
 
-            (State::PendingLoad, Some(OfflineArg::Load(loaded))) => {
+            (State::PendingLoad, Some(ReplicaArg::Load(loaded))) => {
                 self.old = loaded.placements;
 
                 debug!("enumerate the new handle space in full");
                 trace!("loaded {} old placements", self.old.len());
                 self.state = State::PendingEnumerate;
-                OfflineCoroutineState::Yielded(OfflineYield::WantsEnumerate {
+                ReplicaCoroutineState::Yielded(ReplicaYield::WantsEnumerate {
                     collection: self.collection.clone(),
                     cursor: None,
                 })
             }
 
-            (State::PendingEnumerate, Some(OfflineArg::Enumerate(snapshot))) => {
+            (State::PendingEnumerate, Some(ReplicaArg::Enumerate(snapshot))) => {
                 self.items = snapshot.items;
                 self.checkpoint = Some(snapshot.checkpoint);
 
@@ -301,22 +301,22 @@ impl OfflineCoroutine for OfflineRekey {
                     debug!("no link ids to match, rebuild the spine");
                     self.state = State::PendingWrite;
                     let writes = self.rebuild(BTreeMap::new());
-                    return OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(writes));
+                    return ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(writes));
                 }
 
-                let handles: Vec<OfflineHandle> =
+                let handles: Vec<ReplicaHandle> =
                     self.items.iter().map(|i| i.handle.clone()).collect();
                 debug!("resolve {} new link ids at meta tier", handles.len());
                 self.state = State::PendingFetch;
-                OfflineCoroutineState::Yielded(OfflineYield::WantsFetch {
+                ReplicaCoroutineState::Yielded(ReplicaYield::WantsFetch {
                     collection: self.collection.clone(),
                     handles,
-                    tier: OfflineTier::Meta,
+                    tier: ReplicaTier::Meta,
                 })
             }
 
-            (State::PendingFetch, Some(OfflineArg::Fetch(fetched))) => {
-                let links: BTreeMap<OfflineHandle, (OfflineLinkId, OfflineMeta)> = fetched
+            (State::PendingFetch, Some(ReplicaArg::Fetch(fetched))) => {
+                let links: BTreeMap<ReplicaHandle, (ReplicaLinkId, ReplicaMeta)> = fetched
                     .into_iter()
                     .map(|f| (f.handle, (f.link_id, f.meta)))
                     .collect();
@@ -324,19 +324,19 @@ impl OfflineCoroutine for OfflineRekey {
                 trace!("resolved {} link ids", links.len());
                 self.state = State::PendingWrite;
                 let writes = self.rebuild(links);
-                OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(writes))
+                ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(writes))
             }
 
-            (State::PendingWrite, Some(OfflineArg::Write)) => {
+            (State::PendingWrite, Some(ReplicaArg::Write)) => {
                 debug!(
                     "rekey done: {} carried, {} pulled, {} pending dropped",
                     self.report.rekeyed, self.report.pulled, self.report.dropped,
                 );
-                OfflineCoroutineState::Complete(Ok(self.report))
+                ReplicaCoroutineState::Complete(Ok(self.report))
             }
 
-            (_, Some(_)) => OfflineCoroutineState::Complete(Err(OfflineRekeyError::UnexpectedArg)),
-            (_, None) => OfflineCoroutineState::Complete(Err(OfflineRekeyError::MissingArg)),
+            (_, Some(_)) => ReplicaCoroutineState::Complete(Err(ReplicaRekeyError::UnexpectedArg)),
+            (_, None) => ReplicaCoroutineState::Complete(Err(ReplicaRekeyError::MissingArg)),
         }
     }
 }
@@ -366,27 +366,27 @@ mod tests {
     use alloc::vec;
 
     use crate::{
-        object::OfflineHash,
-        placement::OfflineOrigin,
+        object::ReplicaHash,
+        placement::ReplicaOrigin,
         rekey::*,
-        remote::{OfflineFetchedItem, OfflineRemoteSnapshot},
-        storage::OfflineLoaded,
+        remote::{ReplicaFetchedItem, ReplicaRemoteSnapshot},
+        storage::ReplicaLoaded,
     };
 
     /// An old-spine placement, synced clean at base `flags`.
-    fn synced(handle: &str, link: &str, flags: &[&str]) -> OfflinePlacement {
-        OfflinePlacement {
+    fn synced(handle: &str, link: &str, flags: &[&str]) -> ReplicaPlacement {
+        ReplicaPlacement {
             collection: "inbox".into(),
-            handle: OfflineHandle::from(handle),
-            link_id: Some(OfflineLinkId::from(link)),
+            handle: ReplicaHandle::from(handle),
+            link_id: Some(ReplicaLinkId::from(link)),
             object: None,
-            level: OfflineLevel::Meta,
-            meta: Some(OfflineMeta("row".into())),
-            flags: OfflineFlags::from_iter(flags.iter().copied()),
-            status: OfflineStatus::Clean,
+            level: ReplicaLevel::Meta,
+            meta: Some(ReplicaMeta("row".into())),
+            flags: ReplicaFlags::from_iter(flags.iter().copied()),
+            status: ReplicaStatus::Clean,
             conflict_revision: None,
-            base: Some(OfflineBase {
-                flags: OfflineFlags::from_iter(flags.iter().copied()),
+            base: Some(ReplicaBase {
+                flags: ReplicaFlags::from_iter(flags.iter().copied()),
                 revision: None,
                 object: None,
             }),
@@ -394,19 +394,19 @@ mod tests {
         }
     }
 
-    fn item(handle: &str, flags: &[&str]) -> OfflineRemoteItem {
-        OfflineRemoteItem {
-            handle: OfflineHandle::from(handle),
-            flags: OfflineFlags::from_iter(flags.iter().copied()),
+    fn item(handle: &str, flags: &[&str]) -> ReplicaRemoteItem {
+        ReplicaRemoteItem {
+            handle: ReplicaHandle::from(handle),
+            flags: ReplicaFlags::from_iter(flags.iter().copied()),
             revision: None,
         }
     }
 
-    fn fetched(handle: &str, link: &str) -> OfflineFetchedItem {
-        OfflineFetchedItem {
-            handle: OfflineHandle::from(handle),
-            link_id: OfflineLinkId::from(link),
-            meta: OfflineMeta("fresh row".into()),
+    fn fetched(handle: &str, link: &str) -> ReplicaFetchedItem {
+        ReplicaFetchedItem {
+            handle: ReplicaHandle::from(handle),
+            link_id: ReplicaLinkId::from(link),
+            meta: ReplicaMeta("fresh row".into()),
             body: None,
             revision: None,
         }
@@ -415,46 +415,46 @@ mod tests {
     /// Runs a rekey to completion over the given old spine, new spine and
     /// meta replies, returning the writes and the report.
     fn run(
-        old: Vec<OfflinePlacement>,
-        items: Vec<OfflineRemoteItem>,
-        metas: Vec<OfflineFetchedItem>,
-    ) -> (Vec<OfflineWriteOp>, OfflineRekeyReport) {
+        old: Vec<ReplicaPlacement>,
+        items: Vec<ReplicaRemoteItem>,
+        metas: Vec<ReplicaFetchedItem>,
+    ) -> (Vec<ReplicaWriteOp>, ReplicaRekeyReport) {
         crate::testlog::init();
-        let mut rekey = OfflineRekey::new("inbox");
+        let mut rekey = ReplicaRekey::new("inbox");
         let _ = rekey.resume(None);
-        let _ = rekey.resume(Some(OfflineArg::Load(OfflineLoaded {
+        let _ = rekey.resume(Some(ReplicaArg::Load(ReplicaLoaded {
             placements: old,
             checkpoint: None,
         })));
 
-        let snapshot = OfflineRemoteSnapshot {
+        let snapshot = ReplicaRemoteSnapshot {
             items,
             vanished: Vec::new(),
             complete: true,
-            checkpoint: OfflineCheckpoint(b"v2".to_vec()),
+            checkpoint: ReplicaCheckpoint(b"v2".to_vec()),
         };
-        let writes = match rekey.resume(Some(OfflineArg::Enumerate(snapshot))) {
-            OfflineCoroutineState::Yielded(OfflineYield::WantsFetch { tier, .. }) => {
-                assert_eq!(tier, OfflineTier::Meta);
-                match rekey.resume(Some(OfflineArg::Fetch(metas))) {
-                    OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(w)) => w,
+        let writes = match rekey.resume(Some(ReplicaArg::Enumerate(snapshot))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsFetch { tier, .. }) => {
+                assert_eq!(tier, ReplicaTier::Meta);
+                match rekey.resume(Some(ReplicaArg::Fetch(metas))) {
+                    ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(w)) => w,
                     state => panic!("expected WantsWrite, got {state:?}"),
                 }
             }
-            OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(w)) => w,
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(w)) => w,
             state => panic!("expected fetch or write, got {state:?}"),
         };
 
-        let report = match rekey.resume(Some(OfflineArg::Write)) {
-            OfflineCoroutineState::Complete(Ok(report)) => report,
+        let report = match rekey.resume(Some(ReplicaArg::Write)) {
+            ReplicaCoroutineState::Complete(Ok(report)) => report,
             state => panic!("expected Complete(Ok), got {state:?}"),
         };
         (writes, report)
     }
 
-    fn upserted<'a>(writes: &'a [OfflineWriteOp], handle: &str) -> Option<&'a OfflinePlacement> {
+    fn upserted<'a>(writes: &'a [ReplicaWriteOp], handle: &str) -> Option<&'a ReplicaPlacement> {
         writes.iter().find_map(|w| match w {
-            OfflineWriteOp::UpsertPlacement(p) if p.handle.as_str() == handle => Some(p),
+            ReplicaWriteOp::UpsertPlacement(p) if p.handle.as_str() == handle => Some(p),
             _ => None,
         })
     }
@@ -464,8 +464,8 @@ mod tests {
         // The old placement had staged "flagged" on top of a "seen" base;
         // the new handle re-derives that delta against the new base.
         let mut old = synced("1", "msg-a", &["seen"]);
-        old.flags = OfflineFlags::from_iter(["seen", "flagged"]);
-        old.status = OfflineStatus::Dirty;
+        old.flags = ReplicaFlags::from_iter(["seen", "flagged"]);
+        old.status = ReplicaStatus::Dirty;
 
         let (writes, report) = run(
             vec![old],
@@ -477,14 +477,14 @@ mod tests {
         assert_eq!(report.dropped, 0);
         assert!(
             writes.iter().any(
-                |w| matches!(w, OfflineWriteOp::DropPlacement { handle, .. } if handle.as_str() == "1")
+                |w| matches!(w, ReplicaWriteOp::DropPlacement { handle, .. } if handle.as_str() == "1")
             ),
             "the old handle is dropped: {writes:?}",
         );
         let carried = upserted(&writes, "101").expect("a carried placement");
         assert_eq!(
             carried.status,
-            OfflineStatus::Dirty,
+            ReplicaStatus::Dirty,
             "the delta stays pending"
         );
         assert!(carried.flags.contains("flagged"));
@@ -495,10 +495,10 @@ mod tests {
     #[test]
     fn a_tombstone_survives_with_its_destination() {
         let mut old = synced("1", "msg-a", &["seen"]);
-        old.status = OfflineStatus::Tombstone;
-        old.origin = Some(OfflineOrigin {
+        old.status = ReplicaStatus::Tombstone;
+        old.origin = Some(ReplicaOrigin {
             collection: "archive".into(),
-            handle: OfflineHandle::from("1"),
+            handle: ReplicaHandle::from("1"),
         });
 
         let (writes, report) = run(
@@ -509,7 +509,7 @@ mod tests {
 
         assert_eq!(report.rekeyed, 1);
         let carried = upserted(&writes, "101").expect("a carried placement");
-        assert_eq!(carried.status, OfflineStatus::Tombstone);
+        assert_eq!(carried.status, ReplicaStatus::Tombstone);
         assert_eq!(
             carried.origin.as_ref().expect("a move target").collection,
             "archive".into(),
@@ -519,9 +519,9 @@ mod tests {
     #[test]
     fn a_staged_edit_survives_with_its_body() {
         let mut old = synced("1", "msg-a", &[]);
-        old.object = Some(OfflineHash::from("h2"));
-        old.level = OfflineLevel::Full;
-        old.status = OfflineStatus::Dirty;
+        old.object = Some(ReplicaHash::from("h2"));
+        old.level = ReplicaLevel::Full;
+        old.status = ReplicaStatus::Dirty;
 
         let (writes, report) = run(
             vec![old],
@@ -531,21 +531,21 @@ mod tests {
 
         assert_eq!(report.rekeyed, 1);
         let carried = upserted(&writes, "101").expect("a carried placement");
-        assert_eq!(carried.status, OfflineStatus::Dirty);
+        assert_eq!(carried.status, ReplicaStatus::Dirty);
         assert_eq!(
             carried.object,
-            Some(OfflineHash::from("h2")),
+            Some(ReplicaHash::from("h2")),
             "the body survives"
         );
-        assert_eq!(carried.level, OfflineLevel::Full, "the cache survives");
+        assert_eq!(carried.level, ReplicaLevel::Full, "the cache survives");
     }
 
     #[test]
     fn a_clean_cache_carries_over_without_pending_state() {
         let mut old = synced("1", "msg-a", &["seen"]);
-        old.object = Some(OfflineHash::from("h1"));
-        old.base.as_mut().expect("a base").object = Some(OfflineHash::from("h1"));
-        old.level = OfflineLevel::Full;
+        old.object = Some(ReplicaHash::from("h1"));
+        old.base.as_mut().expect("a base").object = Some(ReplicaHash::from("h1"));
+        old.level = ReplicaLevel::Full;
 
         let (writes, report) = run(
             vec![old],
@@ -555,11 +555,11 @@ mod tests {
 
         assert_eq!(report.rekeyed, 1);
         let carried = upserted(&writes, "101").expect("a carried placement");
-        assert_eq!(carried.status, OfflineStatus::Clean);
-        assert_eq!(carried.object, Some(OfflineHash::from("h1")));
-        assert_eq!(carried.level, OfflineLevel::Full);
+        assert_eq!(carried.status, ReplicaStatus::Clean);
+        assert_eq!(carried.object, Some(ReplicaHash::from("h1")));
+        assert_eq!(carried.level, ReplicaLevel::Full);
         let base = carried.base.as_ref().expect("a base");
-        assert_eq!(base.object, Some(OfflineHash::from("h1")));
+        assert_eq!(base.object, Some(ReplicaHash::from("h1")));
     }
 
     #[test]
@@ -568,18 +568,18 @@ mod tests {
         // outage that came with the bump): the edit survives as a pending
         // create, the same edit-beats-delete rule the sync applies.
         let mut old = synced("1", "msg-a", &[]);
-        old.object = Some(OfflineHash::from("h2"));
-        old.level = OfflineLevel::Full;
-        old.status = OfflineStatus::Dirty;
+        old.object = Some(ReplicaHash::from("h2"));
+        old.level = ReplicaLevel::Full;
+        old.status = ReplicaStatus::Dirty;
 
         let (writes, report) = run(vec![old], vec![], vec![]);
 
         assert_eq!(report.rekeyed, 1, "carried as a pending create");
         assert_eq!(report.dropped, 0);
         let resurrected = upserted(&writes, "1").expect("a resurrected placement");
-        assert_eq!(resurrected.status, OfflineStatus::Created);
+        assert_eq!(resurrected.status, ReplicaStatus::Created);
         assert!(resurrected.base.is_none());
-        assert_eq!(resurrected.object, Some(OfflineHash::from("h2")));
+        assert_eq!(resurrected.object, Some(ReplicaHash::from("h2")));
     }
 
     #[test]
@@ -588,8 +588,8 @@ mod tests {
         // its pending flag edit is lost with the old handle space.
         let mut old = synced("1", "msg-a", &[]);
         old.link_id = None;
-        old.flags = OfflineFlags::from_iter(["flagged"]);
-        old.status = OfflineStatus::Dirty;
+        old.flags = ReplicaFlags::from_iter(["flagged"]);
+        old.status = ReplicaStatus::Dirty;
 
         let (writes, report) = run(vec![old], vec![item("101", &[])], vec![]);
 
@@ -597,7 +597,7 @@ mod tests {
         assert_eq!(report.pulled, 1);
         assert_eq!(report.dropped, 1, "the pending edit is lost, and said so");
         let fresh = upserted(&writes, "101").expect("a fresh placement");
-        assert_eq!(fresh.status, OfflineStatus::Clean);
+        assert_eq!(fresh.status, ReplicaStatus::Clean);
     }
 
     #[test]
@@ -605,21 +605,21 @@ mod tests {
         let mut old = synced("1", "msg-a", &[]);
         old.link_id = None;
 
-        let mut rekey = OfflineRekey::new("inbox");
+        let mut rekey = ReplicaRekey::new("inbox");
         let _ = rekey.resume(None);
-        let _ = rekey.resume(Some(OfflineArg::Load(OfflineLoaded {
+        let _ = rekey.resume(Some(ReplicaArg::Load(ReplicaLoaded {
             placements: vec![old],
             checkpoint: None,
         })));
 
-        let snapshot = OfflineRemoteSnapshot {
+        let snapshot = ReplicaRemoteSnapshot {
             items: vec![item("101", &[])],
             vanished: Vec::new(),
             complete: true,
-            checkpoint: OfflineCheckpoint(b"v2".to_vec()),
+            checkpoint: ReplicaCheckpoint(b"v2".to_vec()),
         };
-        match rekey.resume(Some(OfflineArg::Enumerate(snapshot))) {
-            OfflineCoroutineState::Yielded(OfflineYield::WantsWrite(_)) => {}
+        match rekey.resume(Some(ReplicaArg::Enumerate(snapshot))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(_)) => {}
             state => panic!("expected WantsWrite without a fetch, got {state:?}"),
         }
     }
@@ -627,7 +627,7 @@ mod tests {
     #[test]
     fn pending_creates_are_left_untouched() {
         let mut placeholder = synced("tmp-1", "msg-b", &[]);
-        placeholder.status = OfflineStatus::Created;
+        placeholder.status = ReplicaStatus::Created;
         placeholder.base = None;
 
         let (writes, report) = run(vec![placeholder], vec![], vec![]);
@@ -636,7 +636,7 @@ mod tests {
         assert!(
             !writes.iter().any(|w| matches!(
                 w,
-                OfflineWriteOp::DropPlacement { handle, .. } if handle.as_str() == "tmp-1"
+                ReplicaWriteOp::DropPlacement { handle, .. } if handle.as_str() == "tmp-1"
             )),
             "the placeholder is not spine, it stays: {writes:?}",
         );
@@ -644,20 +644,20 @@ mod tests {
 
     #[test]
     fn missing_arg_errors() {
-        let mut rekey = OfflineRekey::new("inbox");
+        let mut rekey = ReplicaRekey::new("inbox");
         let _ = rekey.resume(None);
         match rekey.resume(None) {
-            OfflineCoroutineState::Complete(Err(OfflineRekeyError::MissingArg)) => {}
+            ReplicaCoroutineState::Complete(Err(ReplicaRekeyError::MissingArg)) => {}
             state => panic!("expected MissingArg, got {state:?}"),
         }
     }
 
     #[test]
     fn unexpected_arg_errors() {
-        let mut rekey = OfflineRekey::new("inbox");
+        let mut rekey = ReplicaRekey::new("inbox");
         let _ = rekey.resume(None);
-        match rekey.resume(Some(OfflineArg::Write)) {
-            OfflineCoroutineState::Complete(Err(OfflineRekeyError::UnexpectedArg)) => {}
+        match rekey.resume(Some(ReplicaArg::Write)) {
+            ReplicaCoroutineState::Complete(Err(ReplicaRekeyError::UnexpectedArg)) => {}
             state => panic!("expected UnexpectedArg, got {state:?}"),
         }
     }

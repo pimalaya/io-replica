@@ -7,16 +7,16 @@ mod common;
 
 use std::collections::BTreeMap;
 
-use io_offline::{
-    change::{OfflineChange, OfflineWriteOp},
-    client::{OfflineClient, OfflineClientError, OfflineRemote, OfflineStorage},
-    collection::{OfflineCheckpoint, OfflineCollectionId},
-    mutate::OfflineMutation,
-    object::OfflineHash,
-    placement::{OfflineHandle, OfflineLinkId},
-    remote::{OfflineFetchedItem, OfflinePushResult, OfflineRemoteSnapshot, OfflineTier},
-    storage::OfflineLoaded,
-    sync::OfflineSyncOptions,
+use io_replica::{
+    change::{ReplicaChange, ReplicaWriteOp},
+    client::{ReplicaClient, ReplicaClientError, ReplicaRemote, ReplicaStorage},
+    collection::{ReplicaCheckpoint, ReplicaCollectionId},
+    mutate::ReplicaMutation,
+    object::ReplicaHash,
+    placement::{ReplicaHandle, ReplicaLinkId},
+    remote::{ReplicaFetchedItem, ReplicaPushResult, ReplicaRemoteSnapshot, ReplicaTier},
+    storage::ReplicaLoaded,
+    sync::ReplicaSyncOptions,
 };
 
 use crate::common::{MemRemote, MemStorage};
@@ -24,21 +24,21 @@ use crate::common::{MemRemote, MemStorage};
 /// A storage whose every call fails.
 struct BrokenStorage;
 
-impl OfflineStorage for BrokenStorage {
+impl ReplicaStorage for BrokenStorage {
     type Error = &'static str;
 
-    fn load(&self, _: &OfflineCollectionId) -> Result<OfflineLoaded, Self::Error> {
+    fn load(&self, _: &ReplicaCollectionId) -> Result<ReplicaLoaded, Self::Error> {
         Err("disk on fire")
     }
 
     fn lookup_objects(
         &self,
-        _: &[OfflineLinkId],
-    ) -> Result<BTreeMap<OfflineLinkId, OfflineHash>, Self::Error> {
+        _: &[ReplicaLinkId],
+    ) -> Result<BTreeMap<ReplicaLinkId, ReplicaHash>, Self::Error> {
         Err("disk on fire")
     }
 
-    fn write(&mut self, _: Vec<OfflineWriteOp>) -> Result<(), Self::Error> {
+    fn write(&mut self, _: Vec<ReplicaWriteOp>) -> Result<(), Self::Error> {
         Err("disk on fire")
     }
 }
@@ -46,75 +46,75 @@ impl OfflineStorage for BrokenStorage {
 /// A remote whose every call fails.
 struct BrokenRemote;
 
-impl OfflineRemote for BrokenRemote {
+impl ReplicaRemote for BrokenRemote {
     type Error = &'static str;
 
     fn enumerate(
         &mut self,
-        _: &OfflineCollectionId,
-        _: Option<OfflineCheckpoint>,
-    ) -> Result<OfflineRemoteSnapshot, Self::Error> {
+        _: &ReplicaCollectionId,
+        _: Option<ReplicaCheckpoint>,
+    ) -> Result<ReplicaRemoteSnapshot, Self::Error> {
         Err("network unplugged")
     }
 
     fn fetch(
         &mut self,
-        _: &OfflineCollectionId,
-        _: Vec<OfflineHandle>,
-        _: OfflineTier,
-    ) -> Result<Vec<OfflineFetchedItem>, Self::Error> {
+        _: &ReplicaCollectionId,
+        _: Vec<ReplicaHandle>,
+        _: ReplicaTier,
+    ) -> Result<Vec<ReplicaFetchedItem>, Self::Error> {
         Err("network unplugged")
     }
 
     fn push(
         &mut self,
-        _: &OfflineCollectionId,
-        _: Vec<OfflineChange>,
-    ) -> Result<Vec<OfflinePushResult>, Self::Error> {
+        _: &ReplicaCollectionId,
+        _: Vec<ReplicaChange>,
+    ) -> Result<Vec<ReplicaPushResult>, Self::Error> {
         Err("network unplugged")
     }
 }
 
 #[test]
 fn storage_error_propagates() {
-    let mut client = OfflineClient::new(BrokenStorage, MemRemote::default());
+    let mut client = ReplicaClient::new(BrokenStorage, MemRemote::default());
 
     let err = client.open("inbox").unwrap_err();
     assert!(matches!(
         err,
-        OfflineClientError::OfflineStorage("disk on fire")
+        ReplicaClientError::ReplicaStorage("disk on fire")
     ));
-    assert_eq!(err.to_string(), "OfflineStorage seam failed: disk on fire");
+    assert_eq!(err.to_string(), "ReplicaStorage seam failed: disk on fire");
 }
 
 #[test]
 fn remote_error_propagates() {
-    let mut client = OfflineClient::new(MemStorage::default(), BrokenRemote);
+    let mut client = ReplicaClient::new(MemStorage::default(), BrokenRemote);
 
     let err = client
-        .sync("inbox", OfflineSyncOptions::default())
+        .sync("inbox", ReplicaSyncOptions::default())
         .unwrap_err();
     assert!(matches!(
         err,
-        OfflineClientError::OfflineRemote("network unplugged")
+        ReplicaClientError::ReplicaRemote("network unplugged")
     ));
     assert_eq!(
         err.to_string(),
-        "OfflineRemote seam failed: network unplugged"
+        "ReplicaRemote seam failed: network unplugged"
     );
 }
 
 #[test]
 fn coroutine_error_propagates() {
-    let mut client = OfflineClient::new(MemStorage::default(), MemRemote::default());
+    let mut client = ReplicaClient::new(MemStorage::default(), MemRemote::default());
 
     let err = client
         .mutate(
             "inbox",
-            OfflineMutation::Remove(OfflineHandle::from("nope")),
+            ReplicaMutation::Remove(ReplicaHandle::from("nope")),
         )
         .unwrap_err();
-    assert!(matches!(err, OfflineClientError::Coroutine(_)));
+    assert!(matches!(err, ReplicaClientError::Coroutine(_)));
     assert_eq!(
         err.to_string(),
         "Offline engine failed: Offline MUTATE failed: unknown handle nope",
@@ -123,13 +123,13 @@ fn coroutine_error_propagates() {
 
 #[test]
 fn seams_are_borrowable_both_ways() {
-    let mut client = OfflineClient::new(MemStorage::default(), MemRemote::default());
+    let mut client = ReplicaClient::new(MemStorage::default(), MemRemote::default());
 
     client.remote_mut().seed("inbox", "1", "msg-1", &[], b"x");
     client
         .storage_mut()
         .checkpoints
-        .insert("inbox".into(), OfflineCheckpoint(b"cp".to_vec()));
+        .insert("inbox".into(), ReplicaCheckpoint(b"cp".to_vec()));
 
     assert_eq!(client.remote().calls, 0);
     assert_eq!(client.storage().checkpoints.len(), 1);

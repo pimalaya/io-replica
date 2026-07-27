@@ -8,11 +8,11 @@ use core::fmt;
 use log::{debug, trace};
 use thiserror::Error;
 
-use crate::{collection::OfflineCollectionId, coroutine::*, storage::OfflineLoaded};
+use crate::{collection::ReplicaCollectionId, coroutine::*, storage::ReplicaLoaded};
 
 /// Failure causes during an OPEN flow.
 #[derive(Clone, Debug, Error)]
-pub enum OfflineOpenError {
+pub enum ReplicaOpenError {
     /// The driver fed back an arg that does not match the pending yield.
     #[error("Offline OPEN failed: unexpected coroutine arg")]
     UnexpectedArg,
@@ -22,14 +22,14 @@ pub enum OfflineOpenError {
 }
 
 /// I/O-free OPEN coroutine.
-pub struct OfflineOpen {
-    collection: OfflineCollectionId,
+pub struct ReplicaOpen {
+    collection: ReplicaCollectionId,
     state: State,
 }
 
-impl OfflineOpen {
+impl ReplicaOpen {
     /// Creates a coroutine that loads `collection` from storage.
-    pub fn new(collection: impl Into<OfflineCollectionId>) -> Self {
+    pub fn new(collection: impl Into<ReplicaCollectionId>) -> Self {
         let collection = collection.into();
         debug!("open collection {}", collection.as_str());
 
@@ -40,29 +40,29 @@ impl OfflineOpen {
     }
 }
 
-impl OfflineCoroutine for OfflineOpen {
-    type Yield = OfflineYield;
-    type Return = Result<OfflineLoaded, OfflineOpenError>;
+impl ReplicaCoroutine for ReplicaOpen {
+    type Yield = ReplicaYield;
+    type Return = Result<ReplicaLoaded, ReplicaOpenError>;
 
     fn resume(
         &mut self,
-        arg: Option<OfflineArg>,
-    ) -> OfflineCoroutineState<Self::Yield, Self::Return> {
+        arg: Option<ReplicaArg>,
+    ) -> ReplicaCoroutineState<Self::Yield, Self::Return> {
         trace!("open: {}", self.state);
 
         match (&self.state, arg) {
             (State::Start, None) => {
                 debug!("load collection from storage");
                 self.state = State::PendingLoad;
-                OfflineCoroutineState::Yielded(OfflineYield::WantsLoad(self.collection.clone()))
+                ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad(self.collection.clone()))
             }
-            (State::PendingLoad, Some(OfflineArg::Load(loaded))) => {
+            (State::PendingLoad, Some(ReplicaArg::Load(loaded))) => {
                 debug!("opened collection with {} items", loaded.placements.len());
                 trace!("loaded placements: {:?}", loaded.placements);
-                OfflineCoroutineState::Complete(Ok(loaded))
+                ReplicaCoroutineState::Complete(Ok(loaded))
             }
-            (_, Some(_)) => OfflineCoroutineState::Complete(Err(OfflineOpenError::UnexpectedArg)),
-            (_, None) => OfflineCoroutineState::Complete(Err(OfflineOpenError::MissingArg)),
+            (_, Some(_)) => ReplicaCoroutineState::Complete(Err(ReplicaOpenError::UnexpectedArg)),
+            (_, None) => ReplicaCoroutineState::Complete(Err(ReplicaOpenError::MissingArg)),
         }
     }
 }
@@ -86,21 +86,21 @@ mod tests {
     use alloc::vec;
 
     use crate::{
-        collection::OfflineCheckpoint,
+        collection::ReplicaCheckpoint,
         open::*,
-        placement::{OfflineFlags, OfflineHandle, OfflineLevel, OfflinePlacement, OfflineStatus},
+        placement::{ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaPlacement, ReplicaStatus},
     };
 
-    fn placement(handle: &str) -> OfflinePlacement {
-        OfflinePlacement {
+    fn placement(handle: &str) -> ReplicaPlacement {
+        ReplicaPlacement {
             collection: "inbox".into(),
-            handle: OfflineHandle::from(handle),
+            handle: ReplicaHandle::from(handle),
             link_id: None,
             object: None,
-            level: OfflineLevel::Probed,
+            level: ReplicaLevel::Probed,
             meta: None,
-            flags: OfflineFlags::default(),
-            status: OfflineStatus::Clean,
+            flags: ReplicaFlags::default(),
+            status: ReplicaStatus::Clean,
             conflict_revision: None,
             base: None,
             origin: None,
@@ -109,9 +109,9 @@ mod tests {
 
     #[test]
     fn start_yields_load() {
-        let mut open = OfflineOpen::new("inbox");
+        let mut open = ReplicaOpen::new("inbox");
         match open.resume(None) {
-            OfflineCoroutineState::Yielded(OfflineYield::WantsLoad(id)) => {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad(id)) => {
                 assert_eq!(id.as_str(), "inbox");
             }
             state => panic!("expected WantsLoad, got {state:?}"),
@@ -121,44 +121,44 @@ mod tests {
     #[test]
     fn load_completes_with_placements() {
         crate::testlog::init();
-        let mut open = OfflineOpen::new("inbox");
+        let mut open = ReplicaOpen::new("inbox");
         let _ = open.resume(None);
 
-        let loaded = OfflineLoaded {
+        let loaded = ReplicaLoaded {
             placements: vec![placement("1"), placement("2")],
-            checkpoint: Some(OfflineCheckpoint(b"tok".to_vec())),
+            checkpoint: Some(ReplicaCheckpoint(b"tok".to_vec())),
         };
-        match open.resume(Some(OfflineArg::Load(loaded))) {
-            OfflineCoroutineState::Complete(Ok(out)) => assert_eq!(out.placements.len(), 2),
+        match open.resume(Some(ReplicaArg::Load(loaded))) {
+            ReplicaCoroutineState::Complete(Ok(out)) => assert_eq!(out.placements.len(), 2),
             state => panic!("expected Complete(Ok), got {state:?}"),
         }
     }
 
     #[test]
     fn unexpected_arg_at_start_errors() {
-        let mut open = OfflineOpen::new("inbox");
-        match open.resume(Some(OfflineArg::Write)) {
-            OfflineCoroutineState::Complete(Err(OfflineOpenError::UnexpectedArg)) => {}
+        let mut open = ReplicaOpen::new("inbox");
+        match open.resume(Some(ReplicaArg::Write)) {
+            ReplicaCoroutineState::Complete(Err(ReplicaOpenError::UnexpectedArg)) => {}
             state => panic!("expected UnexpectedArg, got {state:?}"),
         }
     }
 
     #[test]
     fn missing_arg_at_pending_load_errors() {
-        let mut open = OfflineOpen::new("inbox");
+        let mut open = ReplicaOpen::new("inbox");
         let _ = open.resume(None);
         match open.resume(None) {
-            OfflineCoroutineState::Complete(Err(OfflineOpenError::MissingArg)) => {}
+            ReplicaCoroutineState::Complete(Err(ReplicaOpenError::MissingArg)) => {}
             state => panic!("expected MissingArg, got {state:?}"),
         }
     }
 
     #[test]
     fn wrong_arg_kind_at_pending_load_errors() {
-        let mut open = OfflineOpen::new("inbox");
+        let mut open = ReplicaOpen::new("inbox");
         let _ = open.resume(None);
-        match open.resume(Some(OfflineArg::Write)) {
-            OfflineCoroutineState::Complete(Err(OfflineOpenError::UnexpectedArg)) => {}
+        match open.resume(Some(ReplicaArg::Write)) {
+            ReplicaCoroutineState::Complete(Err(ReplicaOpenError::UnexpectedArg)) => {}
             state => panic!("expected UnexpectedArg, got {state:?}"),
         }
     }

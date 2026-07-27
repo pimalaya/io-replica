@@ -9,7 +9,7 @@ status: current
 `sync` reconciles one collection's local replica against one remote through a
 three-way merge of Local, Base and Remote per placement, keyed on the handle.
 Flags merge element-wise and never conflict; only divergent mutable content is
-kept as a conflict. It is tuned by `OfflineSyncOptions`.
+kept as a conflict. It is tuned by `ReplicaSyncOptions`.
 
 ### Requirement: Three-way reconcile
 The engine SHALL merge each candidate placement over `(local, base, remote)`,
@@ -24,10 +24,10 @@ flag, content, delete or create push is stashed and applied only on an
 dirty, tombstoned or provisional so the next sync retries it.
 
 ### Requirement: Push direction
-`OfflineSyncOptions.push` SHALL be the master push switch. When false the source
+`ReplicaSyncOptions.push` SHALL be the master push switch. When false the source
 is treated read-only: local flag and content changes are kept dirty and never
 pushed, remote-won changes are still pulled, and a local delete is applied to the
-replica only. When true, the `OfflinePushRights` refinement SHALL gate each push
+replica only. When true, the `ReplicaPushRights` refinement SHALL gate each push
 kind independently.
 
 #### Scenario: Read-only source keeps local edits
@@ -36,7 +36,7 @@ kind independently.
 - THEN the engine emits no push and the placement stays dirty
 
 ### Requirement: Granular push rights
-`OfflineSyncOptions` SHALL carry an `OfflinePushRights` refinement with an
+`ReplicaSyncOptions` SHALL carry a `ReplicaPushRights` refinement with an
 independent boolean for each push kind (`flags`, `content`, `add`, `remove`),
 defaulting to all-permitted. When `push` is true, the engine SHALL derive a push
 of a given kind only when the matching right is permitted; a forbidden push kind
