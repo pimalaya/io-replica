@@ -1070,7 +1070,10 @@ proptest! {
         server.seed("inbox", "m2", "l2", &["seen"], b"two");
         let server = Rc::new(RefCell::new(server));
 
-        let full_opts = OfflineSyncOptions { push: true, full: true };
+        let full_opts = OfflineSyncOptions {
+            full: true,
+            ..OfflineSyncOptions::default()
+        };
         let delta_opts = OfflineSyncOptions::default();
         let mut a = OfflineClient::new(MemStorage::default(), SharedRemote(server.clone()));
         let mut b = OfflineClient::new(MemStorage::default(), SharedRemote(server.clone()));

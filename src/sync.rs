@@ -35,15 +35,68 @@ use crate::{
     remote::{OfflinePushOutcome, OfflineRemoteItem, OfflineRemoteSnapshot},
 };
 
+/// Which push kinds a writable source may derive, refining
+/// [`OfflineSyncOptions::push`].
+///
+/// Each kind is independent, so a source can, for example, accept flag changes
+/// but refuse deletes. All permitted by default, so the refinement is opt-in and
+/// leaves the all-or-nothing behaviour unchanged. Only consulted when
+/// [`OfflineSyncOptions::push`] is true; a false `push` is fully read-only
+/// regardless of these.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OfflinePushRights {
+    /// May push a flag-set change.
+    pub flags: bool,
+    /// May push an in-place content update.
+    pub content: bool,
+    /// May push a membership add (a create: copy, move target or append).
+    pub add: bool,
+    /// May push a membership remove (a delete or move source).
+    pub remove: bool,
+}
+
+impl OfflinePushRights {
+    /// Every push kind permitted (the default).
+    pub const fn all() -> Self {
+        Self {
+            flags: true,
+            content: true,
+            add: true,
+            remove: true,
+        }
+    }
+
+    /// No push kind permitted.
+    pub const fn none() -> Self {
+        Self {
+            flags: false,
+            content: false,
+            add: false,
+            remove: false,
+        }
+    }
+}
+
+impl Default for OfflinePushRights {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
 /// Tuning for one sync run: the push direction and the enumerate depth.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OfflineSyncOptions {
-    /// When false the source is treated read-only: local flag and content
-    /// changes are kept dirty and never pushed (permission gating). Local
-    /// deletes instead apply locally only, deliberately: they can never
-    /// propagate, so the replica mirrors the source and the next
-    /// enumerate re-adds the member.
+    /// The master push switch. When false the source is treated read-only:
+    /// local flag and content changes are kept dirty and never pushed
+    /// (permission gating). Local deletes instead apply locally only,
+    /// deliberately: they can never propagate, so the replica mirrors the
+    /// source and the next enumerate re-adds the member.
     pub push: bool,
+    /// Per-kind refinement of `push`, consulted only when `push` is true. A
+    /// forbidden push kind is kept pending (never pushed, and a forbidden
+    /// delete is not applied to the replica either), while other kinds still
+    /// propagate.
+    pub rights: OfflinePushRights,
     /// When true the checkpoint is ignored and the whole remote is
     /// enumerated, so the merge reconciles the complete spine: it re-adds
     /// any locally-missing message and drops any local phantom. The
@@ -51,10 +104,19 @@ pub struct OfflineSyncOptions {
     pub full: bool,
 }
 
+impl OfflineSyncOptions {
+    /// Whether a push of the kind selected by `right` may be derived: the
+    /// master switch on, and the specific right permitted.
+    fn may_push(&self, right: impl Fn(&OfflinePushRights) -> bool) -> bool {
+        self.push && right(&self.rights)
+    }
+}
+
 impl Default for OfflineSyncOptions {
     fn default() -> Self {
         Self {
             push: true,
+            rights: OfflinePushRights::all(),
             full: false,
         }
     }
@@ -298,6 +360,10 @@ impl OfflineSync {
                         .as_ref()
                         .is_some_and(|b| local.object != b.object);
                 if edited && local.origin.is_some() {
+                    if !self.opts.rights.content {
+                        // Content push forbidden: keep the tombstone pending.
+                        return None;
+                    }
                     self.pending_content_pushes
                         .insert(handle.clone(), local.clone());
                     return Some(OfflineChange::Update {
@@ -305,6 +371,13 @@ impl OfflineSync {
                         object: local.object.clone().expect("a staged edited body"),
                         if_match: base_revision,
                     });
+                }
+
+                if !self.opts.rights.remove {
+                    // Remove push forbidden: keep the tombstone pending, and do
+                    // not drop it locally (unlike a read-only source, which
+                    // mirrors the delete).
+                    return None;
                 }
 
                 // Hold the drop until the remote confirms it (in PendingPush);
@@ -350,7 +423,9 @@ impl OfflineSync {
                     self.writes
                         .push(OfflineWriteOp::UpsertPlacement(resurrected.clone()));
 
-                    if !self.opts.push {
+                    if !self.opts.may_push(|r| r.add) {
+                        // Read-only or add forbidden: keep the resurrected
+                        // create staged and pending, do not push.
                         return None;
                     }
                     self.pending_creates.insert(handle.clone(), resurrected);
@@ -396,7 +471,7 @@ impl OfflineSync {
             // base-less placement that is not Created is left untouched.
             (true, false, false) => {
                 let local = local.as_ref().expect("local present");
-                if self.opts.push && local.status == OfflineStatus::Created {
+                if self.opts.may_push(|r| r.add) && local.status == OfflineStatus::Created {
                     self.pending_creates.insert(handle.clone(), local.clone());
                     return Some(OfflineChange::Add {
                         handle: handle.clone(),
@@ -472,8 +547,9 @@ impl OfflineSync {
             (false, false) => ContentOutcome::Untouched,
             (false, true) => ContentOutcome::Rewritten(self.pull_content(local, item)),
             (true, false) => {
-                if !self.opts.push {
-                    // NOTE: read-only source, keep dirty and do not push
+                if !self.opts.may_push(|r| r.content) {
+                    // NOTE: read-only source or content push forbidden, keep
+                    // dirty and do not push
                     return ContentOutcome::Untouched;
                 }
                 self.pending_content_pushes
@@ -559,8 +635,9 @@ impl OfflineSync {
                     self.report.pulled += 1;
                 }
 
-                if !self.opts.push {
-                    // NOTE: read-only source, keep dirty and do not push
+                if !self.opts.may_push(|r| r.flags) {
+                    // NOTE: read-only source or flag push forbidden, keep dirty
+                    // and do not push
                     return None;
                 }
                 // Hold the rebase until the push is confirmed: a rejected
@@ -1317,6 +1394,7 @@ mod tests {
 
         let opts = OfflineSyncOptions {
             push: false,
+            rights: OfflinePushRights::all(),
             full: false,
         };
         let mut sync = OfflineSync::new("inbox", opts);
@@ -1491,6 +1569,7 @@ mod tests {
         let local = synced("1", &[]);
         let opts = OfflineSyncOptions {
             push: false,
+            rights: OfflinePushRights::all(),
             full: false,
         };
         let mut sync = OfflineSync::new("inbox", opts);
@@ -1755,6 +1834,7 @@ mod tests {
             "inbox",
             OfflineSyncOptions {
                 push: true,
+                rights: OfflinePushRights::all(),
                 full: true,
             },
         );
@@ -2217,6 +2297,7 @@ mod tests {
         // later writable sync instead of being dropped.
         let opts = OfflineSyncOptions {
             push: false,
+            rights: OfflinePushRights::all(),
             full: false,
         };
         let mut sync = OfflineSync::new("inbox", opts);
@@ -2236,6 +2317,7 @@ mod tests {
             "inbox",
             OfflineSyncOptions {
                 push: false,
+                rights: OfflinePushRights::all(),
                 full: false,
             },
         );
@@ -2259,6 +2341,7 @@ mod tests {
 
         let opts = OfflineSyncOptions {
             push: false,
+            rights: OfflinePushRights::all(),
             full: false,
         };
         let mut sync = OfflineSync::new("inbox", opts);
@@ -2324,5 +2407,86 @@ mod tests {
             OfflineCoroutineState::Complete(Err(OfflineSyncError::UnexpectedArg)) => {}
             state => panic!("expected UnexpectedArg, got {state:?}"),
         }
+    }
+
+    // --- granular push rights ------------------------------------------
+
+    /// A writable sync (`push = true`) with the given per-kind rights.
+    fn with_rights(flags: bool, content: bool, add: bool, remove: bool) -> OfflineSyncOptions {
+        OfflineSyncOptions {
+            push: true,
+            rights: OfflinePushRights {
+                flags,
+                content,
+                add,
+                remove,
+            },
+            full: false,
+        }
+    }
+
+    #[test]
+    fn forbidding_flags_keeps_dirty_without_push() {
+        let mut local = synced("1", &[]);
+        local.flags = OfflineFlags::from_iter(["seen"]);
+        local.status = OfflineStatus::Dirty;
+
+        let mut sync = OfflineSync::new("inbox", with_rights(false, true, true, true));
+        let (pushes, _writes, report) = run(&mut sync, vec![local], vec![remote("1", &[])]);
+
+        assert!(pushes.is_none(), "a forbidden flag push must not fire");
+        assert_eq!(report.pushed, 0);
+    }
+
+    #[test]
+    fn forbidding_remove_keeps_tombstone_undropped() {
+        let mut local = synced("1", &["seen"]);
+        local.status = OfflineStatus::Tombstone;
+
+        let mut sync = OfflineSync::new("inbox", with_rights(true, true, true, false));
+        let (pushes, writes, report) = run(&mut sync, vec![local], vec![remote("1", &["seen"])]);
+
+        assert!(pushes.is_none(), "a forbidden remove must not push");
+        assert!(
+            !writes.iter().any(|w| matches!(
+                w,
+                OfflineWriteOp::DropPlacement { handle, .. } if handle.as_str() == "1"
+            )),
+            "the tombstone must be retained, not dropped: {writes:?}",
+        );
+        assert_eq!(report.pushed, 0);
+    }
+
+    #[test]
+    fn flags_allowed_remove_forbidden_pushes_only_flags() {
+        let mut dirty = synced("1", &[]);
+        dirty.flags = OfflineFlags::from_iter(["seen"]);
+        dirty.status = OfflineStatus::Dirty;
+        let mut tomb = synced("2", &[]);
+        tomb.status = OfflineStatus::Tombstone;
+
+        let mut sync = OfflineSync::new("inbox", with_rights(true, true, true, false));
+        let (pushes, _writes, _report) = run(
+            &mut sync,
+            vec![dirty, tomb],
+            vec![remote("1", &[]), remote("2", &[])],
+        );
+
+        let pushes = pushes.expect("the permitted flag push still fires");
+        assert!(
+            pushes
+                .iter()
+                .all(|c| matches!(c, OfflineChange::SetFlags { .. })),
+            "only the flag change may be pushed, not the delete: {pushes:?}",
+        );
+    }
+
+    #[test]
+    fn forbidding_add_keeps_created_pending() {
+        let mut sync = OfflineSync::new("inbox", with_rights(true, true, false, true));
+        let (pushes, _writes, report) = run(&mut sync, vec![created("tmp")], vec![]);
+
+        assert!(pushes.is_none(), "a forbidden add must not push the create");
+        assert_eq!(report.pushed, 0);
     }
 }

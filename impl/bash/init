@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+#
+# cairn init: scaffold a cairn/ root with empty spec/ changes/ log/.
+#
+# This is an OPTIONAL convenience. See ../../GUIDE.md to do the same by hand.
+#
+#   init [dir] [--base NAME]      dir defaults to the current directory
+
+set -u
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$here/common.sh"
+
+start=""
+base="cairn"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --base) base="${2:-}"; shift 2 ;;
+    --base=*) base="${1#--base=}"; shift ;;
+    -h|--help) printf 'usage: init [dir] [--base NAME]\n'; exit 0 ;;
+    -*) die "unknown option: $1" ;;
+    *) start="$1"; shift ;;
+  esac
+done
+start="${start:-$PWD}"
+[ -d "$start" ] || die "no such directory: $start"
+
+if existing=$(find_root "$start"); then
+  printf 'cairn: root already present at %s\n' "$existing"
+fi
+
+target="$start/$base"
+for d in spec changes log; do
+  mkdir -p "$target/$d"
+  [ -e "$target/$d/.gitkeep" ] || : > "$target/$d/.gitkeep"
+done
+printf 'cairn: initialised %s (spec/ changes/ log/)\n' "$target"

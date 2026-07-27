@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+#
+# Cairn pre-commit hook (OPTIONAL). It aborts commits that break Cairn conformance.
+#
+# Cairn needs no tooling. This hook is a convenience for repositories that want
+# mechanical enforcement. Enable it with:
+#     git config core.hooksPath hooks
+#
+# Read-only. It runs the bash reference port and does not modify the tree.
+
+root=$(git rev-parse --show-toplevel)
+exec "$root/impl/bash/verify"
