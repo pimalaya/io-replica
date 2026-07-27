@@ -4,8 +4,8 @@
 //! A placement is one of the two identity axes (see [`crate::object`] for
 //! the other). It pins a logical item to a single collection through the
 //! protocol [`ReplicaHandle`], carries the per-location mutable state (flags,
-//! membership), records the detail [`ReplicaLevel`], and holds the [`ReplicaBase`] the
-//! three-way merge reconciles against.
+//! membership), records the detail [`ReplicaLevel`], and holds the
+//! [`ReplicaBase`] the three-way merge reconciles against.
 
 use alloc::{
     collections::BTreeSet,
@@ -206,13 +206,14 @@ pub struct ReplicaPlacement {
     /// How this placement relates to its base.
     pub status: ReplicaStatus,
     /// The remote content revision observed when the placement was marked
-    /// [`ReplicaStatus::Conflict`]: what the consumer resolves against (fetch that
-    /// revision's body, merge, then edit). `None` otherwise.
+    /// [`ReplicaStatus::Conflict`]: what the consumer resolves against (fetch
+    /// that revision's body, merge, then edit). `None` otherwise.
     pub conflict_revision: Option<String>,
     /// The last-synced base; `None` until first reconciled.
     pub base: Option<ReplicaBase>,
-    /// For a [`ReplicaStatus::Created`] placement, where its body already lives so
-    /// the push can copy or move it; `None` otherwise (and for an append).
+    /// For a [`ReplicaStatus::Created`] placement, where its body already
+    /// lives so the push can copy or move it; `None` otherwise (and for an
+    /// append).
     pub origin: Option<ReplicaOrigin>,
 }
 

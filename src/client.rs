@@ -2,9 +2,10 @@
 //!
 //! A driver that runs any standard-shape coroutine to completion by
 //! servicing each [`ReplicaYield`] through two consumer-supplied traits:
-//! [`ReplicaStorage`] for the index and blob store, [`ReplicaRemote`] for the protocol
-//! seam. These traits live on the consumer side, not inside the engine,
-//! so the I/O-free contract holds: the coroutines still only emit `Wants`.
+//! [`ReplicaStorage`] for the index and blob store, [`ReplicaRemote`] for the
+//! protocol seam. These traits live on the consumer side, not inside the
+//! engine, so the I/O-free contract holds: the coroutines still only emit
+//! `Wants`.
 //!
 //! A desktop or Neverest consumer backs [`ReplicaRemote`] with io-email's
 //! blocking clients and [`ReplicaStorage`] with sqlite plus a blob dir; an

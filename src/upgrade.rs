@@ -1,9 +1,9 @@
 //! I/O-free coroutine to raise placements to a higher detail level.
 //!
 //! A pure pull, never a merge. It loads the targeted placements, then for
-//! [`ReplicaTier::Full`] resolves their link ids against the object store first:
-//! a body already stored under another collection is linked without any
-//! network round-trip. This stores one body for an item that appears in
+//! [`ReplicaTier::Full`] resolves their link ids against the object store
+//! first: a body already stored under another collection is linked without
+//! any network round-trip. This stores one body for an item that appears in
 //! several collections at once, and backs a unified across-collections
 //! view.
 

@@ -1,7 +1,7 @@
 ---
 cairn: change
 id: delta-events
-status: active
+status: landed
 created: 2026-07-28
 ---
 

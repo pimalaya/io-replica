@@ -1,8 +1,9 @@
 //! Outbound remote changes and inbound storage writes.
 //!
-//! [`ReplicaChange`] is what the engine asks the consumer to push to the remote;
-//! [`ReplicaWriteOp`] is what it asks the consumer to persist locally. The engine
-//! itself performs neither: both travel as coroutine yields.
+//! [`ReplicaChange`] is what the engine asks the consumer to push to the
+//! remote; [`ReplicaWriteOp`] is what it asks the consumer to persist
+//! locally. The engine itself performs neither: both travel as coroutine
+//! yields.
 
 use alloc::{string::String, vec::Vec};
 
@@ -27,7 +28,8 @@ use crate::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReplicaChange {
     /// Add a member. The push reconciles the provisional `handle` to the
-    /// server-assigned one (returned as [`crate::remote::ReplicaPushResult::assigned`]).
+    /// server-assigned one (returned as
+    /// [`crate::remote::ReplicaPushResult::assigned`]).
     Add {
         /// The provisional handle the member is staged under locally.
         handle: ReplicaHandle,
@@ -108,8 +110,8 @@ pub enum ReplicaWriteOp {
     },
     /// Store an object body. Storing takes no reference of its own:
     /// references come from placement pointers only, and a paired
-    /// [`ReplicaWriteOp::UpsertPlacement`] pointing at the hash lands in the same
-    /// batch.
+    /// [`ReplicaWriteOp::UpsertPlacement`] pointing at the hash lands in the
+    /// same batch.
     StoreObject {
         /// The object metadata.
         object: ReplicaObject,

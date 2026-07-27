@@ -12,9 +12,9 @@
 //! services each yield and resumes the coroutine with the matching
 //! [`ReplicaArg`].
 //!
-//! ReplicaStorage is therefore not a trait injected into the engine, which would
-//! break the I/O-free contract: it is `Wants` variants like everything
-//! else. The optional std [`crate::client`] is one such consumer.
+//! ReplicaStorage is therefore not a trait injected into the engine, which
+//! would break the I/O-free contract: it is `Wants` variants like
+//! everything else. The optional std [`crate::client`] is one such consumer.
 
 use alloc::{collections::BTreeMap, vec::Vec};
 

@@ -27,7 +27,8 @@ use crate::{
 ///
 /// Each mutation reads one source placement in the coroutine's collection
 /// and stages the resulting writes; the remote is reconciled on the next
-/// sync. A copy stages a [`ReplicaStatus::Created`] placement in another collection.
+/// sync. A copy stages a [`ReplicaStatus::Created`] placement in another
+/// collection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReplicaMutation {
     /// Replace a placement's flag set.

@@ -1,10 +1,11 @@
 //! I/O-free coroutine to reconcile a collection with its remote.
 //!
 //! The load-bearing verb. It loads local state, enumerates the remote
-//! delta, then runs a three-way merge of Local, ReplicaBase and ReplicaRemote per
-//! placement: local-won changes are pushed, remote-won changes are
-//! pulled. ReplicaFlags merge element-wise and never conflict (each flag is
-//! independent, so divergent sets fold into their union of changes);
+//! delta, then runs a three-way merge of Local, ReplicaBase and
+//! ReplicaRemote per placement: local-won changes are pushed, remote-won
+//! changes are pulled. ReplicaFlags merge element-wise and never conflict
+//! (each flag is independent, so divergent sets fold into their union of
+//! changes);
 //! only divergent content edits are kept both as a conflict. The merge
 //! compares per-placement identities (flags and a content revision),
 //! never raw bytes: the complete probed spine plus the per-placement
@@ -38,11 +39,11 @@ use crate::{
 /// Which push kinds a writable source may derive, refining
 /// [`ReplicaSyncOptions::push`].
 ///
-/// Each kind is independent, so a source can, for example, accept flag changes
-/// but refuse deletes. All permitted by default, so the refinement is opt-in and
-/// leaves the all-or-nothing behaviour unchanged. Only consulted when
-/// [`ReplicaSyncOptions::push`] is true; a false `push` is fully read-only
-/// regardless of these.
+/// Each kind is independent, so a source can, for example, accept flag
+/// changes but refuse deletes. All permitted by default, so the refinement is
+/// opt-in and leaves the all-or-nothing behaviour unchanged. Only consulted
+/// when [`ReplicaSyncOptions::push`] is true; a false `push` is fully
+/// read-only regardless of these.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplicaPushRights {
     /// May push a flag-set change.
@@ -122,8 +123,32 @@ impl Default for ReplicaSyncOptions {
     }
 }
 
+/// A per-item outcome of a sync, for hooks and richer reporting.
+///
+/// Emitted as the merge (and the push confirmation) touches each handle: what
+/// changed for that placement, in order. Watch/notify/log hooks ride these; the
+/// counters on [`ReplicaSyncReport`] summarise them. Events are data, spine
+/// level (a handle, no body), so emitting them enters no I/O.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReplicaEvent {
+    /// A new member appeared locally, pulled from the remote.
+    Added(ReplicaHandle),
+    /// A placement's flag set changed (pulled from, or pushed to, the remote).
+    FlagsChanged(ReplicaHandle),
+    /// A placement's content changed: a stale body dropped for an on-demand
+    /// refetch (pull), or a local edit the remote confirmed (push).
+    ContentChanged(ReplicaHandle),
+    /// A member was removed: dropped after a remote delete, or a local delete
+    /// the remote confirmed.
+    Vanished(ReplicaHandle),
+    /// A placement's content diverged on both sides and is left conflicted.
+    Conflicted(ReplicaHandle),
+    /// A local create (copy, move target or append) the remote accepted.
+    Created(ReplicaHandle),
+}
+
 /// What a sync did.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ReplicaSyncReport {
     /// Placements changed by pulling the remote.
     pub pulled: usize,
@@ -136,6 +161,8 @@ pub struct ReplicaSyncReport {
     /// Placements whose stale body was dropped after a remote content
     /// change; an upgrade refetches them on demand.
     pub refreshed: usize,
+    /// The per-item events this sync emitted, in order.
+    pub events: Vec<ReplicaEvent>,
 }
 
 /// Failure causes during a SYNC flow.
@@ -340,6 +367,7 @@ impl ReplicaSync {
                 if item.revision.is_some() && item.revision != base_revision {
                     self.pull_add(item);
                     self.report.pulled += 1;
+                    self.emit(ReplicaEvent::Added(handle.clone()));
                     return None;
                 }
 
@@ -361,7 +389,8 @@ impl ReplicaSync {
                         .is_some_and(|b| local.object != b.object);
                 if edited && local.origin.is_some() {
                     if !self.opts.rights.content {
-                        // Content push forbidden: keep the tombstone pending.
+                        // NOTE: content push forbidden, keep the tombstone
+                        // pending.
                         return None;
                     }
                     self.pending_content_pushes
@@ -374,9 +403,9 @@ impl ReplicaSync {
                 }
 
                 if !self.opts.rights.remove {
-                    // Remove push forbidden: keep the tombstone pending, and do
-                    // not drop it locally (unlike a read-only source, which
-                    // mirrors the delete).
+                    // NOTE: remove push forbidden, keep the tombstone pending,
+                    // and do not drop it locally (unlike a read-only source,
+                    // which mirrors the delete).
                     return None;
                 }
 
@@ -424,8 +453,8 @@ impl ReplicaSync {
                         .push(ReplicaWriteOp::UpsertPlacement(resurrected.clone()));
 
                     if !self.opts.may_push(|r| r.add) {
-                        // Read-only or add forbidden: keep the resurrected
-                        // create staged and pending, do not push.
+                        // NOTE: read-only or add forbidden, keep the
+                        // resurrected create staged and pending, do not push.
                         return None;
                     }
                     self.pending_creates.insert(handle.clone(), resurrected);
@@ -440,12 +469,14 @@ impl ReplicaSync {
 
                 self.drop(handle);
                 self.report.pulled += 1;
+                self.emit(ReplicaEvent::Vanished(handle.clone()));
                 None
             }
             // remote add: brand new upstream
             (false, false, true) => {
                 self.pull_add(&remote_item.expect("remote present"));
                 self.report.pulled += 1;
+                self.emit(ReplicaEvent::Added(handle.clone()));
                 None
             }
             // present on both: reconcile content, then flags
@@ -519,6 +550,7 @@ impl ReplicaSync {
                 self.writes
                     .push(ReplicaWriteOp::UpsertPlacement(conflicted.clone()));
                 self.report.conflicts += 1;
+                self.emit(ReplicaEvent::Conflicted(local.handle.clone()));
                 return ContentOutcome::Rewritten(conflicted);
             }
             return ContentOutcome::Untouched;
@@ -567,6 +599,7 @@ impl ReplicaSync {
                 self.writes
                     .push(ReplicaWriteOp::UpsertPlacement(conflicted.clone()));
                 self.report.conflicts += 1;
+                self.emit(ReplicaEvent::Conflicted(local.handle.clone()));
                 ContentOutcome::Rewritten(conflicted)
             }
         }
@@ -575,8 +608,9 @@ impl ReplicaSync {
     /// Reconciles the flag sets of a placement present on both sides,
     /// returning a push when the local side won any flag.
     ///
-    /// ReplicaFlags merge element-wise ([`ReplicaFlags::merge`]) and never conflict:
-    /// divergent sets fold into one merged set that both sides converge
+    /// ReplicaFlags merge element-wise ([`ReplicaFlags::merge`]) and never
+    /// conflict: divergent sets fold into one merged set that both sides
+    /// converge
     /// on, pulling the remote-won flags and pushing the local-won ones.
     fn reconcile_flags(
         &mut self,
@@ -589,6 +623,7 @@ impl ReplicaSync {
             // NOTE: never based but present on both: converge on remote
             self.pull_flags(local, &remote.flags);
             self.report.pulled += 1;
+            self.emit(ReplicaEvent::FlagsChanged(local.handle.clone()));
             return None;
         };
 
@@ -620,6 +655,7 @@ impl ReplicaSync {
             (true, false) => {
                 self.pull_flags(local, &merged);
                 self.report.pulled += 1;
+                self.emit(ReplicaEvent::FlagsChanged(local.handle.clone()));
                 None
             }
             // the local side won at least one flag: push the merged set.
@@ -633,6 +669,7 @@ impl ReplicaSync {
                     self.writes
                         .push(ReplicaWriteOp::UpsertPlacement(updated.clone()));
                     self.report.pulled += 1;
+                    self.emit(ReplicaEvent::FlagsChanged(local.handle.clone()));
                 }
 
                 if !self.opts.may_push(|r| r.flags) {
@@ -652,6 +689,11 @@ impl ReplicaSync {
                 })
             }
         }
+    }
+
+    /// Records a per-item event for the report.
+    fn emit(&mut self, event: ReplicaEvent) {
+        self.report.events.push(event);
     }
 
     fn drop(&mut self, handle: &ReplicaHandle) {
@@ -703,6 +745,7 @@ impl ReplicaSync {
         self.writes
             .push(ReplicaWriteOp::UpsertPlacement(updated.clone()));
         self.report.refreshed += 1;
+        self.emit(ReplicaEvent::ContentChanged(local.handle.clone()));
         updated
     }
 
@@ -877,18 +920,28 @@ impl ReplicaCoroutine for ReplicaSync {
                             {
                                 let flags = placement.flags.clone();
                                 self.rebase(&placement, &flags);
+                                self.emit(ReplicaEvent::FlagsChanged(result.handle.clone()));
                             }
                             if let Some(placement) =
                                 self.pending_content_pushes.remove(&result.handle)
                             {
                                 self.rebase_content(&placement, result.revision.clone());
+                                self.emit(ReplicaEvent::ContentChanged(result.handle.clone()));
                             }
                             if self.pending_drops.remove(&result.handle) {
                                 self.drop(&result.handle);
+                                self.emit(ReplicaEvent::Vanished(result.handle.clone()));
                             }
                             if let Some(placeholder) = self.pending_creates.remove(&result.handle) {
+                                // NOTE: the created member's handle is the
+                                // assigned one when the remote reports it,
+                                // else the provisional.
+                                let created = result
+                                    .assigned
+                                    .clone()
+                                    .unwrap_or_else(|| result.handle.clone());
                                 match result.assigned.clone() {
-                                    // The remote returned the new handle: rekey.
+                                    // Remote returned the new handle: rekey.
                                     Some(assigned) => self.rekey_create(
                                         placeholder,
                                         assigned,
@@ -896,10 +949,11 @@ impl ReplicaCoroutine for ReplicaSync {
                                     ),
                                     // No assigned handle (no UIDPLUS): the copy
                                     // landed, so drop the placeholder; the next
-                                    // enumerate re-adds it by its real handle and
-                                    // links the body by link id.
+                                    // enumerate re-adds it by its real handle
+                                    // and links the body by link id.
                                     None => self.drop(&placeholder.handle),
                                 }
+                                self.emit(ReplicaEvent::Created(created));
                             }
                         }
                         // The remote refused it: leave the dirty placement,
@@ -930,7 +984,7 @@ impl ReplicaCoroutine for ReplicaSync {
                     self.report.conflicts,
                     self.report.rejected,
                 );
-                ReplicaCoroutineState::Complete(Ok(self.report))
+                ReplicaCoroutineState::Complete(Ok(mem::take(&mut self.report)))
             }
 
             (_, Some(_)) => ReplicaCoroutineState::Complete(Err(ReplicaSyncError::UnexpectedArg)),
@@ -1471,8 +1525,6 @@ mod tests {
         assert_eq!(report.pushed, 1);
     }
 
-    // --- reconcile_flags branch coverage -------------------------------
-
     #[test]
     fn unchanged_flags_is_noop() {
         // local == base == remote: nothing to pull or push, no placement write.
@@ -1584,8 +1636,6 @@ mod tests {
                 .contains("seen")
         );
     }
-
-    // --- membership (tombstone / remote delete) coverage ---------------
 
     #[test]
     fn accepted_delete_drops_tombstone() {
@@ -2409,8 +2459,6 @@ mod tests {
         }
     }
 
-    // --- granular push rights ------------------------------------------
-
     /// A writable sync (`push = true`) with the given per-kind rights.
     fn with_rights(flags: bool, content: bool, add: bool, remove: bool) -> ReplicaSyncOptions {
         ReplicaSyncOptions {
@@ -2488,5 +2536,69 @@ mod tests {
 
         assert!(pushes.is_none(), "a forbidden add must not push the create");
         assert_eq!(report.pushed, 0);
+    }
+
+    #[test]
+    fn event_added_on_remote_add() {
+        let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
+        let (_p, _w, report) = run(&mut sync, vec![], vec![remote("1", &["seen"])]);
+        assert_eq!(
+            report.events,
+            vec![ReplicaEvent::Added(ReplicaHandle::from("1"))]
+        );
+    }
+
+    #[test]
+    fn event_flags_changed_on_remote_flag_pull() {
+        let local = synced("1", &[]);
+        let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
+        let (_p, _w, report) = run(&mut sync, vec![local], vec![remote("1", &["seen"])]);
+        assert_eq!(
+            report.events,
+            vec![ReplicaEvent::FlagsChanged(ReplicaHandle::from("1"))]
+        );
+    }
+
+    #[test]
+    fn event_vanished_on_delta_vanish() {
+        let local = synced("1", &["seen"]);
+        let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
+        let snapshot = delta(vec![], vec![ReplicaHandle::from("1")]);
+        let (_p, _w, report) = run_snapshot(&mut sync, vec![local], snapshot);
+        assert_eq!(
+            report.events,
+            vec![ReplicaEvent::Vanished(ReplicaHandle::from("1"))]
+        );
+    }
+
+    #[test]
+    fn event_flags_changed_on_accepted_push() {
+        let mut local = synced("1", &[]);
+        local.flags = ReplicaFlags::from_iter(["seen"]);
+        local.status = ReplicaStatus::Dirty;
+        let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
+        let (_p, _w, report) = run(&mut sync, vec![local], vec![remote("1", &[])]);
+        assert_eq!(
+            report.events,
+            vec![ReplicaEvent::FlagsChanged(ReplicaHandle::from("1"))]
+        );
+        assert_eq!(report.pushed, 1);
+    }
+
+    #[test]
+    fn event_created_on_accepted_create() {
+        let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
+        let results = vec![ReplicaPushResult {
+            handle: ReplicaHandle::from("tmp"),
+            outcome: ReplicaPushOutcome::Accepted,
+            assigned: Some(ReplicaHandle::from("99")),
+            revision: None,
+        }];
+        let (_w, report) = drive_push(&mut sync, vec![created("tmp")], vec![], results);
+        // the create is reported under the server-assigned handle
+        assert_eq!(
+            report.events,
+            vec![ReplicaEvent::Created(ReplicaHandle::from("99"))]
+        );
     }
 }
