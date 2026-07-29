@@ -23,8 +23,6 @@ use io_replica::{
     storage::ReplicaLoaded,
 };
 
-// ---- in-memory storage ------------------------------------------------
-
 #[derive(Default)]
 pub struct MemStorage {
     pub placements: BTreeMap<(ReplicaCollectionId, ReplicaHandle), ReplicaPlacement>,
@@ -104,8 +102,6 @@ impl ReplicaStorage for MemStorage {
         Ok(())
     }
 }
-
-// ---- fake remote ------------------------------------------------------
 
 #[derive(Clone)]
 pub struct ServerItem {

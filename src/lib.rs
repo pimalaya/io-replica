@@ -17,7 +17,8 @@
 //! coroutine core (always present) and a std-blocking driver (the
 //! `client` feature); there is no CLI. The finer operational details
 //! (the push-outcome discipline, the create path, the checkpoint
-//! depths, driving the engine from an app) live in docs/design.md.
+//! depths, driving the engine from an app) are documented in the
+//! module headers.
 //!
 //! ## Two identity axes, never collapsed
 //!
@@ -85,12 +86,15 @@
 //! contract. The optional [`client`] module (`client` feature) is the
 //! reference std-blocking driver, servicing every yield through a
 //! consumer-implemented [`client::ReplicaStorage`] and
-//! [`client::ReplicaRemote`].
+//! [`client::ReplicaRemote`]. The [`hub`] module composes the single-remote
+//! merge into multi-source sync (mirror, two-way) without a cross-merge: a
+//! storage wraps it to project a per-source view of one shared item and
+//! absorb the writes back.
 //!
 //! ## Conventions
 //!
 //! The crate is no_std with alloc; std only enters behind the `client`
-//! feature. Public items carry the `Offline` prefix. Logging follows
+//! feature. Public items carry the `Replica` prefix. Logging follows
 //! the library rules: state changes at debug level, in-process steps
 //! and data at trace level.
 
@@ -103,6 +107,7 @@ pub mod change;
 pub mod client;
 pub mod collection;
 pub mod coroutine;
+pub mod hub;
 pub mod mutate;
 pub mod object;
 pub mod open;

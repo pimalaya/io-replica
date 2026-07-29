@@ -85,9 +85,9 @@ fn full_offline_lifecycle() {
     );
     assert_eq!(client.storage().objects.len(), 1, "one stored body");
 
-    // 4. second collection, same logical item: upgrading its body must
-    // dedup against the already-stored object, with zero new fetch.
-    // ReplicaMeta first resolves a1's link id (enumerate does not carry it), then
+    // NOTE: a second collection holding the same logical item: upgrading its
+    // body must dedup against the already-stored object, with zero new fetch.
+    // A Meta fetch resolves a1's link id (enumerate does not carry it), then
     // the Full upgrade links the shared body by that link id.
     client
         .sync("archive", ReplicaSyncOptions::default())

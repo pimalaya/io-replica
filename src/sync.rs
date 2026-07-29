@@ -84,6 +84,30 @@ impl Default for ReplicaPushRights {
     }
 }
 
+/// How a headless sync resolves a content conflict — content diverged on both
+/// sides against a shared base.
+///
+/// Only mutable-content backends can conflict (immutable content reports no
+/// revision, so the merge never sees a divergence). An interactive consumer
+/// leaves this `Manual` and resolves with an edit; an unattended sync picks one
+/// of the automatic policies. A base-less create-collision (both sides minted
+/// content for one handle with no shared ancestor) is always kept as a conflict
+/// regardless of this policy: there is no three-way merge to automate.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ReplicaConflictPolicy {
+    /// Mark the placement conflicted and leave it for the consumer to resolve
+    /// with an edit (the interactive default).
+    #[default]
+    Manual,
+    /// Keep the local edit, overwriting the remote's current version.
+    PreferLocal,
+    /// Keep the remote edit, dropping the local one and pulling the remote.
+    PreferRemote,
+    /// Keep both: pull the remote into the placement and stage the local body
+    /// as a new member (a create the next sync appends), so neither is lost.
+    KeepBoth,
+}
+
 /// Tuning for one sync run: the push direction and the enumerate depth.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplicaSyncOptions {
@@ -98,6 +122,9 @@ pub struct ReplicaSyncOptions {
     /// delete is not applied to the replica either), while other kinds still
     /// propagate.
     pub rights: ReplicaPushRights,
+    /// How a content conflict is resolved when the source is unattended.
+    /// Defaults to `Manual` (mark and wait for an edit).
+    pub conflict: ReplicaConflictPolicy,
     /// When true the checkpoint is ignored and the whole remote is
     /// enumerated, so the merge reconciles the complete spine: it re-adds
     /// any locally-missing message and drops any local phantom. The
@@ -118,6 +145,7 @@ impl Default for ReplicaSyncOptions {
         Self {
             push: true,
             rights: ReplicaPushRights::all(),
+            conflict: ReplicaConflictPolicy::Manual,
             full: false,
         }
     }
@@ -592,17 +620,83 @@ impl ReplicaSync {
                     if_match: base.revision.clone(),
                 })
             }
-            (true, true) => {
-                let mut conflicted = local.clone();
-                conflicted.status = ReplicaStatus::Conflict;
-                conflicted.conflict_revision = item.revision.clone();
-                self.writes
-                    .push(ReplicaWriteOp::UpsertPlacement(conflicted.clone()));
-                self.report.conflicts += 1;
-                self.emit(ReplicaEvent::Conflicted(local.handle.clone()));
-                ContentOutcome::Rewritten(conflicted)
+            (true, true) => self.resolve_conflict(local, item),
+        }
+    }
+
+    /// Resolves a content conflict (both sides edited a based placement) by the
+    /// configured [`ReplicaConflictPolicy`].
+    fn resolve_conflict(
+        &mut self,
+        local: &ReplicaPlacement,
+        item: &ReplicaRemoteItem,
+    ) -> ContentOutcome {
+        match self.opts.conflict {
+            ReplicaConflictPolicy::Manual => self.mark_conflict(local, item),
+            ReplicaConflictPolicy::PreferRemote => {
+                ContentOutcome::Rewritten(self.pull_content(local, item))
+            }
+            ReplicaConflictPolicy::PreferLocal => {
+                // NOTE: overwrite the remote's *current* version, so the
+                // precondition is the observed remote revision, not the stale
+                // base (which would be rejected on optimistic concurrency).
+                if !self.opts.may_push(|r| r.content) {
+                    return self.mark_conflict(local, item);
+                }
+                self.pending_content_pushes
+                    .insert(local.handle.clone(), local.clone());
+                ContentOutcome::Push(ReplicaChange::Update {
+                    handle: local.handle.clone(),
+                    object: local.object.clone().expect("a staged edited body"),
+                    if_match: item.revision.clone(),
+                })
+            }
+            ReplicaConflictPolicy::KeepBoth => {
+                self.stage_conflict_dup(local);
+                ContentOutcome::Rewritten(self.pull_content(local, item))
             }
         }
+    }
+
+    /// Marks a placement conflicted, carrying the observed remote revision for
+    /// the consumer to resolve against.
+    fn mark_conflict(
+        &mut self,
+        local: &ReplicaPlacement,
+        item: &ReplicaRemoteItem,
+    ) -> ContentOutcome {
+        let mut conflicted = local.clone();
+        conflicted.status = ReplicaStatus::Conflict;
+        conflicted.conflict_revision = item.revision.clone();
+        self.writes
+            .push(ReplicaWriteOp::UpsertPlacement(conflicted.clone()));
+        self.report.conflicts += 1;
+        self.emit(ReplicaEvent::Conflicted(local.handle.clone()));
+        ContentOutcome::Rewritten(conflicted)
+    }
+
+    /// Stages the local body as a fresh `Created` member so a `KeepBoth`
+    /// resolution loses neither version; the next sync appends it.
+    fn stage_conflict_dup(&mut self, local: &ReplicaPlacement) {
+        let Some(object) = local.object.clone() else {
+            return;
+        };
+        let mut handle = local.handle.0.clone();
+        handle.push_str("\u{1}keepboth");
+        let dup = ReplicaPlacement {
+            collection: self.collection.clone(),
+            handle: ReplicaHandle(handle),
+            link_id: None,
+            object: Some(object),
+            level: ReplicaLevel::Full,
+            meta: local.meta.clone(),
+            flags: local.flags.clone(),
+            status: ReplicaStatus::Created,
+            conflict_revision: None,
+            base: None,
+            origin: None,
+        };
+        self.writes.push(ReplicaWriteOp::UpsertPlacement(dup));
     }
 
     /// Reconciles the flag sets of a placement present on both sides,
@@ -1449,6 +1543,7 @@ mod tests {
         let opts = ReplicaSyncOptions {
             push: false,
             rights: ReplicaPushRights::all(),
+            conflict: ReplicaConflictPolicy::Manual,
             full: false,
         };
         let mut sync = ReplicaSync::new("inbox", opts);
@@ -1622,6 +1717,7 @@ mod tests {
         let opts = ReplicaSyncOptions {
             push: false,
             rights: ReplicaPushRights::all(),
+            conflict: ReplicaConflictPolicy::Manual,
             full: false,
         };
         let mut sync = ReplicaSync::new("inbox", opts);
@@ -1885,6 +1981,7 @@ mod tests {
             ReplicaSyncOptions {
                 push: true,
                 rights: ReplicaPushRights::all(),
+                conflict: ReplicaConflictPolicy::Manual,
                 full: true,
             },
         );
@@ -2348,6 +2445,7 @@ mod tests {
         let opts = ReplicaSyncOptions {
             push: false,
             rights: ReplicaPushRights::all(),
+            conflict: ReplicaConflictPolicy::Manual,
             full: false,
         };
         let mut sync = ReplicaSync::new("inbox", opts);
@@ -2368,6 +2466,7 @@ mod tests {
             ReplicaSyncOptions {
                 push: false,
                 rights: ReplicaPushRights::all(),
+                conflict: ReplicaConflictPolicy::Manual,
                 full: false,
             },
         );
@@ -2392,6 +2491,7 @@ mod tests {
         let opts = ReplicaSyncOptions {
             push: false,
             rights: ReplicaPushRights::all(),
+            conflict: ReplicaConflictPolicy::Manual,
             full: false,
         };
         let mut sync = ReplicaSync::new("inbox", opts);
@@ -2462,14 +2562,13 @@ mod tests {
     /// A writable sync (`push = true`) with the given per-kind rights.
     fn with_rights(flags: bool, content: bool, add: bool, remove: bool) -> ReplicaSyncOptions {
         ReplicaSyncOptions {
-            push: true,
             rights: ReplicaPushRights {
                 flags,
                 content,
                 add,
                 remove,
             },
-            full: false,
+            ..Default::default()
         }
     }
 
@@ -2600,5 +2699,101 @@ mod tests {
             report.events,
             vec![ReplicaEvent::Created(ReplicaHandle::from("99"))]
         );
+    }
+
+    // headless conflict policy
+
+    /// Sync options with a conflict policy, everything else default.
+    fn with_conflict(policy: ReplicaConflictPolicy) -> ReplicaSyncOptions {
+        ReplicaSyncOptions {
+            conflict: policy,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn prefer_remote_drops_the_local_edit() {
+        let mut sync =
+            ReplicaSync::new("inbox", with_conflict(ReplicaConflictPolicy::PreferRemote));
+        let (pushes, writes, report) =
+            run(&mut sync, vec![edited("1")], vec![remote_rev("1", "r2")]);
+
+        assert!(pushes.is_none(), "prefer-remote pulls, never pushes");
+        assert_eq!(report.conflicts, 0);
+        assert_eq!(report.refreshed, 1, "the remote content is pulled");
+        let pulled = upserted(&writes, "1").expect("a pulled placement");
+        assert_eq!(pulled.object, None, "the local edit is dropped");
+        assert_eq!(pulled.level, ReplicaLevel::Probed);
+    }
+
+    #[test]
+    fn prefer_local_overwrites_the_remote() {
+        let mut sync = ReplicaSync::new("inbox", with_conflict(ReplicaConflictPolicy::PreferLocal));
+        let (pushes, _writes, report) =
+            run(&mut sync, vec![edited("1")], vec![remote_rev("1", "r2")]);
+
+        let pushes = pushes.expect("prefer-local pushes the edit");
+        match &pushes[0] {
+            ReplicaChange::Update {
+                object, if_match, ..
+            } => {
+                assert_eq!(object, &ReplicaHash::from("h2"));
+                assert_eq!(
+                    if_match.as_deref(),
+                    Some("r2"),
+                    "overwrites the current remote revision, not the stale base",
+                );
+            }
+            other => panic!("expected an Update push, got {other:?}"),
+        }
+        assert_eq!(report.conflicts, 0);
+    }
+
+    #[test]
+    fn prefer_local_falls_back_to_conflict_when_it_cannot_push() {
+        let opts = ReplicaSyncOptions {
+            conflict: ReplicaConflictPolicy::PreferLocal,
+            rights: ReplicaPushRights {
+                content: false,
+                ..ReplicaPushRights::all()
+            },
+            ..Default::default()
+        };
+        let mut sync = ReplicaSync::new("inbox", opts);
+        let (pushes, _writes, report) =
+            run(&mut sync, vec![edited("1")], vec![remote_rev("1", "r2")]);
+
+        assert!(pushes.is_none());
+        assert_eq!(report.conflicts, 1, "no push right, so it stays a conflict");
+    }
+
+    #[test]
+    fn keep_both_pulls_the_remote_and_stages_the_local_body() {
+        let mut sync = ReplicaSync::new("inbox", with_conflict(ReplicaConflictPolicy::KeepBoth));
+        let (pushes, writes, report) =
+            run(&mut sync, vec![edited("1")], vec![remote_rev("1", "r2")]);
+
+        assert!(
+            pushes.is_none(),
+            "the duplicate is staged, pushed next sync"
+        );
+        assert_eq!(report.conflicts, 0);
+        assert_eq!(
+            report.refreshed, 1,
+            "the remote is pulled into the placement"
+        );
+        let dup = writes
+            .iter()
+            .find_map(|w| match w {
+                ReplicaWriteOp::UpsertPlacement(p) if p.status == ReplicaStatus::Created => Some(p),
+                _ => None,
+            })
+            .expect("a keep-both duplicate");
+        assert_eq!(
+            dup.object,
+            Some(ReplicaHash::from("h2")),
+            "the duplicate carries the local body",
+        );
+        assert!(dup.handle.as_str().contains("keepboth"));
     }
 }

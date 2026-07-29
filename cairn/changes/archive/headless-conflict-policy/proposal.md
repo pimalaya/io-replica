@@ -1,7 +1,7 @@
 ---
 cairn: change
 id: headless-conflict-policy
-status: draft
+status: landed
 created: 2026-07-28
 ---
 

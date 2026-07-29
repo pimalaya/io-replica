@@ -37,8 +37,6 @@ use proptest::{prelude::*, test_runner::TestCaseError};
 
 use crate::common::{MemRemote, MemStorage, hash};
 
-// ---- ReplicaFlags::merge: element-wise merge loses no intent ------------------
-
 /// A small flag universe keeps the sets overlapping, which is where the
 /// merge actually has work to do.
 fn arb_flags() -> impl Strategy<Value = ReplicaFlags> {
@@ -94,8 +92,6 @@ proptest! {
     }
 }
 
-// ---- coroutine protocol: any arg sequence, never a panic ---------------
-
 /// Any coroutine arg, mostly empty payloads: the point is protocol
 /// misuse (wrong variant, missing arg), not payload realism.
 fn arb_arg() -> impl Strategy<Value = Option<ReplicaArg>> {
@@ -140,8 +136,6 @@ proptest! {
         feed(ReplicaSync::new("inbox", ReplicaSyncOptions::default()), args);
     }
 }
-
-// ---- model: random op interleavings converge without loss --------------
 
 /// One step of the random scenario. ReplicaHandle picks are indices resolved
 /// modulo the live set at execution time, so every generated op is valid
@@ -280,8 +274,6 @@ fn server_handles(client: &ReplicaClient<MemStorage, MemRemote>) -> BTreeSet<Rep
         .map(|c| c.keys().cloned().collect())
         .unwrap_or_default()
 }
-
-// ---- model v2: mutable content, revision races, crash injection --------
 
 /// A storage that drops exactly one write batch (simulating a crash after
 /// the pushes were serviced but before the write landed), then recovers.
@@ -994,8 +986,6 @@ proptest! {
     }
 }
 
-// ---- differential: a full-sync replica and a delta replica agree -------
-
 /// A fake remote shared by two replicas, like one server behind two
 /// devices.
 #[derive(Clone)]
@@ -1155,8 +1145,6 @@ proptest! {
         );
     }
 }
-
-// ---- two active replicas: the full-sync (Neverest) shape ---------------
 
 /// One step with two replicas editing the same server concurrently.
 #[derive(Clone, Debug)]
