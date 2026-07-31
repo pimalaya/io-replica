@@ -20,7 +20,7 @@ use crate::{
     coroutine::*,
     object::ReplicaObject,
     placement::{ReplicaHandle, ReplicaLevel, ReplicaPlacement},
-    remote::ReplicaTier,
+    remote::{ReplicaFetchedBody, ReplicaTier},
 };
 
 /// What an upgrade did.
@@ -219,12 +219,28 @@ impl ReplicaCoroutine for ReplicaUpgrade {
                     patched.meta = Some(item.meta);
 
                     match (self.tier, item.body) {
-                        (ReplicaTier::Full, Some((hash, body))) => {
-                            let object = ReplicaObject {
-                                hash: hash.clone(),
-                                size: body.len(),
+                        (ReplicaTier::Full, Some(body)) => {
+                            // NOTE: the body is either inline bytes to store, or
+                            // a reference to an object the consumer already
+                            // streamed into its blob store (bounded memory) —
+                            // then the store op carries no bytes.
+                            let (object, store_body) = match body {
+                                ReplicaFetchedBody::Inline { hash, bytes } => {
+                                    let object = ReplicaObject {
+                                        hash,
+                                        size: bytes.len(),
+                                    };
+                                    (object, Some(bytes))
+                                }
+                                ReplicaFetchedBody::Persisted { hash, size } => {
+                                    (ReplicaObject { hash, size }, None)
+                                }
                             };
-                            self.ops.push(ReplicaWriteOp::StoreObject { object, body });
+                            let hash = object.hash.clone();
+                            self.ops.push(ReplicaWriteOp::StoreObject {
+                                object,
+                                body: store_body,
+                            });
 
                             // NOTE: the revision travels with the body: the
                             // stored object is the remote content as of the
@@ -297,7 +313,7 @@ mod tests {
     use crate::{
         object::ReplicaHash,
         placement::{ReplicaBase, ReplicaFlags, ReplicaLinkId, ReplicaMeta, ReplicaStatus},
-        remote::ReplicaFetchedItem,
+        remote::{ReplicaFetchedBody, ReplicaFetchedItem},
         storage::ReplicaLoaded,
         upgrade::*,
     };
@@ -380,7 +396,10 @@ mod tests {
             handle: ReplicaHandle::from("1"),
             link_id: ReplicaLinkId::from("msg-b"),
             meta: ReplicaMeta("hdr".into()),
-            body: Some((ReplicaHash::from("h-b"), b"body".to_vec())),
+            body: Some(ReplicaFetchedBody::Inline {
+                hash: ReplicaHash::from("h-b"),
+                bytes: b"body".to_vec(),
+            }),
             revision: None,
         }];
         let ops = match up.resume(Some(ReplicaArg::Fetch(items))) {
@@ -395,6 +414,111 @@ mod tests {
         };
         assert_eq!(report.fetched, 1);
         assert_eq!(report.deduped, 0);
+    }
+
+    #[test]
+    fn fetch_results_are_matched_by_handle_not_order() {
+        // A pooled or reordered fetch may return results in any order; each must
+        // land on its own handle, so a concurrent consumer is correct.
+        let loaded = ReplicaLoaded {
+            placements: vec![
+                probed("1", Some("msg-a"), ReplicaLevel::Meta),
+                probed("2", Some("msg-b"), ReplicaLevel::Meta),
+            ],
+            checkpoint: None,
+        };
+        let mut up = ReplicaUpgrade::new(
+            "inbox",
+            vec![ReplicaHandle::from("1"), ReplicaHandle::from("2")],
+            ReplicaTier::Full,
+        );
+        let _ = up.resume(None);
+        let _ = up.resume(Some(ReplicaArg::Load(loaded)));
+        let _ = up.resume(Some(ReplicaArg::LookupObject(BTreeMap::new())));
+
+        // Results returned in the reverse of the requested order.
+        let items = vec![
+            ReplicaFetchedItem {
+                handle: ReplicaHandle::from("2"),
+                link_id: ReplicaLinkId::from("msg-b"),
+                meta: ReplicaMeta("h".into()),
+                body: Some(ReplicaFetchedBody::Inline {
+                    hash: ReplicaHash::from("h-b"),
+                    bytes: b"bbb".to_vec(),
+                }),
+                revision: None,
+            },
+            ReplicaFetchedItem {
+                handle: ReplicaHandle::from("1"),
+                link_id: ReplicaLinkId::from("msg-a"),
+                meta: ReplicaMeta("h".into()),
+                body: Some(ReplicaFetchedBody::Inline {
+                    hash: ReplicaHash::from("h-a"),
+                    bytes: b"aaaaa".to_vec(),
+                }),
+                revision: None,
+            },
+        ];
+        let ops = match up.resume(Some(ReplicaArg::Fetch(items))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+
+        // Each handle's placement pins its own object, not the other's.
+        let object_for = |handle: &str| {
+            ops.iter().find_map(|op| match op {
+                ReplicaWriteOp::UpsertPlacement(p) if p.handle.as_str() == handle => {
+                    p.object.clone()
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(object_for("1"), Some(ReplicaHash::from("h-a")));
+        assert_eq!(object_for("2"), Some(ReplicaHash::from("h-b")));
+    }
+
+    #[test]
+    fn a_persisted_body_stores_the_object_without_bytes() {
+        // A consumer that streamed the body straight into its blob store reports
+        // it by (hash, size); the engine records the object with no bytes.
+        let loaded = ReplicaLoaded {
+            placements: vec![probed("1", Some("msg-b"), ReplicaLevel::Meta)],
+            checkpoint: None,
+        };
+        let mut up =
+            ReplicaUpgrade::new("inbox", vec![ReplicaHandle::from("1")], ReplicaTier::Full);
+        let _ = up.resume(None);
+        let _ = up.resume(Some(ReplicaArg::Load(loaded)));
+        let _ = up.resume(Some(ReplicaArg::LookupObject(BTreeMap::new())));
+
+        let items = vec![ReplicaFetchedItem {
+            handle: ReplicaHandle::from("1"),
+            link_id: ReplicaLinkId::from("msg-b"),
+            meta: ReplicaMeta("hdr".into()),
+            body: Some(ReplicaFetchedBody::Persisted {
+                hash: ReplicaHash::from("h-b"),
+                size: 4096,
+            }),
+            revision: None,
+        }];
+        let ops = match up.resume(Some(ReplicaArg::Fetch(items))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+        match &ops[0] {
+            ReplicaWriteOp::StoreObject { object, body } => {
+                assert_eq!(object.hash, ReplicaHash::from("h-b"));
+                assert_eq!(object.size, 4096, "size comes from the report, not bytes");
+                assert!(body.is_none(), "no bytes: the fetch already persisted them");
+            }
+            other => panic!("expected StoreObject, got {other:?}"),
+        }
+        // The placement still pins the object and rises to Full.
+        assert!(matches!(
+            &ops[1],
+            ReplicaWriteOp::UpsertPlacement(p)
+                if p.object == Some(ReplicaHash::from("h-b")) && p.level == ReplicaLevel::Full
+        ));
     }
 
     #[test]
@@ -423,7 +547,10 @@ mod tests {
             handle: ReplicaHandle::from("1"),
             link_id: ReplicaLinkId::from("msg-b"),
             meta: ReplicaMeta("hdr".into()),
-            body: Some((ReplicaHash::from("h-b"), b"body".to_vec())),
+            body: Some(ReplicaFetchedBody::Inline {
+                hash: ReplicaHash::from("h-b"),
+                bytes: b"body".to_vec(),
+            }),
             revision: Some("r7".into()),
         }];
         let ops = match up.resume(Some(ReplicaArg::Fetch(items))) {
@@ -611,7 +738,10 @@ mod tests {
             handle: ReplicaHandle::from("2"),
             link_id: ReplicaLinkId::from("msg-b"),
             meta: ReplicaMeta("hdr".into()),
-            body: Some((ReplicaHash::from("h-b"), b"body".to_vec())),
+            body: Some(ReplicaFetchedBody::Inline {
+                hash: ReplicaHash::from("h-b"),
+                bytes: b"body".to_vec(),
+            }),
             revision: None,
         }];
         let _ = up.resume(Some(ReplicaArg::Fetch(items)));

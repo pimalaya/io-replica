@@ -17,8 +17,8 @@ use io_replica::{
     object::{ReplicaHash, ReplicaObject},
     placement::{ReplicaFlags, ReplicaHandle, ReplicaLinkId, ReplicaMeta, ReplicaPlacement},
     remote::{
-        ReplicaFetchedItem, ReplicaPushOutcome, ReplicaPushResult, ReplicaRemoteItem,
-        ReplicaRemoteSnapshot, ReplicaTier,
+        ReplicaFetchedBody, ReplicaFetchedItem, ReplicaPushOutcome, ReplicaPushResult,
+        ReplicaRemoteItem, ReplicaRemoteSnapshot, ReplicaTier,
     },
     storage::ReplicaLoaded,
 };
@@ -88,7 +88,8 @@ impl ReplicaStorage for MemStorage {
                     self.placements.remove(&(collection, handle));
                 }
                 ReplicaWriteOp::StoreObject { object, body } => {
-                    self.objects.insert(object.hash.clone(), (object, body));
+                    self.objects
+                        .insert(object.hash.clone(), (object, body.unwrap_or_default()));
                 }
                 ReplicaWriteOp::SetCheckpoint {
                     collection,
@@ -353,7 +354,10 @@ impl ReplicaRemote for MemRemote {
                 ReplicaTier::Meta => None,
                 ReplicaTier::Full => {
                     self.full_fetches.push(handle.clone());
-                    Some((hash(&item.body), item.body.clone()))
+                    Some(ReplicaFetchedBody::Inline {
+                        hash: hash(&item.body),
+                        bytes: item.body.clone(),
+                    })
                 }
             };
 

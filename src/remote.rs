@@ -65,6 +65,32 @@ pub struct ReplicaRemoteSnapshot {
     pub checkpoint: ReplicaCheckpoint,
 }
 
+/// The body a `Full` fetch reports for an item.
+///
+/// A consumer that can stream MAY persist the body straight into its blob store
+/// and report it as [`Persisted`](ReplicaFetchedBody::Persisted), so the engine
+/// never holds a full body in memory (bounded-memory transfer); a consumer that
+/// returns [`Inline`](ReplicaFetchedBody::Inline) bytes has the engine store
+/// them. Either way the engine indexes the object from its `(hash, size)`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReplicaFetchedBody {
+    /// The body bytes and their content hash, for the engine to store.
+    Inline {
+        /// Content hash of the bytes.
+        hash: ReplicaHash,
+        /// The body bytes.
+        bytes: Vec<u8>,
+    },
+    /// An object the consumer already persisted into its blob store during the
+    /// fetch; the engine records it by `(hash, size)` and writes no bytes.
+    Persisted {
+        /// Content hash of the persisted object.
+        hash: ReplicaHash,
+        /// Size of the persisted object, in bytes.
+        size: usize,
+    },
+}
+
 /// The result of fetching one item at a requested tier.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplicaFetchedItem {
@@ -75,8 +101,10 @@ pub struct ReplicaFetchedItem {
     /// The cached summary (always set; projected from the body where the
     /// backend has no cheap summary tier).
     pub meta: ReplicaMeta,
-    /// The body and its content hash; `None` at [`ReplicaTier::Meta`].
-    pub body: Option<(ReplicaHash, Vec<u8>)>,
+    /// The body; `None` at [`ReplicaTier::Meta`]. At `Full` it is either inline
+    /// bytes for the engine to store or a reference to an object the consumer
+    /// already streamed into its blob store.
+    pub body: Option<ReplicaFetchedBody>,
     /// The remote content revision the fetched body corresponds to, for
     /// mutable-content backends; `None` where content is immutable.
     pub revision: Option<String>,

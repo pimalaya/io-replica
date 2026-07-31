@@ -115,8 +115,10 @@ pub enum ReplicaWriteOp {
     StoreObject {
         /// The object metadata.
         object: ReplicaObject,
-        /// The body bytes.
-        body: Vec<u8>,
+        /// The body bytes, or `None` when the consumer already persisted the
+        /// object into its blob store during a streaming fetch — the engine
+        /// then only records the object (`object`), writing no bytes.
+        body: Option<Vec<u8>>,
     },
     /// Set a collection's sync checkpoint.
     SetCheckpoint {

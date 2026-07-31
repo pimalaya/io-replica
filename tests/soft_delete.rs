@@ -93,7 +93,8 @@ impl ReplicaStorage for SoftDeleteStorage {
                     self.hidden.insert((collection, handle));
                 }
                 ReplicaWriteOp::StoreObject { object, body } => {
-                    self.objects.insert(object.hash.clone(), (object, body));
+                    self.objects
+                        .insert(object.hash.clone(), (object, body.unwrap_or_default()));
                 }
                 ReplicaWriteOp::SetCheckpoint {
                     collection,

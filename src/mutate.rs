@@ -174,7 +174,7 @@ impl ReplicaMutate {
                 vec![
                     ReplicaWriteOp::StoreObject {
                         object: object.clone(),
-                        body: body.clone(),
+                        body: Some(body.clone()),
                     },
                     ReplicaWriteOp::UpsertPlacement(source),
                 ]
