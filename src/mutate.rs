@@ -18,8 +18,8 @@ use crate::{
     coroutine::*,
     object::ReplicaObject,
     placement::{
-        ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaMeta, ReplicaOrigin, ReplicaPlacement,
-        ReplicaStatus,
+        ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta, ReplicaOrigin,
+        ReplicaPlacement, ReplicaStatus,
     },
 };
 
@@ -80,17 +80,38 @@ pub enum ReplicaMutation {
         /// The collection to move it into.
         target: ReplicaCollectionId,
     },
+    /// Create a brand-new, locally-authored item with no remote origin (compose,
+    /// import). Stages a pending create the next sync pushes as an append (the
+    /// body is uploaded), not a server-side copy. Reads no existing source.
+    Add {
+        /// The provisional local handle the create is staged under, rekeyed to
+        /// the server-assigned handle when the push reports it.
+        handle: ReplicaHandle,
+        /// The item's cross-source link id (its `Message-ID`, …).
+        link_id: ReplicaLinkId,
+        /// The initial flag set.
+        flags: ReplicaFlags,
+        /// The new body's object metadata.
+        object: ReplicaObject,
+        /// The new body bytes.
+        body: Vec<u8>,
+        /// The summary, when the consumer projects one.
+        meta: Option<ReplicaMeta>,
+    },
 }
 
 impl ReplicaMutation {
-    /// The source handle the mutation reads in the coroutine's collection.
-    fn handle(&self) -> &ReplicaHandle {
+    /// The source handle the mutation reads in the coroutine's collection, or
+    /// `None` for [`Add`](Self::Add), which creates a placement rather than
+    /// reading one.
+    fn handle(&self) -> Option<&ReplicaHandle> {
         match self {
-            Self::SetFlags { handle, .. } => handle,
-            Self::Remove(handle) => handle,
-            Self::Edit { handle, .. } => handle,
-            Self::Copy { handle, .. } => handle,
-            Self::Move { handle, .. } => handle,
+            Self::SetFlags { handle, .. } => Some(handle),
+            Self::Remove(handle) => Some(handle),
+            Self::Edit { handle, .. } => Some(handle),
+            Self::Copy { handle, .. } => Some(handle),
+            Self::Move { handle, .. } => Some(handle),
+            Self::Add { .. } => None,
         }
     }
 }
@@ -101,6 +122,9 @@ pub enum ReplicaMutateError {
     /// The targeted handle has no placement in the collection.
     #[error("Offline MUTATE failed: unknown handle {0}")]
     UnknownHandle(String),
+    /// An `Add` names a link id a live placement already holds.
+    #[error("Offline MUTATE failed: link id already present: {0}")]
+    LinkExists(String),
     /// The driver fed back an arg that does not match the pending yield.
     #[error("Offline MUTATE failed: unexpected coroutine arg")]
     UnexpectedArg,
@@ -214,7 +238,47 @@ impl ReplicaMutate {
                 });
                 vec![ReplicaWriteOp::UpsertPlacement(source)]
             }
+            // Add reads no source; it is staged via `create_writes`.
+            ReplicaMutation::Add { .. } => self.create_writes(),
         }
+    }
+
+    /// Stages the writes for an [`Add`](ReplicaMutation::Add): a locally-authored
+    /// `Created` placement with no base and no origin (so the next sync appends
+    /// it, uploading the body, rather than server-copying), plus its object.
+    fn create_writes(&self) -> Vec<ReplicaWriteOp> {
+        let ReplicaMutation::Add {
+            handle,
+            link_id,
+            flags,
+            object,
+            body,
+            meta,
+        } = &self.mutation
+        else {
+            return Vec::new();
+        };
+
+        let create = ReplicaPlacement {
+            collection: self.collection.clone(),
+            handle: handle.clone(),
+            link_id: Some(link_id.clone()),
+            object: Some(object.hash.clone()),
+            level: ReplicaLevel::Full,
+            meta: meta.clone(),
+            flags: flags.clone(),
+            status: ReplicaStatus::Created,
+            conflict_revision: None,
+            base: None,
+            origin: None,
+        };
+        vec![
+            ReplicaWriteOp::StoreObject {
+                object: object.clone(),
+                body: Some(body.clone()),
+            },
+            ReplicaWriteOp::UpsertPlacement(create),
+        ]
     }
 }
 
@@ -235,20 +299,31 @@ impl ReplicaCoroutine for ReplicaMutate {
                 ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad(self.collection.clone()))
             }
             (State::PendingLoad, Some(ReplicaArg::Load(loaded))) => {
-                let handle = self.mutation.handle();
-
-                let Some(placement) = loaded.placements.into_iter().find(|p| &p.handle == handle)
-                else {
-                    let err = ReplicaMutateError::UnknownHandle(handle.as_str().into());
-                    return ReplicaCoroutineState::Complete(Err(err));
+                let ops = if let ReplicaMutation::Add { link_id, .. } = &self.mutation {
+                    // No source to read; guard against re-creating a live item.
+                    let collides = loaded.placements.iter().any(|p| {
+                        p.status != ReplicaStatus::Tombstone && p.link_id.as_ref() == Some(link_id)
+                    });
+                    if collides {
+                        let err = ReplicaMutateError::LinkExists(link_id.0.clone());
+                        return ReplicaCoroutineState::Complete(Err(err));
+                    }
+                    self.create_writes()
+                } else {
+                    let handle = self
+                        .mutation
+                        .handle()
+                        .expect("non-Add mutation has a handle");
+                    let Some(placement) =
+                        loaded.placements.into_iter().find(|p| &p.handle == handle)
+                    else {
+                        let err = ReplicaMutateError::UnknownHandle(handle.as_str().into());
+                        return ReplicaCoroutineState::Complete(Err(err));
+                    };
+                    self.writes(placement)
                 };
 
-                let ops = self.writes(placement);
-                debug!(
-                    "stage local change on {}, {} write(s)",
-                    handle.as_str(),
-                    ops.len()
-                );
+                debug!("stage local change, {} write(s)", ops.len());
                 trace!("writes: {ops:?}");
 
                 self.state = State::PendingWrite;
@@ -416,6 +491,111 @@ mod tests {
                 assert_eq!(h, "nope");
             }
             state => panic!("expected UnknownHandle, got {state:?}"),
+        }
+    }
+
+    #[test]
+    fn add_stages_an_append_create() {
+        // A locally-authored item stages a Created placement with no base and
+        // no origin, plus its body — the shape the sync pushes as an append
+        // (uploading the body), not a server-side copy.
+        use crate::object::{ReplicaHash, ReplicaObject};
+
+        let mutation = ReplicaMutation::Add {
+            handle: ReplicaHandle::from("draft-1"),
+            link_id: ReplicaLinkId("mid:new".into()),
+            flags: ReplicaFlags::from_iter(["\\Draft"]),
+            object: ReplicaObject {
+                hash: ReplicaHash::from("deadbeef"),
+                size: 5,
+            },
+            body: b"hello".to_vec(),
+            meta: Some(ReplicaMeta("{\"v\":1}".into())),
+        };
+        let mut mutate = ReplicaMutate::new("inbox", mutation);
+        let _ = mutate.resume(None);
+
+        // Add reads no source, but still loads to guard collisions; the loaded
+        // item is unrelated (no link id), so no collision.
+        let ops = match mutate.resume(Some(ReplicaArg::Load(loaded("other")))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+
+        let ReplicaWriteOp::StoreObject { body, object } = &ops[0] else {
+            panic!("expected StoreObject, got {:?}", ops[0]);
+        };
+        assert_eq!(body.as_deref(), Some(&b"hello"[..]));
+        assert_eq!(object.hash, ReplicaHash::from("deadbeef"));
+
+        let ReplicaWriteOp::UpsertPlacement(p) = &ops[1] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[1]);
+        };
+        assert_eq!(p.status, ReplicaStatus::Created);
+        assert!(p.base.is_none(), "no prior sync");
+        assert!(p.origin.is_none(), "an append, not a server copy");
+        assert_eq!(p.link_id, Some(ReplicaLinkId("mid:new".into())));
+        assert_eq!(p.level, ReplicaLevel::Full);
+        assert!(p.flags.contains("\\Draft"));
+    }
+
+    #[test]
+    fn add_rejects_a_live_link_id_collision() {
+        use crate::object::{ReplicaHash, ReplicaObject};
+
+        let mutation = ReplicaMutation::Add {
+            handle: ReplicaHandle::from("draft-1"),
+            link_id: ReplicaLinkId("mid:dup".into()),
+            flags: ReplicaFlags::default(),
+            object: ReplicaObject {
+                hash: ReplicaHash::from("deadbeef"),
+                size: 1,
+            },
+            body: b"x".to_vec(),
+            meta: None,
+        };
+        let mut mutate = ReplicaMutate::new("inbox", mutation);
+        let _ = mutate.resume(None);
+
+        // A live placement already holds mid:dup.
+        let mut loaded = loaded("existing");
+        loaded.placements[0].link_id = Some(ReplicaLinkId("mid:dup".into()));
+
+        match mutate.resume(Some(ReplicaArg::Load(loaded))) {
+            ReplicaCoroutineState::Complete(Err(ReplicaMutateError::LinkExists(l))) => {
+                assert_eq!(l, "mid:dup");
+            }
+            state => panic!("expected LinkExists, got {state:?}"),
+        }
+    }
+
+    #[test]
+    fn add_over_a_tombstone_link_id_is_allowed() {
+        // A tombstoned item with the same link id does not block a re-create
+        // (the delete is in flight; the new item supersedes it).
+        use crate::object::{ReplicaHash, ReplicaObject};
+
+        let mutation = ReplicaMutation::Add {
+            handle: ReplicaHandle::from("draft-1"),
+            link_id: ReplicaLinkId("mid:gone".into()),
+            flags: ReplicaFlags::default(),
+            object: ReplicaObject {
+                hash: ReplicaHash::from("deadbeef"),
+                size: 1,
+            },
+            body: b"x".to_vec(),
+            meta: None,
+        };
+        let mut mutate = ReplicaMutate::new("inbox", mutation);
+        let _ = mutate.resume(None);
+
+        let mut loaded = loaded("existing");
+        loaded.placements[0].link_id = Some(ReplicaLinkId("mid:gone".into()));
+        loaded.placements[0].status = ReplicaStatus::Tombstone;
+
+        match mutate.resume(Some(ReplicaArg::Load(loaded))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(_)) => {}
+            state => panic!("expected WantsWrite, got {state:?}"),
         }
     }
 
