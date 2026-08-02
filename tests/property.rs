@@ -621,6 +621,10 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
                         ReplicaMutation::Move {
                             handle: handle.clone(),
                             target: "archive".into(),
+                            placeholder: ReplicaHandle::from(format!(
+                                "move:archive:{}",
+                                handle.as_str()
+                            )),
                         },
                     );
                     if staged.is_ok() {

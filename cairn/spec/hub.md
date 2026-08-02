@@ -45,19 +45,30 @@ and fetches nothing.
 - THEN the other source projects the item dirty, so its next sync pushes the change
 
 ### Requirement: The hub propagates a delete across sources
-`ReplicaHubItem` SHALL carry a `deleted` flag. When `absorb` sees a
-`DropPlacement` of a bound member, it SHALL mark the item deleted and remove that
-source's binding. `project` SHALL then yield a `Tombstone` placement (keeping the
-content, so edit-beats-delete still applies) for every source that still holds
-the item, and nothing for a source that lacks it (a deleted item is never
-copied). Once no source holds the item it is pruned. A later live upsert SHALL
-clear `deleted`, so a re-add or an edit-beats-delete resurrection brings the item
-back on every source.
+`ReplicaHubItem` SHALL carry a `deleted` flag. An item becomes deleted two ways,
+both feeding the same projection: when `absorb` sees a `DropPlacement` of a bound
+member (a member removed under the source's feet), it SHALL mark the item deleted
+and remove that source's binding; and when `absorb` sees an `UpsertPlacement`
+whose `status` is `Tombstone` (a client-staged `Remove`, or a `Move`'s source
+side), it SHALL mark the item deleted and **keep** the source's binding — its
+`handle` and `base` — so the projection knows the remote handle to push the
+remove against, without adopting the tombstone's content or clearing the delete.
+`project` SHALL then yield a `Tombstone` placement (keeping the content, so
+edit-beats-delete still applies) for every source that still holds the item, and
+nothing for a source that lacks it (a deleted item is never copied). Once no
+source holds the item it is pruned. A **live-status** upsert SHALL clear
+`deleted`, so a re-add or an edit-beats-delete resurrection brings the item back
+on every source.
 
 #### Scenario: A delete propagates as a tombstone
 - GIVEN two sources holding one item, and one source removing it
 - WHEN the other source's placements are projected
 - THEN it projects a `Tombstone` for that item, so its next sync pushes a remove
+
+#### Scenario: A client-staged remove marks the item deleted
+- GIVEN an item bound to a source
+- WHEN an `UpsertPlacement` with `Tombstone` status is absorbed for that source
+- THEN the item is deleted, its binding is kept, and the source projects a `Tombstone`
 
 #### Scenario: A live upsert resurrects a delete in flight
 - GIVEN an item marked deleted on one source

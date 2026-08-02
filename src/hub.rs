@@ -275,6 +275,24 @@ impl ReplicaHub {
             sources: BTreeMap::new(),
         });
 
+        // NOTE: a `Tombstone`-status upsert is a client-staged delete (a
+        // `Remove`, or a `Move`'s source side): mark the item deleted and keep
+        // this source's binding — its handle and base — so the projection knows
+        // the remote handle to push the remove against. Do not adopt the
+        // tombstone's content or clear the delete; the kept content lets
+        // edit-beats-delete still resurrect it if the source's server changed it.
+        if placement.status == ReplicaStatus::Tombstone {
+            item.deleted = true;
+            item.sources.insert(
+                source.clone(),
+                ReplicaSourceBinding {
+                    handle: placement.handle.clone(),
+                    base: placement.base.clone(),
+                },
+            );
+            return;
+        }
+
         // NOTE: a live upsert resurrects a cross-source delete in flight
         // (edit/add beats delete): the item comes back on every source.
         item.deleted = false;
@@ -581,6 +599,38 @@ mod tests {
         // NOTE: left no longer holds it, so it projects nothing (not a
         // re-copy).
         assert!(placements(&hub, "left").is_empty());
+    }
+
+    #[test]
+    fn a_client_staged_tombstone_upsert_marks_deleted_and_keeps_the_binding() {
+        // NOTE: a Remove (or a Move's source side) stages a Tombstone-status
+        // upsert, not a drop. Absorbing it must mark the item deleted while
+        // keeping the binding, so the projection pushes the remove — unlike a
+        // live upsert, which would resurrect it.
+        let mut hub = hub_with_left(&["seen"]);
+
+        let mut tombstone = placements(&hub, "left").pop().unwrap();
+        tombstone.status = ReplicaStatus::Tombstone;
+        hub.absorb(
+            &ReplicaSourceId::from("left"),
+            &[ReplicaWriteOp::UpsertPlacement(tombstone)],
+        );
+
+        let item = hub.items.get(&ReplicaLinkId::from("m1")).expect("kept");
+        assert!(item.deleted, "the staged delete is recorded");
+        assert!(
+            item.sources.contains_key(&ReplicaSourceId::from("left")),
+            "the binding is kept so the projection knows the remote handle",
+        );
+
+        let left = placements(&hub, "left");
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].status, ReplicaStatus::Tombstone);
+        assert_eq!(left[0].handle.as_str(), "l1");
+        assert!(
+            left[0].base.is_some(),
+            "based, so the engine pushes a remove"
+        );
     }
 
     #[test]

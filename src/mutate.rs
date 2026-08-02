@@ -70,15 +70,18 @@ pub enum ReplicaMutation {
         /// The provisional handle the copy is staged under in `target`.
         placeholder: ReplicaHandle,
     },
-    /// Move a placement into `target`: tombstone the source carrying its
-    /// destination, so the next sync pushes one atomic server-side UID MOVE
-    /// (no body re-upload, no window where it is on neither side). The target
-    /// picks it up on its own next enumerate.
+    /// Move a placement into `target`: stage a `Created` placement in `target`
+    /// under `placeholder` (carrying the source origin), and tombstone the
+    /// source. The next sync derives a copy into the target and a remove from
+    /// the source — the target create and the source tombstone land in their
+    /// respective collection hubs.
     Move {
         /// The source placement to move.
         handle: ReplicaHandle,
         /// The collection to move it into.
         target: ReplicaCollectionId,
+        /// The provisional handle the move is staged under in `target`.
+        placeholder: ReplicaHandle,
     },
     /// Create a brand-new, locally-authored item with no remote origin (compose,
     /// import). Stages a pending create the next sync pushes as an append (the
@@ -226,17 +229,40 @@ impl ReplicaMutate {
                 };
                 vec![ReplicaWriteOp::UpsertPlacement(create)]
             }
-            ReplicaMutation::Move { target, .. } => {
-                // Tombstone the source, carrying the move destination in its
-                // origin so the sync pushes a UID MOVE rather than a trash
-                // delete. No target placement: it appears there on the next
-                // enumerate.
+            ReplicaMutation::Move {
+                target,
+                placeholder,
+                ..
+            } => {
+                // Stage a Created placement in the target (like Copy), carrying
+                // the source origin, and tombstone the source. The sync derives
+                // a copy into the target and a remove from the source; a hub
+                // binding cannot carry a single atomic UID MOVE.
+                let create = ReplicaPlacement {
+                    collection: target.clone(),
+                    handle: placeholder.clone(),
+                    link_id: source.link_id.clone(),
+                    object: source.object.clone(),
+                    level: source.level,
+                    meta: source.meta.clone(),
+                    flags: source.flags.clone(),
+                    status: ReplicaStatus::Created,
+                    conflict_revision: None,
+                    base: None,
+                    origin: Some(ReplicaOrigin {
+                        collection: source.collection.clone(),
+                        handle: source.handle.clone(),
+                    }),
+                };
                 source.status = ReplicaStatus::Tombstone;
                 source.origin = Some(ReplicaOrigin {
                     collection: target.clone(),
                     handle: source.handle.clone(),
                 });
-                vec![ReplicaWriteOp::UpsertPlacement(source)]
+                vec![
+                    ReplicaWriteOp::UpsertPlacement(create),
+                    ReplicaWriteOp::UpsertPlacement(source),
+                ]
             }
             // Add reads no source; it is staged via `create_writes`.
             ReplicaMutation::Add { .. } => self.create_writes(),
@@ -766,12 +792,14 @@ mod tests {
     }
 
     #[test]
-    fn move_tombstones_source_with_target() {
-        // A move tombstones the source and records its destination in origin,
-        // so the sync pushes a UID MOVE rather than a trash delete.
+    fn move_stages_target_create_and_source_tombstone() {
+        // A move stages a Created placement in the target (carrying the source
+        // origin) and tombstones the source, so the sync copies into the target
+        // and removes from the source.
         let mutation = ReplicaMutation::Move {
             handle: ReplicaHandle::from("1"),
             target: "archive".into(),
+            placeholder: ReplicaHandle::from("tmp-1"),
         };
         let mut mutate = ReplicaMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
@@ -780,17 +808,36 @@ mod tests {
             ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
             state => panic!("expected WantsWrite, got {state:?}"),
         };
-        let ReplicaWriteOp::UpsertPlacement(p) = &ops[0] else {
+
+        let ReplicaWriteOp::UpsertPlacement(create) = &ops[0] else {
             panic!("expected UpsertPlacement, got {:?}", ops[0]);
         };
+        assert_eq!(create.collection.as_str(), "archive");
+        assert_eq!(create.handle.as_str(), "tmp-1");
+        assert_eq!(create.status, ReplicaStatus::Created);
+        assert!(create.base.is_none());
         assert_eq!(
-            p.collection.as_str(),
-            "inbox",
-            "the source row, not a target one"
+            create
+                .origin
+                .as_ref()
+                .expect("the move carries its origin")
+                .handle
+                .as_str(),
+            "1",
         );
-        assert_eq!(p.status, ReplicaStatus::Tombstone);
+
+        let ReplicaWriteOp::UpsertPlacement(source) = &ops[1] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[1]);
+        };
         assert_eq!(
-            p.origin
+            source.collection.as_str(),
+            "inbox",
+            "the source row, tombstoned"
+        );
+        assert_eq!(source.status, ReplicaStatus::Tombstone);
+        assert_eq!(
+            source
+                .origin
                 .as_ref()
                 .expect("a move target")
                 .collection

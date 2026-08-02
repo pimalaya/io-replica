@@ -215,7 +215,17 @@ impl ReplicaCoroutine for ReplicaUpgrade {
                         continue;
                     };
                     let mut patched = placement.clone();
-                    patched.link_id = Some(item.link_id);
+                    // NOTE: keep an already-resolved link id. A fetch establishes
+                    // the link only for a not-yet-linked item (a `Meta` upgrade of
+                    // a probed placement); a `Full` body fetch of a linked item
+                    // must not re-identify it. Two tiers can otherwise disagree on
+                    // the link (a server ENVELOPE reporting a `Message-ID` the body
+                    // parser does not, or a differently formatted date in the
+                    // fallback digest), which would strand the linked item and
+                    // duplicate it under the body's link.
+                    if patched.link_id.is_none() {
+                        patched.link_id = Some(item.link_id);
+                    }
                     patched.meta = Some(item.meta);
 
                     match (self.tier, item.body) {
@@ -475,6 +485,93 @@ mod tests {
         };
         assert_eq!(object_for("1"), Some(ReplicaHash::from("h-a")));
         assert_eq!(object_for("2"), Some(ReplicaHash::from("h-b")));
+    }
+
+    #[test]
+    fn a_full_fetch_keeps_an_already_resolved_link_id() {
+        // A Full body fetch must not re-identify an already-linked item. If the
+        // body parses to a different link than the Meta tier resolved (a server
+        // ENVELOPE reporting a Message-ID the body parser misses, say), the
+        // placement keeps its original link and simply rises to Full — it is not
+        // duplicated under the body's link (which stranded the Meta item and
+        // re-fetched it every sync).
+        let loaded = ReplicaLoaded {
+            placements: vec![probed("1", Some("mid:real"), ReplicaLevel::Meta)],
+            checkpoint: None,
+        };
+        let mut up =
+            ReplicaUpgrade::new("inbox", vec![ReplicaHandle::from("1")], ReplicaTier::Full);
+        let _ = up.resume(None);
+        let _ = up.resume(Some(ReplicaArg::Load(loaded)));
+        let _ = up.resume(Some(ReplicaArg::LookupObject(BTreeMap::new())));
+
+        let items = vec![ReplicaFetchedItem {
+            handle: ReplicaHandle::from("1"),
+            // The body parses to a *different* link than the Meta tier resolved.
+            link_id: ReplicaLinkId::from("alt:divergent"),
+            meta: ReplicaMeta("hdr".into()),
+            body: Some(ReplicaFetchedBody::Persisted {
+                hash: ReplicaHash::from("h"),
+                size: 10,
+            }),
+            revision: None,
+        }];
+        let ops = match up.resume(Some(ReplicaArg::Fetch(items))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+        let placement = ops
+            .iter()
+            .find_map(|op| match op {
+                ReplicaWriteOp::UpsertPlacement(p) => Some(p),
+                _ => None,
+            })
+            .expect("a placement upsert");
+        assert_eq!(
+            placement.link_id,
+            Some(ReplicaLinkId::from("mid:real")),
+            "the Full fetch keeps the Meta-resolved link, not the body's"
+        );
+        assert_eq!(placement.level, ReplicaLevel::Full);
+    }
+
+    #[test]
+    fn a_meta_fetch_still_sets_the_link_of_an_unlinked_item() {
+        // The complement: a not-yet-linked (probed) item DOES take the fetched
+        // link — that is how the Meta tier establishes identity.
+        let loaded = ReplicaLoaded {
+            placements: vec![probed("1", None, ReplicaLevel::Probed)],
+            checkpoint: None,
+        };
+        let mut up =
+            ReplicaUpgrade::new("inbox", vec![ReplicaHandle::from("1")], ReplicaTier::Meta);
+        let _ = up.resume(None);
+        let _ = up.resume(Some(ReplicaArg::Load(loaded)));
+        let _ = up.resume(Some(ReplicaArg::LookupObject(BTreeMap::new())));
+
+        let items = vec![ReplicaFetchedItem {
+            handle: ReplicaHandle::from("1"),
+            link_id: ReplicaLinkId::from("mid:resolved"),
+            meta: ReplicaMeta("hdr".into()),
+            body: None,
+            revision: None,
+        }];
+        let ops = match up.resume(Some(ReplicaArg::Fetch(items))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+        let placement = ops
+            .iter()
+            .find_map(|op| match op {
+                ReplicaWriteOp::UpsertPlacement(p) => Some(p),
+                _ => None,
+            })
+            .expect("a placement upsert");
+        assert_eq!(
+            placement.link_id,
+            Some(ReplicaLinkId::from("mid:resolved")),
+            "a probed item takes the fetched link"
+        );
     }
 
     #[test]
