@@ -1,17 +1,21 @@
-//! # Standard, blocking offline client
+//! # Blocking reference driver
 //!
 //! A driver that runs any standard-shape coroutine to completion by
 //! servicing each [`ReplicaYield`] through two consumer-supplied traits:
 //! [`ReplicaStorage`] for the index and blob store, [`ReplicaRemote`] for the
 //! protocol seam. These traits live on the consumer side, not inside the
 //! engine, so the I/O-free contract holds: the coroutines still only emit
-//! `Wants`.
+//! `Wants`. The driver itself performs no I/O either, so it needs no std
+//! and no feature gate: blocking happens inside the trait impls.
 //!
-//! A desktop or Neverest consumer backs [`ReplicaRemote`] with io-email's
-//! blocking clients and [`ReplicaStorage`] with sqlite plus a blob dir; an
-//! Android consumer backs [`ReplicaRemote`] with io-imap over JNI.
+//! A desktop or Neverest consumer backs [`ReplicaRemote`] with a blocking
+//! protocol client (io-imap, io-jmap, io-webdav) and [`ReplicaStorage`] with
+//! sqlite plus a blob dir; an Android consumer backs [`ReplicaRemote`] with
+//! io-imap over JNI.
 
-use std::{collections::BTreeMap, fmt, vec::Vec};
+use core::{error, fmt};
+
+use alloc::{collections::BTreeMap, vec::Vec};
 
 use crate::{
     change::{ReplicaChange, ReplicaWriteOp},
@@ -89,9 +93,9 @@ pub trait ReplicaRemote {
 #[derive(Debug)]
 pub enum ReplicaClientError<S, R, C> {
     /// A storage seam call failed.
-    ReplicaStorage(S),
+    Storage(S),
     /// A remote seam call failed.
-    ReplicaRemote(R),
+    Remote(R),
     /// The coroutine itself completed with an error.
     Coroutine(C),
 }
@@ -104,14 +108,14 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ReplicaStorage(err) => write!(f, "ReplicaStorage seam failed: {err}"),
-            Self::ReplicaRemote(err) => write!(f, "ReplicaRemote seam failed: {err}"),
-            Self::Coroutine(err) => write!(f, "Offline engine failed: {err}"),
+            Self::Storage(err) => write!(f, "Storage seam failed: {err}"),
+            Self::Remote(err) => write!(f, "Remote seam failed: {err}"),
+            Self::Coroutine(err) => write!(f, "Replica engine failed: {err}"),
         }
     }
 }
 
-impl<S, R, C> std::error::Error for ReplicaClientError<S, R, C>
+impl<S, R, C> error::Error for ReplicaClientError<S, R, C>
 where
     S: fmt::Display + fmt::Debug,
     R: fmt::Display + fmt::Debug,
@@ -119,7 +123,7 @@ where
 {
 }
 
-/// Std-blocking offline client wrapping a storage and a remote.
+/// Blocking replica client wrapping a storage and a remote.
 pub struct ReplicaClient<S, R> {
     storage: S,
     remote: R,
@@ -179,7 +183,7 @@ where
                     let snapshot = self
                         .remote
                         .enumerate(&collection, cursor)
-                        .map_err(ReplicaClientError::ReplicaRemote)?;
+                        .map_err(ReplicaClientError::Remote)?;
                     arg = Some(ReplicaArg::Enumerate(snapshot));
                 }
                 ReplicaCoroutineState::Yielded(ReplicaYield::WantsFetch {
@@ -190,7 +194,7 @@ where
                     let items = self
                         .remote
                         .fetch(&collection, handles, tier)
-                        .map_err(ReplicaClientError::ReplicaRemote)?;
+                        .map_err(ReplicaClientError::Remote)?;
                     arg = Some(ReplicaArg::Fetch(items));
                 }
                 ReplicaCoroutineState::Yielded(ReplicaYield::WantsPush {
@@ -200,27 +204,27 @@ where
                     let results = self
                         .remote
                         .push(&collection, changes)
-                        .map_err(ReplicaClientError::ReplicaRemote)?;
+                        .map_err(ReplicaClientError::Remote)?;
                     arg = Some(ReplicaArg::Push(results));
                 }
                 ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad(collection)) => {
                     let loaded = self
                         .storage
                         .load(&collection)
-                        .map_err(ReplicaClientError::ReplicaStorage)?;
+                        .map_err(ReplicaClientError::Storage)?;
                     arg = Some(ReplicaArg::Load(loaded));
                 }
                 ReplicaCoroutineState::Yielded(ReplicaYield::WantsLookupObject(links)) => {
                     let known = self
                         .storage
                         .lookup_objects(&links)
-                        .map_err(ReplicaClientError::ReplicaStorage)?;
+                        .map_err(ReplicaClientError::Storage)?;
                     arg = Some(ReplicaArg::LookupObject(known));
                 }
                 ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => {
                     self.storage
                         .write(ops)
-                        .map_err(ReplicaClientError::ReplicaStorage)?;
+                        .map_err(ReplicaClientError::Storage)?;
                     arg = Some(ReplicaArg::Write);
                 }
             }

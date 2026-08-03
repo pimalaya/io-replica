@@ -19,7 +19,7 @@
 //! pushes last-writer-wins on its first sync: the old revision chain is
 //! gone with the old handles, and there is no base revision to gate on.
 
-use core::fmt;
+use core::mem;
 
 use alloc::{
     collections::{BTreeMap, BTreeSet},
@@ -57,10 +57,10 @@ pub struct ReplicaRekeyReport {
 #[derive(Clone, Debug, Error)]
 pub enum ReplicaRekeyError {
     /// The driver fed back an arg that does not match the pending yield.
-    #[error("Offline REKEY failed: unexpected coroutine arg")]
+    #[error("Replica REKEY failed: unexpected coroutine arg")]
     UnexpectedArg,
     /// The driver resumed without the arg the pending yield required.
-    #[error("Offline REKEY failed: missing coroutine arg")]
+    #[error("Replica REKEY failed: missing coroutine arg")]
     MissingArg,
 }
 
@@ -100,8 +100,8 @@ impl ReplicaRekey {
     ) -> Vec<ReplicaWriteOp> {
         let mut writes = Vec::new();
 
-        // pending creates are local staging, not spine: left untouched
-        let old: Vec<ReplicaPlacement> = core::mem::take(&mut self.old)
+        // NOTE: pending creates are local staging, not spine: left untouched
+        let old: Vec<ReplicaPlacement> = mem::take(&mut self.old)
             .into_iter()
             .filter(|p| p.status != ReplicaStatus::Created)
             .collect();
@@ -119,7 +119,7 @@ impl ReplicaRekey {
         }
 
         let mut carried_over = BTreeSet::new();
-        for item in core::mem::take(&mut self.items) {
+        for item in mem::take(&mut self.items) {
             let resolved = links.get(&item.handle);
             let carried = resolved.and_then(|(link, _)| old_by_link.remove(link));
 
@@ -138,8 +138,8 @@ impl ReplicaRekey {
             }
         }
 
-        // an unmatched staged edit survives as a pending create, the same
-        // edit-beats-delete rule the sync applies when a remote delete
+        // NOTE: an unmatched staged edit survives as a pending create, the
+        // same edit-beats-delete rule the sync applies when a remote delete
         // races a local edit; every other unmatched pending state is lost
         // with the old handle space
         for placement in &old {
@@ -270,8 +270,6 @@ impl ReplicaCoroutine for ReplicaRekey {
         &mut self,
         arg: Option<ReplicaArg>,
     ) -> ReplicaCoroutineState<Self::Yield, Self::Return> {
-        trace!("rekey: {}", self.state);
-
         match (&self.state, arg) {
             (State::Start, None) => {
                 debug!("load local state from storage");
@@ -295,8 +293,8 @@ impl ReplicaCoroutine for ReplicaRekey {
                 self.items = snapshot.items;
                 self.checkpoint = Some(snapshot.checkpoint);
 
-                // without a single resolved link id there is nothing to
-                // match against: rebuild the spine without a fetch
+                // NOTE: without a single resolved link id there is nothing
+                // to match against: rebuild the spine without a fetch
                 if !self.old.iter().any(|p| p.link_id.is_some()) {
                     debug!("no link ids to match, rebuild the spine");
                     self.state = State::PendingWrite;
@@ -347,18 +345,6 @@ enum State {
     PendingEnumerate,
     PendingFetch,
     PendingWrite,
-}
-
-impl fmt::Display for State {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Start => f.write_str("start"),
-            Self::PendingLoad => f.write_str("pending load"),
-            Self::PendingEnumerate => f.write_str("pending enumerate"),
-            Self::PendingFetch => f.write_str("pending fetch"),
-            Self::PendingWrite => f.write_str("pending write"),
-        }
-    }
 }
 
 #[cfg(test)]

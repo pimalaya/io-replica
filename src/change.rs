@@ -88,7 +88,7 @@ pub enum ReplicaChange {
 /// The set the four verbs emit; the consumer applies them atomically
 /// against its index and blob store.
 ///
-/// ReplicaObject references derive from placement pointers: a stored placement
+/// Object references derive from placement pointers: a stored placement
 /// references an object once per pointing field (`ReplicaPlacement::object` and
 /// `ReplicaBase::object`). The consumer maintains the counts incrementally, by
 /// diffing an upsert against the stored row it replaces and by releasing

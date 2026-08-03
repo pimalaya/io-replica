@@ -1,11 +1,10 @@
 //! I/O-free coroutine to reconcile a collection with its remote.
 //!
 //! The load-bearing verb. It loads local state, enumerates the remote
-//! delta, then runs a three-way merge of Local, ReplicaBase and
-//! ReplicaRemote per placement: local-won changes are pushed, remote-won
-//! changes are pulled. ReplicaFlags merge element-wise and never conflict
-//! (each flag is independent, so divergent sets fold into their union of
-//! changes);
+//! delta, then runs a three-way merge of local, base and remote per
+//! placement: local-won changes are pushed, remote-won changes are
+//! pulled. Flags merge element-wise and never conflict (each flag is
+//! independent, so divergent sets fold into their union of changes);
 //! only divergent content edits are kept both as a conflict. The merge
 //! compares per-placement identities (flags and a content revision),
 //! never raw bytes: the complete probed spine plus the per-placement
@@ -19,7 +18,7 @@
 //! survives a remote delete as a pending create. Permission gating drops
 //! pushes a read-only source forbids.
 
-use core::{fmt, mem};
+use core::mem;
 
 use alloc::{collections::BTreeMap, collections::BTreeSet, string::String, vec::Vec};
 
@@ -197,10 +196,10 @@ pub struct ReplicaSyncReport {
 #[derive(Clone, Debug, Error)]
 pub enum ReplicaSyncError {
     /// The driver fed back an arg that does not match the pending yield.
-    #[error("Offline SYNC failed: unexpected coroutine arg")]
+    #[error("Replica SYNC failed: unexpected coroutine arg")]
     UnexpectedArg,
     /// The driver resumed without the arg the pending yield required.
-    #[error("Offline SYNC failed: missing coroutine arg")]
+    #[error("Replica SYNC failed: missing coroutine arg")]
     MissingArg,
 }
 
@@ -383,7 +382,7 @@ impl ReplicaSync {
         let remote_present = remote_item.is_some();
 
         match (local_present, based, remote_present) {
-            // local delete or move: both knew it, we removed it here
+            // NOTE: local delete or move: both knew it, we removed it here
             (false, true, true) if local_tombstone => {
                 let local = local.as_ref().expect("local present");
                 let item = remote_item.as_ref().expect("remote present");
@@ -400,7 +399,7 @@ impl ReplicaSync {
                 }
 
                 if !self.opts.push {
-                    // Read-only source: apply the delete locally only.
+                    // NOTE: read-only source: apply the delete locally only.
                     self.drop(handle);
                     return None;
                 }
@@ -437,10 +436,10 @@ impl ReplicaSync {
                     return None;
                 }
 
-                // Hold the drop until the remote confirms it (in PendingPush);
-                // a rejected push keeps the tombstone for the next retry. A
-                // move carries its destination in `origin`; a plain delete has
-                // none, and the consumer routes it to trash.
+                // NOTE: hold the drop until the remote confirms it (in
+                // PendingPush); a rejected push keeps the tombstone for the
+                // next retry. A move carries its destination in `origin`; a
+                // plain delete has none, and the consumer routes it to trash.
                 self.pending_drops.insert(handle.clone());
                 let to = local.origin.as_ref().map(|o| o.collection.clone());
                 Some(ReplicaChange::Remove {
@@ -449,12 +448,12 @@ impl ReplicaSync {
                     if_match: base_revision,
                 })
             }
-            // local delete of something already gone remote
+            // NOTE: local delete of something already gone remote
             (false, _, false) if local_tombstone => {
                 self.drop(handle);
                 None
             }
-            // remote delete: we had it in sync, it vanished upstream
+            // NOTE: remote delete: we had it in sync, it vanished upstream
             (true, true, false) => {
                 let local = local.as_ref().expect("local present");
 
@@ -500,14 +499,14 @@ impl ReplicaSync {
                 self.emit(ReplicaEvent::Vanished(handle.clone()));
                 None
             }
-            // remote add: brand new upstream
+            // NOTE: remote add: brand new upstream
             (false, false, true) => {
                 self.pull_add(&remote_item.expect("remote present"));
                 self.report.pulled += 1;
                 self.emit(ReplicaEvent::Added(handle.clone()));
                 None
             }
-            // present on both: reconcile content, then flags
+            // NOTE: present on both: reconcile content, then flags
             (true, _, true) => {
                 let local = local.as_ref().expect("local present");
                 let item = remote_item.as_ref().expect("remote present");
@@ -524,10 +523,10 @@ impl ReplicaSync {
                     ContentOutcome::Untouched => self.reconcile_flags(local, item),
                 }
             }
-            // local create (no base, not upstream): a pending copy/move or
-            // append. Stage the add; the rekey to the server-assigned handle
-            // is held until the push reports it (in PendingPush). A plain
-            // base-less placement that is not Created is left untouched.
+            // NOTE: local create (no base, not upstream): a pending copy,
+            // move or append. Stage the add; the rekey to the server-assigned
+            // handle is held until the push reports it (in PendingPush). A
+            // plain base-less placement that is not Created is left untouched.
             (true, false, false) => {
                 let local = local.as_ref().expect("local present");
                 if self.opts.may_push(|r| r.add) && local.status == ReplicaStatus::Created {
@@ -561,7 +560,7 @@ impl ReplicaSync {
         item: &ReplicaRemoteItem,
     ) -> ContentOutcome {
         let Some(base) = &local.base else {
-            // A base-less placement that carries a body the remote also
+            // NOTE: a base-less placement that carries a body the remote also
             // holds is a create-collision: both sides minted content for
             // this handle with no shared ancestor, so there is no
             // three-way merge to run. Surface it as a conflict (the remote
@@ -702,10 +701,10 @@ impl ReplicaSync {
     /// Reconciles the flag sets of a placement present on both sides,
     /// returning a push when the local side won any flag.
     ///
-    /// ReplicaFlags merge element-wise ([`ReplicaFlags::merge`]) and never
+    /// Flags merge element-wise ([`ReplicaFlags::merge`]) and never
     /// conflict: divergent sets fold into one merged set that both sides
-    /// converge
-    /// on, pulling the remote-won flags and pushing the local-won ones.
+    /// converge on, pulling the remote-won flags and pushing the local-won
+    /// ones.
     fn reconcile_flags(
         &mut self,
         local: &ReplicaPlacement,
@@ -726,10 +725,10 @@ impl ReplicaSync {
         let push = merged != remote.flags;
 
         match (pull, push) {
-            // in sync, or both sides moved to the same flags: no push,
-            // rebase when the shared move left the base behind, and clean
-            // a dirty placement whose edit turned out to be a no-op (a
-            // flag set put back to its base value would otherwise stay
+            // NOTE: in sync, or both sides moved to the same flags: no
+            // push, rebase when the shared move left the base behind, and
+            // clean a dirty placement whose edit turned out to be a no-op
+            // (a flag set put back to its base value would otherwise stay
             // dirty forever). A staged content edit is not a no-op: it
             // stays dirty (the read-only path lands here with one).
             (false, false) => {
@@ -745,15 +744,15 @@ impl ReplicaSync {
                 }
                 None
             }
-            // the remote won every differing flag: pull the merged set
+            // NOTE: the remote won every differing flag: pull the merged set
             (true, false) => {
                 self.pull_flags(local, &merged);
                 self.report.pulled += 1;
                 self.emit(ReplicaEvent::FlagsChanged(local.handle.clone()));
                 None
             }
-            // the local side won at least one flag: push the merged set.
-            // When the remote won some flags too, they are folded in
+            // NOTE: the local side won at least one flag: push the merged
+            // set. When the remote won some flags too, they are folded in
             // locally right away, dirty on the old base, so a rejected or
             // read-only push re-derives the same merge next sync.
             (pull, true) => {
@@ -771,10 +770,10 @@ impl ReplicaSync {
                     // and do not push
                     return None;
                 }
-                // Hold the rebase until the push is confirmed: a rejected
-                // push must leave the placement dirty so the next sync
-                // retries it, not rebase it onto a state the remote never
-                // took (which QRESYNC would then never revisit).
+                // NOTE: hold the rebase until the push is confirmed: a
+                // rejected push must leave the placement dirty so the next
+                // sync retries it, not rebase it onto a state the remote
+                // never took (which QRESYNC would then never revisit).
                 self.pending_flag_pushes
                     .insert(local.handle.clone(), updated);
                 Some(ReplicaChange::SetFlags {
@@ -821,7 +820,7 @@ impl ReplicaSync {
     /// Pulls a remote content change: the stale local body is dropped and
     /// the base adopts the new revision. The level falls back to probed
     /// (the cached summary describes the old revision; it is kept as a
-    /// display fallback until a meta upgrade refetches it). ReplicaFlags and
+    /// display fallback until a meta upgrade refetches it). Flags and
     /// status are left for the flag reconciliation to settle.
     fn pull_content(
         &mut self,
@@ -938,8 +937,6 @@ impl ReplicaCoroutine for ReplicaSync {
         &mut self,
         arg: Option<ReplicaArg>,
     ) -> ReplicaCoroutineState<Self::Yield, Self::Return> {
-        trace!("sync: {}", self.state);
-
         match (&self.state, arg) {
             (State::Start, None) => {
                 debug!("load local state from storage");
@@ -953,8 +950,9 @@ impl ReplicaCoroutine for ReplicaSync {
                     .into_iter()
                     .map(|p| (p.handle.clone(), p))
                     .collect();
-                // A full sync ignores the checkpoint, so the enumerate yields
-                // the whole remote and the merge reconciles the entire spine.
+                // NOTE: a full sync ignores the checkpoint, so the enumerate
+                // yields the whole remote and the merge reconciles the
+                // entire spine.
                 self.checkpoint = if self.opts.full {
                     None
                 } else {
@@ -1003,7 +1001,7 @@ impl ReplicaCoroutine for ReplicaSync {
             (State::PendingPush, Some(ReplicaArg::Push(results))) => {
                 for result in &results {
                     match result.outcome {
-                        // The remote took the change: rebase a flag or
+                        // NOTE: the remote took the change: rebase a flag or
                         // content push clean, drop a confirmed delete, or
                         // rekey a confirmed create to its server-assigned
                         // handle, so the local state matches what the
@@ -1035,28 +1033,31 @@ impl ReplicaCoroutine for ReplicaSync {
                                     .clone()
                                     .unwrap_or_else(|| result.handle.clone());
                                 match result.assigned.clone() {
-                                    // Remote returned the new handle: rekey.
+                                    // NOTE: remote returned the new handle:
+                                    // rekey.
                                     Some(assigned) => self.rekey_create(
                                         placeholder,
                                         assigned,
                                         result.revision.clone(),
                                     ),
-                                    // No assigned handle (no UIDPLUS): the copy
-                                    // landed, so drop the placeholder; the next
-                                    // enumerate re-adds it by its real handle
-                                    // and links the body by link id.
+                                    // NOTE: no assigned handle (no UIDPLUS):
+                                    // the copy landed, so drop the
+                                    // placeholder; the next enumerate re-adds
+                                    // it by its real handle and links the
+                                    // body by link id.
                                     None => self.drop(&placeholder.handle),
                                 }
                                 self.emit(ReplicaEvent::Created(created));
                             }
                         }
-                        // The remote refused it: leave the dirty placement,
-                        // tombstone or placeholder untouched so the next sync
-                        // retries the push.
+                        // NOTE: the remote refused it: leave the dirty
+                        // placement, tombstone or placeholder untouched so
+                        // the next sync retries the push.
                         ReplicaPushOutcome::Rejected => self.report.rejected += 1,
                     }
                 }
-                // Any handle the push never reported on stays pending too.
+                // NOTE: any handle the push never reported on stays pending
+                // too.
                 self.pending_flag_pushes.clear();
                 self.pending_content_pushes.clear();
                 self.pending_drops.clear();
@@ -1106,18 +1107,6 @@ enum State {
     PendingEnumerate,
     PendingPush,
     PendingWrite,
-}
-
-impl fmt::Display for State {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Start => f.write_str("start"),
-            Self::PendingLoad => f.write_str("pending load"),
-            Self::PendingEnumerate => f.write_str("pending enumerate"),
-            Self::PendingPush => f.write_str("pending push"),
-            Self::PendingWrite => f.write_str("pending write"),
-        }
-    }
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-//! Std-client seam coverage: error propagation from each seam and the
+//! Client seam coverage: error propagation from each seam and the
 //! error display shapes.
 
 // NOTE: shared across test targets; not every target uses every helper
@@ -80,11 +80,8 @@ fn storage_error_propagates() {
     let mut client = ReplicaClient::new(BrokenStorage, MemRemote::default());
 
     let err = client.open("inbox").unwrap_err();
-    assert!(matches!(
-        err,
-        ReplicaClientError::ReplicaStorage("disk on fire")
-    ));
-    assert_eq!(err.to_string(), "ReplicaStorage seam failed: disk on fire");
+    assert!(matches!(err, ReplicaClientError::Storage("disk on fire")));
+    assert_eq!(err.to_string(), "Storage seam failed: disk on fire");
 }
 
 #[test]
@@ -96,12 +93,9 @@ fn remote_error_propagates() {
         .unwrap_err();
     assert!(matches!(
         err,
-        ReplicaClientError::ReplicaRemote("network unplugged")
+        ReplicaClientError::Remote("network unplugged")
     ));
-    assert_eq!(
-        err.to_string(),
-        "ReplicaRemote seam failed: network unplugged"
-    );
+    assert_eq!(err.to_string(), "Remote seam failed: network unplugged");
 }
 
 #[test]
@@ -117,7 +111,7 @@ fn coroutine_error_propagates() {
     assert!(matches!(err, ReplicaClientError::Coroutine(_)));
     assert_eq!(
         err.to_string(),
-        "Offline engine failed: Offline MUTATE failed: unknown handle nope",
+        "Replica engine failed: Replica MUTATE failed: unknown handle nope",
     );
 }
 

@@ -3,8 +3,6 @@
 //! A single storage read: load the placements and checkpoint, hand them
 //! straight back. No network is ever touched.
 
-use core::fmt;
-
 use log::{debug, trace};
 use thiserror::Error;
 
@@ -14,10 +12,10 @@ use crate::{collection::ReplicaCollectionId, coroutine::*, storage::ReplicaLoade
 #[derive(Clone, Debug, Error)]
 pub enum ReplicaOpenError {
     /// The driver fed back an arg that does not match the pending yield.
-    #[error("Offline OPEN failed: unexpected coroutine arg")]
+    #[error("Replica OPEN failed: unexpected coroutine arg")]
     UnexpectedArg,
     /// The driver resumed without the arg the pending yield required.
-    #[error("Offline OPEN failed: missing coroutine arg")]
+    #[error("Replica OPEN failed: missing coroutine arg")]
     MissingArg,
 }
 
@@ -48,8 +46,6 @@ impl ReplicaCoroutine for ReplicaOpen {
         &mut self,
         arg: Option<ReplicaArg>,
     ) -> ReplicaCoroutineState<Self::Yield, Self::Return> {
-        trace!("open: {}", self.state);
-
         match (&self.state, arg) {
             (State::Start, None) => {
                 debug!("load collection from storage");
@@ -70,15 +66,6 @@ impl ReplicaCoroutine for ReplicaOpen {
 enum State {
     Start,
     PendingLoad,
-}
-
-impl fmt::Display for State {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Start => f.write_str("start"),
-            Self::PendingLoad => f.write_str("pending load"),
-        }
-    }
 }
 
 #[cfg(test)]

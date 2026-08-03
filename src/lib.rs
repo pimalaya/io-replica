@@ -3,22 +3,28 @@
 
 //! # io-replica
 //!
-//! I/O-free offline-first replica engine. It maintains a local
-//! replica of remote collections of items (mail first, contacts and
-//! calendar next), usable fully offline, and reconciles that replica
-//! with the remote through a three-way merge against a stored base.
-//! Sync is a consequence of offline editing, not the primary goal.
+//! I/O-free offline-first replica engine for collections of PIM items:
+//! mailboxes of messages, address books of contacts, calendars of
+//! events. It maintains a local replica of remote collections, usable
+//! fully offline, and reconciles that replica with the remote through a
+//! three-way merge against a stored base. Sync is a consequence of
+//! offline editing, not the primary goal.
 //!
 //! The engine owns no wire protocol and no on-disk format: it speaks
 //! two seams, [`remote`] and [`storage`], both expressed as coroutine
 //! yields, so a consumer wires it to whatever it likes (sqlite plus a
 //! blob dir on desktop, io-imap over JNI plus an Android sqlite store
-//! on mobile). It ships two of the three standard layers: the I/O-free
-//! coroutine core (always present) and a std-blocking driver (the
-//! `client` feature); there is no CLI. The finer operational details
-//! (the push-outcome discipline, the create path, the checkpoint
-//! depths, driving the engine from an app) are documented in the
-//! module headers.
+//! on mobile, io-webdav under an address book, etc). It ships two of
+//! the three standard layers: the I/O-free coroutine core and the
+//! [`client`] reference driver, itself free of std since it performs no
+//! I/O of its own; there is no CLI, and no cargo feature, since no
+//! layer pulls extra crates (the golden rule for feature-gating). The
+//! finer operational details (the push-outcome discipline, the create
+//! path, the checkpoint depths, driving the engine from an app) are
+//! documented in the module headers, and a complete runnable lifecycle
+//! lives in [examples/mailbox_lifecycle.rs][example].
+//!
+//! [example]: https://github.com/pimalaya/io-replica/blob/master/examples/mailbox_lifecycle.rs
 //!
 //! ## Two identity axes, never collapsed
 //!
@@ -41,9 +47,10 @@
 //! collection, so a missing item means deleted only when the base says
 //! so, never inferred from a missing body), meta (a minimal summary
 //! cached), and full (linked to a stored object body). The completeness
-//! of the probed spine plus the per-placement [`placement::ReplicaBase`],
-//! not the presence of a cached body, is what tells deleted from
-//! not-cached, and keeps a partial body cache safe to sync.
+//! of the probed spine plus the per-placement
+//! [`placement::ReplicaBase`], not the presence of a cached body, is
+//! what tells deleted from not-cached, and keeps a partial body cache
+//! safe to sync.
 //!
 //! ## The five verbs
 //!
@@ -55,6 +62,18 @@
 //! reconciles a collection against its remote, and [`rekey`] rebuilds a
 //! collection after a handle-space change (an IMAP UIDVALIDITY bump)
 //! carrying the cache and pending state over by link id.
+//!
+//! Every verb is scoped to one collection, because the collection is
+//! the unit of consistency: the spine completeness, the checkpoint and
+//! the merge all live per collection. There is deliberately no
+//! cross-collection read verb; the engine only reads local state in
+//! order to merge it, and the merged, deduplicated across-collections
+//! view is a plain query the consumer runs against its own storage
+//! (placements sharing a link id point at one object), with no engine
+//! involvement. [`open`] exists for symmetry as the reference
+//! single-collection read, not as the only way to look at the data: the
+//! storage is the consumer's, and the consumer may read it however it
+//! likes.
 //!
 //! ## The three-way merge
 //!
@@ -83,27 +102,24 @@
 //! seam vocabulary. The item model lives in [`object`], [`placement`]
 //! and [`collection`]. The five verbs are [`open`], [`upgrade`],
 //! [`mutate`], [`sync`] and [`rekey`], all built on the [`coroutine`]
-//! contract. The optional [`client`] module (`client` feature) is the
-//! reference std-blocking driver, servicing every yield through a
-//! consumer-implemented [`client::ReplicaStorage`] and
-//! [`client::ReplicaRemote`]. The [`hub`] module composes the single-remote
-//! merge into multi-source sync (mirror, two-way) without a cross-merge: a
-//! storage wraps it to project a per-source view of one shared item and
-//! absorb the writes back.
+//! contract. The [`client`] module is the reference blocking driver,
+//! servicing every yield through a consumer-implemented
+//! [`client::ReplicaStorage`] and [`client::ReplicaRemote`]. The
+//! [`hub`] module composes the single-remote merge into multi-source
+//! sync (mirror, two-way) without a cross-merge: a storage wraps it to
+//! project a per-source view of one shared item and absorb the writes
+//! back.
 //!
 //! ## Conventions
 //!
-//! The crate is no_std with alloc; std only enters behind the `client`
-//! feature. Public items carry the `Replica` prefix. Logging follows
-//! the library rules: state changes at debug level, in-process steps
-//! and data at trace level.
+//! The crate is no_std with alloc, everywhere: even the blocking driver
+//! never touches std. Public items carry the `Replica` prefix. Logging
+//! follows the library rules: state changes at debug level, in-process
+//! steps and data at trace level.
 
 extern crate alloc;
-#[cfg(feature = "client")]
-extern crate std;
 
 pub mod change;
-#[cfg(feature = "client")]
 pub mod client;
 pub mod collection;
 pub mod coroutine;

@@ -1,8 +1,8 @@
 //! Payloads exchanged with the remote seam.
 //!
 //! The consumer satisfies three capabilities by driving a protocol crate
-//! (io-imap, io-jmap, io-webdav) or io-email's clients: enumerate, fetch
-//! and push. These types are what those capabilities return.
+//! (io-imap, io-jmap, io-webdav): enumerate, fetch and push. These types
+//! are what those capabilities return.
 
 use alloc::{string::String, vec::Vec};
 

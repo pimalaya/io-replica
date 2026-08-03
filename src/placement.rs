@@ -120,7 +120,7 @@ impl<S: ToString> FromIterator<S> for ReplicaFlags {
 /// includes the one below.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ReplicaLevel {
-    /// ReplicaHandle known, nothing else; kept complete per collection.
+    /// Handle known, nothing else; kept complete per collection.
     Probed,
     /// Minimal summary cached.
     Meta,
@@ -138,7 +138,7 @@ pub enum ReplicaStatus {
     /// Locally deleted since the base; a remove is pending.
     Tombstone,
     /// Content diverged on both sides; awaiting keep-both resolution.
-    /// ReplicaFlags never conflict (they merge element-wise), so this is a
+    /// Flags never conflict (they merge element-wise), so this is a
     /// mutable-content state only.
     Conflict,
     /// Locally created (a copy, move or append) with no remote handle yet;

@@ -5,8 +5,6 @@
 //! derive the pending push), and writes it back. The remote is never
 //! touched here; reconciliation is [`crate::sync`]'s job.
 
-use core::fmt;
-
 use alloc::{string::String, vec, vec::Vec};
 
 use log::{debug, trace};
@@ -123,16 +121,16 @@ impl ReplicaMutation {
 #[derive(Clone, Debug, Error)]
 pub enum ReplicaMutateError {
     /// The targeted handle has no placement in the collection.
-    #[error("Offline MUTATE failed: unknown handle {0}")]
+    #[error("Replica MUTATE failed: unknown handle {0}")]
     UnknownHandle(String),
     /// An `Add` names a link id a live placement already holds.
-    #[error("Offline MUTATE failed: link id already present: {0}")]
+    #[error("Replica MUTATE failed: link id already present: {0}")]
     LinkExists(String),
     /// The driver fed back an arg that does not match the pending yield.
-    #[error("Offline MUTATE failed: unexpected coroutine arg")]
+    #[error("Replica MUTATE failed: unexpected coroutine arg")]
     UnexpectedArg,
     /// The driver resumed without the arg the pending yield required.
-    #[error("Offline MUTATE failed: missing coroutine arg")]
+    #[error("Replica MUTATE failed: missing coroutine arg")]
     MissingArg,
 }
 
@@ -157,7 +155,7 @@ impl ReplicaMutate {
     }
 
     /// Stages the writes for the mutation given its loaded source placement.
-    /// ReplicaFlags and removes rewrite the source in place; a copy leaves the
+    /// Flag sets and removes rewrite the source in place; a copy leaves the
     /// source untouched and stages a pending create in the target.
     fn writes(&self, mut source: ReplicaPlacement) -> Vec<ReplicaWriteOp> {
         match &self.mutation {
@@ -234,10 +232,10 @@ impl ReplicaMutate {
                 placeholder,
                 ..
             } => {
-                // Stage a Created placement in the target (like Copy), carrying
-                // the source origin, and tombstone the source. The sync derives
-                // a copy into the target and a remove from the source; a hub
-                // binding cannot carry a single atomic UID MOVE.
+                // NOTE: stage a Created placement in the target (like Copy),
+                // carrying the source origin, and tombstone the source. The
+                // sync derives a copy into the target and a remove from the
+                // source; a hub binding cannot carry a single atomic UID MOVE.
                 let create = ReplicaPlacement {
                     collection: target.clone(),
                     handle: placeholder.clone(),
@@ -264,7 +262,7 @@ impl ReplicaMutate {
                     ReplicaWriteOp::UpsertPlacement(source),
                 ]
             }
-            // Add reads no source; it is staged via `create_writes`.
+            // NOTE: Add reads no source; it is staged via `create_writes`.
             ReplicaMutation::Add { .. } => self.create_writes(),
         }
     }
@@ -316,8 +314,6 @@ impl ReplicaCoroutine for ReplicaMutate {
         &mut self,
         arg: Option<ReplicaArg>,
     ) -> ReplicaCoroutineState<Self::Yield, Self::Return> {
-        trace!("mutate: {}", self.state);
-
         match (&mut self.state, arg) {
             (State::Start, None) => {
                 debug!("load target item from storage");
@@ -326,7 +322,8 @@ impl ReplicaCoroutine for ReplicaMutate {
             }
             (State::PendingLoad, Some(ReplicaArg::Load(loaded))) => {
                 let ops = if let ReplicaMutation::Add { link_id, .. } = &self.mutation {
-                    // No source to read; guard against re-creating a live item.
+                    // NOTE: no source to read; guard against re-creating a
+                    // live item.
                     let collides = loaded.placements.iter().any(|p| {
                         p.status != ReplicaStatus::Tombstone && p.link_id.as_ref() == Some(link_id)
                     });
@@ -369,16 +366,6 @@ enum State {
     Start,
     PendingLoad,
     PendingWrite,
-}
-
-impl fmt::Display for State {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Start => f.write_str("start"),
-            Self::PendingLoad => f.write_str("pending load"),
-            Self::PendingWrite => f.write_str("pending write"),
-        }
-    }
 }
 
 #[cfg(test)]

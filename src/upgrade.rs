@@ -7,7 +7,7 @@
 //! several collections at once, and backs a unified across-collections
 //! view.
 
-use core::{fmt, mem};
+use core::mem;
 
 use alloc::{collections::BTreeMap, vec::Vec};
 
@@ -38,10 +38,10 @@ pub struct ReplicaUpgradeReport {
 #[derive(Clone, Debug, Error)]
 pub enum ReplicaUpgradeError {
     /// The driver fed back an arg that does not match the pending yield.
-    #[error("Offline UPGRADE failed: unexpected coroutine arg")]
+    #[error("Replica UPGRADE failed: unexpected coroutine arg")]
     UnexpectedArg,
     /// The driver resumed without the arg the pending yield required.
-    #[error("Offline UPGRADE failed: missing coroutine arg")]
+    #[error("Replica UPGRADE failed: missing coroutine arg")]
     MissingArg,
 }
 
@@ -106,8 +106,6 @@ impl ReplicaCoroutine for ReplicaUpgrade {
         &mut self,
         arg: Option<ReplicaArg>,
     ) -> ReplicaCoroutineState<Self::Yield, Self::Return> {
-        trace!("upgrade: {}", self.state);
-
         match (&self.state, arg) {
             (State::Start, None) => {
                 debug!("load target items from storage");
@@ -302,18 +300,6 @@ enum State {
     PendingLookup,
     PendingFetch,
     PendingWrite,
-}
-
-impl fmt::Display for State {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Start => f.write_str("start"),
-            Self::PendingLoad => f.write_str("pending load"),
-            Self::PendingLookup => f.write_str("pending object lookup"),
-            Self::PendingFetch => f.write_str("pending fetch"),
-            Self::PendingWrite => f.write_str("pending write"),
-        }
-    }
 }
 
 #[cfg(test)]

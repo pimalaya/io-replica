@@ -16,12 +16,12 @@ repository = "https://github.com/pimalaya/io-replica"
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
-[features]
-default = ["client"]
-client = []
+[[example]]
+name = "mailbox_lifecycle"
+path = "examples/mailbox_lifecycle.rs"
 
 [dev-dependencies]
-proptest = "1"
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 [dependencies]
 log = { version = "0.4", default-features = false }

@@ -12,9 +12,9 @@
 //! services each yield and resumes the coroutine with the matching
 //! [`ReplicaArg`].
 //!
-//! ReplicaStorage is therefore not a trait injected into the engine, which
+//! Storage is therefore not a trait injected into the engine, which
 //! would break the I/O-free contract: it is `Wants` variants like
-//! everything else. The optional std [`crate::client`] is one such consumer.
+//! everything else. The blocking [`crate::client`] is one such consumer.
 
 use alloc::{collections::BTreeMap, vec::Vec};
 
@@ -77,7 +77,6 @@ pub enum ReplicaYield {
         /// The last checkpoint to delta from, if any.
         cursor: Option<ReplicaCheckpoint>,
     },
-
     /// Consumer must fetch each handle at `tier` and feed back
     /// [`ReplicaArg::Fetch`].
     WantsFetch {
@@ -88,7 +87,6 @@ pub enum ReplicaYield {
         /// The detail tier.
         tier: ReplicaTier,
     },
-
     /// Consumer must push each change and feed back
     /// [`ReplicaArg::Push`].
     WantsPush {
@@ -97,16 +95,13 @@ pub enum ReplicaYield {
         /// The changes to push.
         changes: Vec<ReplicaChange>,
     },
-
     /// Consumer must load the collection's placements and checkpoint and
     /// feed back [`ReplicaArg::Load`].
     WantsLoad(ReplicaCollectionId),
-
     /// Consumer must resolve which link ids already have a stored object
     /// and feed back [`ReplicaArg::LookupObject`]. This is the dedup
     /// check that skips re-downloading a body shared across collections.
     WantsLookupObject(Vec<ReplicaLinkId>),
-
     /// Consumer must apply each write atomically and feed back
     /// [`ReplicaArg::Write`].
     WantsWrite(Vec<ReplicaWriteOp>),

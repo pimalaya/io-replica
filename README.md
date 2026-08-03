@@ -1,11 +1,11 @@
-# I/O offline [![Documentation](https://img.shields.io/docsrs/io-replica?style=flat&logo=docs.rs&logoColor=white)](https://docs.rs/io-replica/latest/io_replica) [![Matrix](https://img.shields.io/badge/chat-%23pimalaya-blue?style=flat&logo=matrix&logoColor=white)](https://matrix.to/#/#pimalaya:matrix.org) [![Mastodon](https://img.shields.io/badge/news-%40pimalaya-blue?style=flat&logo=mastodon&logoColor=white)](https://fosstodon.org/@pimalaya)
+# I/O replica [![Documentation](https://img.shields.io/docsrs/io-replica?style=flat&logo=docs.rs&logoColor=white)](https://docs.rs/io-replica/latest/io_replica) [![Matrix](https://img.shields.io/badge/chat-%23pimalaya-blue?style=flat&logo=matrix&logoColor=white)](https://matrix.to/#/#pimalaya:matrix.org) [![Mastodon](https://img.shields.io/badge/news-%40pimalaya-blue?style=flat&logo=mastodon&logoColor=white)](https://fosstodon.org/@pimalaya)
 
 Offline-first replica engine library for Rust
 
-This library is composed of 2 feature-gated layers:
+This library is composed of 2 layers:
 
 - Low-level **I/O-free** coroutines: no_std-compatible state machines containing the whole replica logic, usable anywhere
-- Mid-level **std client**: a standard, blocking driver servicing the storage and remote effects through two traits you implement
+- Mid-level **blocking driver**: a reference client servicing the storage and remote effects through two traits you implement
 
 ## Table of contents
 
@@ -26,18 +26,15 @@ This library is composed of 2 feature-gated layers:
 - **Partial cache**: cache only what you need, whether identifiers, list summaries or full bodies, and still tell deleted apart from not-yet-cached safely.
 - **Conflict handling**: flags merge without ever conflicting; diverging content is kept on both sides for you to resolve.
 - **I/O-free coroutines**: no_std state machines holding the whole replica logic, resumable from any blocking, async or in-memory harness.
-- Standard, blocking driver servicing the storage and remote seams through two traits you implement, enabled by the default `client` feature.
-
-> [!TIP]
-> I/O offline is written in [Rust](https://www.rust-lang.org/) and uses [cargo features](https://doc.rust-lang.org/cargo/reference/features.html) to gate the std client layer. The default feature set is declared in [Cargo.toml](./Cargo.toml) or on [docs.rs](https://docs.rs/crate/io-replica/latest/features).
+- Blocking reference driver servicing the storage and remote seams through two traits you implement, always available since it performs no I/O of its own.
 
 ## Usage
 
-The whole API is documented on [docs.rs](https://docs.rs/io-replica/latest/io_replica), including runnable snippets for every coroutine and for the std client.
+The whole API is documented on [docs.rs](https://docs.rs/io-replica/latest/io_replica), including runnable snippets for every coroutine and for the blocking client.
 
 ## Examples
 
-There is no standalone examples folder yet; the [test suite](./tests) demonstrates real usage, driving full offline lifecycles over a scripted storage and remote.
+Complete runnable programs live in [./examples](./examples), starting with the full mailbox lifecycle (probe, offline open, hydrate, dedup, offline flag, push, pull); the [test suite](./tests) also demonstrates real usage, driving full offline lifecycles over a scripted storage and remote.
 
 ## AI disclosure
 
