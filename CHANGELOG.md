@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-06
+
 ### Added
 
 - Added the multi-source hub (the `hub` module): one shared item with a per-source base, projected as per-source placements and absorbed back from sync writes, so multi-source propagation (adds, flags, deletes, staged removes and moves) falls out of the ordinary per-source merge with no cross-merge.
@@ -44,5 +46,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added the std client behind the client feature: a blocking ReplicaClient servicing every yield through the consumer-implemented Storage and Remote traits.
 - Documented the at-least-once push contract (an add's link_id dedups a retry, a remove of an already-missing member reads as accepted) and the pointer-derived object refcounting the consumer maintains by diffing placement upserts and drops.
 
-[unreleased]: https://github.com/pimalaya/io-replica/compare/v0.1.0..HEAD
+[unreleased]: https://github.com/pimalaya/io-replica/compare/v0.2.0..HEAD
+[0.2.0]: https://github.com/pimalaya/io-replica/compare/v0.1.0..v0.2.0
 [0.1.0]: https://github.com/pimalaya/io-replica/compare/root..v0.1.0
