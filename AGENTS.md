@@ -5,9 +5,7 @@ keeping a living spec, reviewable change proposals, and an honest history beside
 the code. The full format lives in the Cairn repository
 (<https://github.com/pimalaya/cairn>: `CAIRN.md` for the contract, `GUIDE.md`
 for the procedure). No tooling is required: you create and check the structure
-by reading and following the rules. An optional bash port ships under
-[`impl/bash/`](./impl/bash) (`init`, `verify`); reading the rules is the primary
-path.
+by reading and following the rules.
 
 If you are an agent working in this repository, do the following **by default,
 without being asked**.
@@ -49,5 +47,4 @@ Check the structure yourself against the strict rules (Cairn §8): a discoverabl
 root; `spec/ changes/ log/` present; every Cairn file carrying a valid `cairn:`
 type; each change having `proposal.md` and `tasks.md`; kebab-case ids; literal
 delta headings; a log entry for every landed change. Everything else (prose,
-naming, ordering, extra files) is free. `impl/bash/verify` runs the same check,
-but reading the rules is the primary path.
+naming, ordering, extra files) is free.
