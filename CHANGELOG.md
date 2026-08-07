@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A per-source content conflict now survives a round trip through the hub.** `ReplicaHub::absorb` dropped an upserted placement's `Conflict` status and its `conflict_revision` (every binding was built as `{ handle, base }`), and `project` derived its status purely from the base comparison with a hardcoded `conflict_revision: None` — so a storage built on the hub read a conflicted placement back as `Dirty`.
+
+  That defeated the merge's own rule that an unresolved conflict is left alone: the push the remote had already rejected was re-derived, re-rejected and re-marked conflicted on **every run**, never converging, while a consumer reading the storage could not tell which items needed resolving. Invisible to immutable-content backends, since mail bodies never conflict.
+
+  `ReplicaSourceBinding` now carries `conflicted` and `conflict_revision`, recorded by `absorb` from a `Conflict` upsert and cleared by an upsert of any other status (so a consumer's resolving edit needs no dedicated call), and projected back ahead of the Clean/Dirty decision. The state lives on the **binding**, not the item: "this source vs its own remote" is a different fact from `ReplicaHubItem::conflicted`, which is "source vs source", and the two stay independent. Purely additive — `reconcile_content` and `ReplicaHubItem` are untouched.
+
+  Persisting the two fields is a follow-up in io-pimdir, which needs a `pimdir` schema change; until then a pimdir-backed store still loses the conflict across a restart, even though the hub no longer does.
+
+### Changed
+
+- **BREAKING**: `ReplicaSourceBinding` gained the two public fields above, so its struct literals need updating.
+
 ## [0.2.0] - 2026-08-06
 
 ### Added

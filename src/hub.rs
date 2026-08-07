@@ -50,14 +50,28 @@ impl From<String> for ReplicaSourceId {
     }
 }
 
-/// One source's binding of a shared item: its handle there and the base last
-/// synced with it.
+/// One source's binding of a shared item: its handle there, the base last
+/// synced with it, and whether that source's own sync is stuck on a conflict.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplicaSourceBinding {
     /// The item's handle on this source.
     pub handle: ReplicaHandle,
     /// The last state synced with this source; `None` until first reconciled.
     pub base: Option<ReplicaBase>,
+    /// Set when *this source* and its own remote diverged and the merge left
+    /// the placement [`ReplicaStatus::Conflict`].
+    ///
+    /// Distinct from [`ReplicaHubItem::conflicted`], the **cross-source**
+    /// conflict (two sources edited the shared body differently). A two-source
+    /// store needs both, independently: one says "left and its server
+    /// disagree", the other "left and right disagree". Cleared by an upsert of
+    /// any other status, so a consumer resolving the conflict with an edit
+    /// needs no explicit resolution call.
+    pub conflicted: bool,
+    /// The remote revision observed when this binding was marked conflicted —
+    /// what a resolver fetches and merges against. `None` when not conflicted,
+    /// or when the remote reports no revision.
+    pub conflict_revision: Option<String>,
 }
 
 /// How the hub resolves a cross-source content conflict — both sources edited
@@ -163,7 +177,13 @@ impl ReplicaHub {
             .base
             .as_ref()
             .is_some_and(|b| b.flags == item.flags && b.object == item.object);
-        let status = if in_sync {
+        let status = if binding.conflicted {
+            // NOTE: an unresolved conflict outranks the base comparison. The
+            // merge leaves a conflicted placement alone; downgrading it to
+            // Dirty here would re-derive the push it already rejected, so the
+            // same conflict would be re-marked on every run and never converge.
+            ReplicaStatus::Conflict
+        } else if in_sync {
             ReplicaStatus::Clean
         } else {
             // NOTE: the hub diverged from this source's base, so push it.
@@ -179,7 +199,7 @@ impl ReplicaHub {
             meta: item.meta.clone(),
             flags: item.flags.clone(),
             status,
-            conflict_revision: None,
+            conflict_revision: binding.conflict_revision.clone(),
             base: binding.base.clone(),
             origin: None,
         }
@@ -283,13 +303,8 @@ impl ReplicaHub {
         // edit-beats-delete still resurrect it if the source's server changed it.
         if placement.status == ReplicaStatus::Tombstone {
             item.deleted = true;
-            item.sources.insert(
-                source.clone(),
-                ReplicaSourceBinding {
-                    handle: placement.handle.clone(),
-                    base: placement.base.clone(),
-                },
-            );
+            item.sources
+                .insert(source.clone(), Self::binding_of(placement));
             return;
         }
 
@@ -307,13 +322,30 @@ impl ReplicaHub {
 
         Self::reconcile_content(item, source, placement, policy);
 
-        item.sources.insert(
-            source.clone(),
-            ReplicaSourceBinding {
-                handle: placement.handle.clone(),
-                base: placement.base.clone(),
-            },
-        );
+        item.sources
+            .insert(source.clone(), Self::binding_of(placement));
+    }
+
+    /// The binding an upsert leaves for its source: its handle and base, plus
+    /// whether this source's own sync is stuck on a conflict with its remote.
+    ///
+    /// Recording the conflict is what makes the round trip faithful: the merge
+    /// leaves an unresolved conflict alone, so a projection that reported it as
+    /// `Dirty` would re-derive the rejected push every run. Any status other
+    /// than `Conflict` clears it, which is how a consumer's resolving edit
+    /// (absorbed as `Dirty`) ends the conflict without a dedicated call.
+    fn binding_of(placement: &ReplicaPlacement) -> ReplicaSourceBinding {
+        let conflicted = placement.status == ReplicaStatus::Conflict;
+        ReplicaSourceBinding {
+            handle: placement.handle.clone(),
+            base: placement.base.clone(),
+            conflicted,
+            // Only meaningful while conflicted; dropping it otherwise keeps a
+            // resolved binding from carrying a stale revision forward.
+            conflict_revision: conflicted
+                .then(|| placement.conflict_revision.clone())
+                .flatten(),
+        }
     }
 
     /// Reconciles the shared body against an incoming upsert. A clean
@@ -412,6 +444,8 @@ mod tests {
             ReplicaSourceBinding {
                 handle: ReplicaHandle::from("l1"),
                 base: Some(base(flags)),
+                conflicted: false,
+                conflict_revision: None,
             },
         );
         let item = ReplicaHubItem {
@@ -445,6 +479,8 @@ mod tests {
                 ReplicaSourceBinding {
                     handle: ReplicaHandle::from("r1"),
                     base: Some(base(flags)),
+                    conflicted: false,
+                    conflict_revision: None,
                 },
             );
     }
@@ -464,6 +500,8 @@ mod tests {
                 ReplicaSourceBinding {
                     handle: ReplicaHandle::from("r1"),
                     base: Some(base(&["seen"])),
+                    conflicted: false,
+                    conflict_revision: None,
                 },
             );
 
@@ -491,6 +529,8 @@ mod tests {
                 ReplicaSourceBinding {
                     handle: ReplicaHandle::from("r1"),
                     base: Some(base(&[])),
+                    conflicted: false,
+                    conflict_revision: None,
                 },
             );
 
@@ -552,6 +592,8 @@ mod tests {
                 ReplicaSourceBinding {
                     handle: ReplicaHandle::from("r1"),
                     base: Some(base(&["seen"])),
+                    conflicted: false,
+                    conflict_revision: None,
                 },
             );
 
@@ -716,6 +758,8 @@ mod tests {
                 revision: Some("r0".into()),
                 object: Some(ReplicaHash::from("o0")),
             }),
+            conflicted: false,
+            conflict_revision: None,
         };
         let mut sources = BTreeMap::new();
         sources.insert(ReplicaSourceId::from("left"), based("l1"));
@@ -852,5 +896,159 @@ mod tests {
             Some(ReplicaHash::from("oa")),
             "the shared body is kept"
         );
+    }
+
+    /// A conflicted upsert for the shared item from `handle`: the local body is
+    /// `object`, and `revision` is the remote revision the merge observed.
+    fn conflicted_upsert(handle: &str, object: &str, revision: &str) -> ReplicaWriteOp {
+        ReplicaWriteOp::UpsertPlacement(ReplicaPlacement {
+            collection: "inbox".into(),
+            handle: ReplicaHandle::from(handle),
+            link_id: Some(ReplicaLinkId::from("m1")),
+            object: Some(ReplicaHash::from(object)),
+            level: ReplicaLevel::Full,
+            meta: None,
+            flags: ReplicaFlags::default(),
+            status: ReplicaStatus::Conflict,
+            conflict_revision: Some(revision.into()),
+            base: Some(ReplicaBase {
+                flags: ReplicaFlags::default(),
+                revision: Some("r0".into()),
+                object: Some(ReplicaHash::from("o0")),
+            }),
+            origin: None,
+        })
+    }
+
+    #[test]
+    fn a_conflicted_placement_round_trips_with_its_revision() {
+        // The bug this change fixes: the merge marks a placement Conflict and
+        // records the remote revision it saw, and both must come back out. Read
+        // back as Dirty, the engine re-derives the push it already had rejected
+        // and re-conflicts on every run, never converging.
+        let mut hub = content_hub(ReplicaHubConflict::Manual);
+        hub.absorb(
+            &ReplicaSourceId::from("left"),
+            &[conflicted_upsert("l1", "o-local", "r-remote")],
+        );
+
+        let projected = placements(&hub, "left");
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].status, ReplicaStatus::Conflict);
+        assert_eq!(
+            projected[0].conflict_revision.as_deref(),
+            Some("r-remote"),
+            "the observed remote revision is what a resolver merges against"
+        );
+    }
+
+    #[test]
+    fn a_conflict_outranks_the_base_comparison() {
+        // A conflicted binding whose base still matches the shared content would
+        // otherwise project Clean, silently losing the conflict; and one that
+        // diverges would project Dirty, re-deriving the rejected push. Neither
+        // may happen.
+        let mut hub = content_hub(ReplicaHubConflict::Manual);
+        hub.absorb(
+            &ReplicaSourceId::from("left"),
+            &[conflicted_upsert("l1", "o0", "r-remote")],
+        );
+
+        let binding =
+            hub.items[&ReplicaLinkId::from("m1")].sources[&ReplicaSourceId::from("left")].clone();
+        assert!(binding.conflicted);
+        // The base equals the shared content, so the Clean branch would win
+        // without the conflict check.
+        assert_eq!(
+            binding.base.as_ref().and_then(|b| b.object.clone()),
+            hub.items[&ReplicaLinkId::from("m1")].object
+        );
+        assert_eq!(placements(&hub, "left")[0].status, ReplicaStatus::Conflict);
+    }
+
+    #[test]
+    fn resolving_the_conflict_with_an_edit_clears_it() {
+        // Resolution needs no dedicated call: the consumer's edit arrives as an
+        // ordinary upsert, and any status but Conflict clears the binding.
+        let mut hub = content_hub(ReplicaHubConflict::Manual);
+        let left = ReplicaSourceId::from("left");
+        hub.absorb(&left, &[conflicted_upsert("l1", "o-local", "r-remote")]);
+        assert_eq!(placements(&hub, "left")[0].status, ReplicaStatus::Conflict);
+
+        hub.absorb(&left, &[content_upsert("l1", "o-merged")]);
+
+        let binding = hub.items[&ReplicaLinkId::from("m1")].sources[&left].clone();
+        assert!(!binding.conflicted);
+        assert_eq!(
+            binding.conflict_revision, None,
+            "a resolved binding must not carry a stale revision forward"
+        );
+        assert_ne!(placements(&hub, "left")[0].status, ReplicaStatus::Conflict);
+    }
+
+    #[test]
+    fn the_two_conflict_axes_stay_independent() {
+        // A source-vs-its-own-remote conflict and a cross-source conflict are
+        // different facts; conflating them would make a two-source store report
+        // one as the other. Neither may leak into the other's flag.
+        let mut hub = content_hub(ReplicaHubConflict::Manual);
+        let link = ReplicaLinkId::from("m1");
+
+        // Left conflicts with its own server: the binding is marked, the shared
+        // item's cross-source flag is not.
+        hub.absorb(
+            &ReplicaSourceId::from("left"),
+            &[conflicted_upsert("l1", "o-local", "r-remote")],
+        );
+        assert!(hub.items[&link].sources[&ReplicaSourceId::from("left")].conflicted);
+        assert!(
+            !hub.items[&link].conflicted,
+            "a per-source conflict is not a cross-source one"
+        );
+
+        // Right's binding is untouched by left's conflict.
+        assert!(!hub.items[&link].sources[&ReplicaSourceId::from("right")].conflicted);
+        assert_eq!(placements(&hub, "right")[0].status, ReplicaStatus::Dirty);
+
+        // Now a genuine cross-source divergence (both moved to different
+        // bodies): the item is flagged, and right's own binding is not.
+        let mut hub = content_hub(ReplicaHubConflict::Manual);
+        hub.absorb(
+            &ReplicaSourceId::from("left"),
+            &[content_upsert("l1", "o-l")],
+        );
+        hub.absorb(
+            &ReplicaSourceId::from("right"),
+            &[content_upsert("r1", "o-r")],
+        );
+        assert!(hub.items[&link].conflicted);
+        assert_eq!(
+            hub.items[&link].conflict_object,
+            Some(ReplicaHash::from("o-r"))
+        );
+        assert!(
+            !hub.items[&link].sources[&ReplicaSourceId::from("right")].conflicted,
+            "a cross-source conflict is not a per-source one"
+        );
+    }
+
+    #[test]
+    fn a_tombstone_is_never_conflicted() {
+        // The tombstone path takes the same binding constructor; a staged
+        // delete carries no conflict, and must not inherit a stale one.
+        let mut hub = content_hub(ReplicaHubConflict::Manual);
+        let left = ReplicaSourceId::from("left");
+        hub.absorb(&left, &[conflicted_upsert("l1", "o-local", "r-remote")]);
+
+        let mut tombstone = match content_upsert("l1", "o0") {
+            ReplicaWriteOp::UpsertPlacement(p) => p,
+            _ => unreachable!(),
+        };
+        tombstone.status = ReplicaStatus::Tombstone;
+        hub.absorb(&left, &[ReplicaWriteOp::UpsertPlacement(tombstone)]);
+
+        let binding = hub.items[&ReplicaLinkId::from("m1")].sources[&left].clone();
+        assert!(!binding.conflicted);
+        assert_eq!(binding.conflict_revision, None);
     }
 }

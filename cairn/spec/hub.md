@@ -97,3 +97,39 @@ id per body and never reach this path.
 - GIVEN two sources agreeing on a body, then only one editing it
 - WHEN that upsert is absorbed
 - THEN the hub adopts the new body with no conflict
+
+### Requirement: A per-source content conflict round-trips through the hub
+`ReplicaSourceBinding` SHALL carry a `conflicted` flag and a
+`conflict_revision`, recording that **this source and its own remote** diverged
+and the merge left the placement `Conflict`. This is a distinct fact from the
+item-level cross-source conflict above — one says "left and its server
+disagree", the other "left and right disagree" — and a two-source store needs
+both independently; neither SHALL set the other.
+
+`absorb` SHALL record both from any upsert whose status is `Conflict`, and clear
+them for an upsert of any other status, so a consumer resolving the conflict
+with an ordinary edit needs no dedicated resolution call. `project` SHALL yield
+`Conflict` for a conflicted binding **ahead of** the base comparison, carrying
+the stored `conflict_revision` back, so a conflict is never downgraded to
+`Clean` or `Dirty`.
+
+Without this the merge cannot honour its own rule that an unresolved conflict is
+left alone: the placement reads back `Dirty`, the engine re-derives the push the
+remote already rejected, and the same conflict is re-marked on every run with no
+convergence — while a consumer reading the storage cannot tell which items need
+resolving. Immutable-content backends never reach this path.
+
+#### Scenario: A conflicted placement keeps its status and revision
+- GIVEN a source whose merge marked a placement `Conflict` at an observed remote revision
+- WHEN that upsert is absorbed and the source's placements are projected
+- THEN the placement projects `Conflict` carrying the same `conflict_revision`
+
+#### Scenario: A conflict outranks the base comparison
+- GIVEN a conflicted binding whose base still equals the shared content
+- WHEN the source's placements are projected
+- THEN the placement projects `Conflict`, not `Clean`
+
+#### Scenario: An edit resolves the conflict
+- GIVEN a conflicted binding
+- WHEN an upsert of any other status is absorbed for that source
+- THEN the binding is no longer conflicted and carries no `conflict_revision`
