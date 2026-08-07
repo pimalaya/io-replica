@@ -7,15 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-07
+
 ### Fixed
 
-- **A per-source content conflict now survives a round trip through the hub.** `ReplicaHub::absorb` dropped an upserted placement's `Conflict` status and its `conflict_revision` (every binding was built as `{ handle, base }`), and `project` derived its status purely from the base comparison with a hardcoded `conflict_revision: None` — so a storage built on the hub read a conflicted placement back as `Dirty`.
+- **A per-source content conflict now survives a round trip through the hub.** `ReplicaHub::absorb` dropped an upserted placement's `Conflict` status and its `conflict_revision` (every binding was built as `{ handle, base }`), and `project` derived its status purely from the base comparison with a hardcoded `conflict_revision: None`, so a storage built on the hub read a conflicted placement back as `Dirty`.
 
   That defeated the merge's own rule that an unresolved conflict is left alone: the push the remote had already rejected was re-derived, re-rejected and re-marked conflicted on **every run**, never converging, while a consumer reading the storage could not tell which items needed resolving. Invisible to immutable-content backends, since mail bodies never conflict.
 
-  `ReplicaSourceBinding` now carries `conflicted` and `conflict_revision`, recorded by `absorb` from a `Conflict` upsert and cleared by an upsert of any other status (so a consumer's resolving edit needs no dedicated call), and projected back ahead of the Clean/Dirty decision. The state lives on the **binding**, not the item: "this source vs its own remote" is a different fact from `ReplicaHubItem::conflicted`, which is "source vs source", and the two stay independent. Purely additive — `reconcile_content` and `ReplicaHubItem` are untouched.
+  `ReplicaSourceBinding` now carries `conflicted` and `conflict_revision`, recorded by `absorb` from a `Conflict` upsert and cleared by an upsert of any other status (so a consumer's resolving edit needs no dedicated call), and projected back ahead of the Clean/Dirty decision. The state lives on the **binding**, not the item: "this source vs its own remote" is a different fact from `ReplicaHubItem::conflicted`, which is "source vs source", and the two stay independent. Purely additive: `reconcile_content` and `ReplicaHubItem` are untouched.
 
-  Persisting the two fields is a follow-up in io-pimdir, which needs a `pimdir` schema change; until then a pimdir-backed store still loses the conflict across a restart, even though the hub no longer does.
+  Persisting the two fields is io-pimdir's half, and it landed alongside this release (`bindings.conflicted` / `bindings.conflict_revision`, folded into the draft schema), so a pimdir-backed store now keeps a conflict across a restart instead of re-deriving the rejected push on every run.
 
 ### Changed
 
@@ -60,6 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added the std client behind the client feature: a blocking ReplicaClient servicing every yield through the consumer-implemented Storage and Remote traits.
 - Documented the at-least-once push contract (an add's link_id dedups a retry, a remove of an already-missing member reads as accepted) and the pointer-derived object refcounting the consumer maintains by diffing placement upserts and drops.
 
-[unreleased]: https://github.com/pimalaya/io-replica/compare/v0.2.0..HEAD
+[unreleased]: https://github.com/pimalaya/io-replica/compare/v0.3.0..HEAD
+[0.3.0]: https://github.com/pimalaya/io-replica/compare/v0.2.0..v0.3.0
 [0.2.0]: https://github.com/pimalaya/io-replica/compare/v0.1.0..v0.2.0
 [0.1.0]: https://github.com/pimalaya/io-replica/compare/root..v0.1.0
