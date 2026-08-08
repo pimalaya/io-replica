@@ -133,3 +133,14 @@ resolving. Immutable-content backends never reach this path.
 - GIVEN a conflicted binding
 - WHEN an upsert of any other status is absorbed for that source
 - THEN the binding is no longer conflicted and carries no `conflict_revision`
+
+### Requirement: An unknown sort key never erases a known one
+Absorbing an upsert whose sort key is unknown SHALL leave the shared key alone,
+on the same terms as an absent summary. A source that has only probed an item,
+or whose kind defines no key, MUST NOT un-sort an item another source has
+already placed. A known key SHALL replace another known key.
+
+#### Scenario: A second source probes an item the first summarised
+- GIVEN a hub item whose key one source derived
+- WHEN another source absorbs the same item with an unknown key
+- THEN the projection still carries the derived key

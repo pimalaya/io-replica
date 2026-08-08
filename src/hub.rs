@@ -22,7 +22,7 @@ use crate::{
     object::ReplicaHash,
     placement::{
         ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta,
-        ReplicaPlacement, ReplicaStatus,
+        ReplicaPlacement, ReplicaSortKey, ReplicaStatus,
     },
 };
 
@@ -101,6 +101,8 @@ pub struct ReplicaHubItem {
     pub object: Option<ReplicaHash>,
     /// The current summary, shared by every source; `None` until fetched.
     pub meta: Option<ReplicaMeta>,
+    /// The current sort key, shared by every source; empty until derived.
+    pub sort_key: ReplicaSortKey,
     /// The highest detail level any source has reached.
     pub level: ReplicaLevel,
     /// Set once a source removed the item: the delete propagates to every
@@ -197,6 +199,7 @@ impl ReplicaHub {
             object: item.object.clone(),
             level: item.level,
             meta: item.meta.clone(),
+            sort_key: item.sort_key.clone(),
             flags: item.flags.clone(),
             status,
             conflict_revision: binding.conflict_revision.clone(),
@@ -223,6 +226,7 @@ impl ReplicaHub {
             object: item.object.clone(),
             level: item.level,
             meta: item.meta.clone(),
+            sort_key: item.sort_key.clone(),
             flags: item.flags.clone(),
             status: ReplicaStatus::Tombstone,
             conflict_revision: None,
@@ -251,6 +255,7 @@ impl ReplicaHub {
             object: item.object.clone(),
             level: ReplicaLevel::Full,
             meta: item.meta.clone(),
+            sort_key: item.sort_key.clone(),
             flags: item.flags.clone(),
             status: ReplicaStatus::Created,
             conflict_revision: None,
@@ -288,6 +293,7 @@ impl ReplicaHub {
             flags: placement.flags.clone(),
             object: placement.object.clone(),
             meta: placement.meta.clone(),
+            sort_key: placement.sort_key.clone(),
             level: placement.level,
             deleted: false,
             conflicted: false,
@@ -317,6 +323,13 @@ impl ReplicaHub {
         item.flags = placement.flags.clone();
         if placement.meta.is_some() {
             item.meta = placement.meta.clone();
+        }
+        // NOTE: an unknown key does not overwrite a known one, on the same
+        // terms as an absent meta. A source that has not derived a key yet
+        // (probed only, or a kind that defines none) must not un-sort an item
+        // another source already placed.
+        if !placement.sort_key.is_unknown() {
+            item.sort_key = placement.sort_key.clone();
         }
         item.level = item.level.max(placement.level);
 
@@ -449,6 +462,7 @@ mod tests {
             },
         );
         let item = ReplicaHubItem {
+            sort_key: Default::default(),
             flags: ReplicaFlags::from_iter(flags.iter().copied()),
             object: None,
             meta: None,
@@ -711,6 +725,7 @@ mod tests {
         // NOTE: left's server had edited it (edit-beats-delete), so left's sync
         // resurrects it as a live upsert rather than pushing the delete.
         let mut pulled = ReplicaPlacement {
+            sort_key: Default::default(),
             collection: "inbox".into(),
             handle: ReplicaHandle::from("l1"),
             link_id: Some(ReplicaLinkId::from("m1")),
@@ -765,6 +780,7 @@ mod tests {
         sources.insert(ReplicaSourceId::from("left"), based("l1"));
         sources.insert(ReplicaSourceId::from("right"), based("r1"));
         let item = ReplicaHubItem {
+            sort_key: Default::default(),
             flags: ReplicaFlags::default(),
             object: Some(ReplicaHash::from("o0")),
             meta: None,
@@ -783,6 +799,7 @@ mod tests {
     /// An upsert write for the shared item from `handle`, carrying `object`.
     fn content_upsert(handle: &str, object: &str) -> ReplicaWriteOp {
         ReplicaWriteOp::UpsertPlacement(ReplicaPlacement {
+            sort_key: Default::default(),
             collection: "inbox".into(),
             handle: ReplicaHandle::from(handle),
             link_id: Some(ReplicaLinkId::from("m1")),
@@ -902,6 +919,7 @@ mod tests {
     /// `object`, and `revision` is the remote revision the merge observed.
     fn conflicted_upsert(handle: &str, object: &str, revision: &str) -> ReplicaWriteOp {
         ReplicaWriteOp::UpsertPlacement(ReplicaPlacement {
+            sort_key: Default::default(),
             collection: "inbox".into(),
             handle: ReplicaHandle::from(handle),
             link_id: Some(ReplicaLinkId::from("m1")),
@@ -1050,5 +1068,79 @@ mod tests {
         let binding = hub.items[&ReplicaLinkId::from("m1")].sources[&left].clone();
         assert!(!binding.conflicted);
         assert_eq!(binding.conflict_revision, None);
+    }
+}
+
+#[cfg(test)]
+mod sort_key_tests {
+
+    use crate::{
+        change::ReplicaWriteOp,
+        hub::*,
+        placement::{ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaPlacement},
+    };
+
+    fn upsert(source: &str, key: &str) -> ReplicaWriteOp {
+        let _ = source;
+        ReplicaWriteOp::UpsertPlacement(ReplicaPlacement {
+            collection: ReplicaCollectionId::from("inbox"),
+            handle: ReplicaHandle::from("1"),
+            link_id: Some(ReplicaLinkId::from("mid:a@host")),
+            object: None,
+            level: ReplicaLevel::Meta,
+            meta: None,
+            sort_key: ReplicaSortKey::from(key),
+            flags: ReplicaFlags::default(),
+            status: ReplicaStatus::Clean,
+            conflict_revision: None,
+            base: None,
+            origin: None,
+        })
+    }
+
+    #[test]
+    fn a_sort_key_round_trips_through_the_hub() {
+        // The whole point of carrying it: a key absorbed from one source
+        // has to come back out when that source is projected, or the
+        // storage below reads it as unknown on every load.
+        let mut hub = ReplicaHub::default();
+        let left = ReplicaSourceId::from("left");
+
+        hub.absorb(&left, &[upsert("left", "2026-08-01T10:00:00Z")]);
+
+        let projected = hub.project(&ReplicaCollectionId::from("inbox"), &left);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].sort_key.0, "2026-08-01T10:00:00Z");
+    }
+
+    #[test]
+    fn an_unknown_key_does_not_erase_a_known_one() {
+        // A second source that has only probed the item carries no key.
+        // Adopting it unconditionally would un-sort an item the first
+        // source had already placed, which is the same reasoning that
+        // makes an absent meta leave the cached summary alone.
+        let mut hub = ReplicaHub::default();
+        let left = ReplicaSourceId::from("left");
+        let right = ReplicaSourceId::from("right");
+
+        hub.absorb(&left, &[upsert("left", "2026-08-01T10:00:00Z")]);
+        hub.absorb(&right, &[upsert("right", "")]);
+
+        let projected = hub.project(&ReplicaCollectionId::from("inbox"), &left);
+        assert_eq!(projected[0].sort_key.0, "2026-08-01T10:00:00Z");
+    }
+
+    #[test]
+    fn a_later_derivation_replaces_an_earlier_one() {
+        // A `Full` fetch knows more than an envelope did, so a real key
+        // must be allowed to correct a real key; only unknown is inert.
+        let mut hub = ReplicaHub::default();
+        let left = ReplicaSourceId::from("left");
+
+        hub.absorb(&left, &[upsert("left", "2026-08-01T10:00:00Z")]);
+        hub.absorb(&left, &[upsert("left", "2026-08-02T09:00:00Z")]);
+
+        let projected = hub.project(&ReplicaCollectionId::from("inbox"), &left);
+        assert_eq!(projected[0].sort_key.0, "2026-08-02T09:00:00Z");
     }
 }

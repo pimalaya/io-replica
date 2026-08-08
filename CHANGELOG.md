@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A placement carries a presentation sort key**, `ReplicaSortKey`, beside its summary: the item's position in its collection's natural order, newest first for mail and calendars, A to Z for contacts. The engine ferries it and never parses it, exactly as it does the summary, so what it means stays the kind's business and how it is stored stays the storage's.
+
+  Without it the only orderings a store can serve are by link id or allocation order, neither of which means anything to a reader, so every consumer had to scan a whole collection into memory to render a list.
+
+  Empty means unknown and is the default, so an item is orderable from the moment it exists.
+
+  A fetch refreshes the key at **both** tiers, unlike the link id, which is kept once resolved: the key is a projection of content rather than an identity, so the better-informed derivation should win. A `Full` body carries the real date where an envelope may have carried none.
+
+  In the hub, an unknown key **never erases a known one**, mirroring the rule for an absent summary: a second source that has only probed an item must not un-sort what another source already placed. A rekey carries each key over, falling back to the old placement's when the meta fetch resolved none, so a handle-space change does not un-sort a collection.
+
+### Changed
+
+- **Breaking.** `ReplicaPlacement`, `ReplicaFetchedItem` and `ReplicaHubItem` gained a `sort_key` field; `ReplicaMutation::Add` gained one and `ReplicaMutation::Edit` an optional one, on the same terms as its optional `meta` (absent keeps the stored key).
+
 ## [0.3.0] - 2026-08-07
 
 ### Fixed

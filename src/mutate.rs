@@ -17,7 +17,7 @@ use crate::{
     object::ReplicaObject,
     placement::{
         ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta, ReplicaOrigin,
-        ReplicaPlacement, ReplicaStatus,
+        ReplicaPlacement, ReplicaSortKey, ReplicaStatus,
     },
 };
 
@@ -56,6 +56,11 @@ pub enum ReplicaMutation {
         /// The refreshed summary, when the consumer projects one; `None`
         /// keeps the cached summary.
         meta: Option<ReplicaMeta>,
+        /// The refreshed sort key, on the same terms as `meta`: `None`
+        /// keeps the stored one. An edit that changes what a key is
+        /// derived from (a card's name, an event's start) has to say so,
+        /// or the item stays where it was in the list.
+        sort_key: Option<ReplicaSortKey>,
     },
     /// Copy a placement into `target` as a pending create that the next
     /// sync pushes with a server-side copy (no body re-upload). The source
@@ -98,6 +103,8 @@ pub enum ReplicaMutation {
         body: Vec<u8>,
         /// The summary, when the consumer projects one.
         meta: Option<ReplicaMeta>,
+        /// The sort key, when the consumer's kind defines one.
+        sort_key: ReplicaSortKey,
     },
 }
 
@@ -174,12 +181,19 @@ impl ReplicaMutate {
                 vec![ReplicaWriteOp::UpsertPlacement(source)]
             }
             ReplicaMutation::Edit {
-                object, body, meta, ..
+                object,
+                body,
+                meta,
+                sort_key,
+                ..
             } => {
                 source.object = Some(object.hash.clone());
                 source.level = ReplicaLevel::Full;
                 if meta.is_some() {
                     source.meta = meta.clone();
+                }
+                if let Some(sort_key) = sort_key {
+                    source.sort_key = sort_key.clone();
                 }
 
                 // NOTE: editing a conflict is its resolution: the base
@@ -216,6 +230,7 @@ impl ReplicaMutate {
                     object: source.object.clone(),
                     level: source.level,
                     meta: source.meta.clone(),
+                    sort_key: source.sort_key.clone(),
                     flags: source.flags.clone(),
                     status: ReplicaStatus::Created,
                     conflict_revision: None,
@@ -243,6 +258,7 @@ impl ReplicaMutate {
                     object: source.object.clone(),
                     level: source.level,
                     meta: source.meta.clone(),
+                    sort_key: source.sort_key.clone(),
                     flags: source.flags.clone(),
                     status: ReplicaStatus::Created,
                     conflict_revision: None,
@@ -278,6 +294,7 @@ impl ReplicaMutate {
             object,
             body,
             meta,
+            sort_key,
         } = &self.mutation
         else {
             return Vec::new();
@@ -290,6 +307,7 @@ impl ReplicaMutate {
             object: Some(object.hash.clone()),
             level: ReplicaLevel::Full,
             meta: meta.clone(),
+            sort_key: sort_key.clone(),
             flags: flags.clone(),
             status: ReplicaStatus::Created,
             conflict_revision: None,
@@ -382,6 +400,7 @@ mod tests {
         crate::testlog::init();
         ReplicaLoaded {
             placements: vec![ReplicaPlacement {
+                sort_key: Default::default(),
                 collection: "inbox".into(),
                 handle: ReplicaHandle::from(handle),
                 link_id: None,
@@ -515,6 +534,7 @@ mod tests {
         use crate::object::{ReplicaHash, ReplicaObject};
 
         let mutation = ReplicaMutation::Add {
+            sort_key: Default::default(),
             handle: ReplicaHandle::from("draft-1"),
             link_id: ReplicaLinkId("mid:new".into()),
             flags: ReplicaFlags::from_iter(["\\Draft"]),
@@ -557,6 +577,7 @@ mod tests {
         use crate::object::{ReplicaHash, ReplicaObject};
 
         let mutation = ReplicaMutation::Add {
+            sort_key: Default::default(),
             handle: ReplicaHandle::from("draft-1"),
             link_id: ReplicaLinkId("mid:dup".into()),
             flags: ReplicaFlags::default(),
@@ -589,6 +610,7 @@ mod tests {
         use crate::object::{ReplicaHash, ReplicaObject};
 
         let mutation = ReplicaMutation::Add {
+            sort_key: Default::default(),
             handle: ReplicaHandle::from("draft-1"),
             link_id: ReplicaLinkId("mid:gone".into()),
             flags: ReplicaFlags::default(),
@@ -657,6 +679,7 @@ mod tests {
         use crate::object::{ReplicaHash, ReplicaObject};
 
         let mutation = ReplicaMutation::Edit {
+            sort_key: Default::default(),
             handle: ReplicaHandle::from("1"),
             object: ReplicaObject {
                 hash: ReplicaHash::from("h2"),
@@ -692,6 +715,7 @@ mod tests {
         use crate::object::{ReplicaHash, ReplicaObject};
 
         let mutation = ReplicaMutation::Edit {
+            sort_key: Default::default(),
             handle: ReplicaHandle::from("1"),
             object: ReplicaObject {
                 hash: ReplicaHash::from("h2"),
@@ -721,6 +745,7 @@ mod tests {
         use crate::object::{ReplicaHash, ReplicaObject};
 
         let mutation = ReplicaMutation::Edit {
+            sort_key: Default::default(),
             handle: ReplicaHandle::from("1"),
             object: ReplicaObject {
                 hash: ReplicaHash::from("h3"),

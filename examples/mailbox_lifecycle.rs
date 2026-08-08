@@ -181,6 +181,7 @@ impl ReplicaRemote for MemRemote {
                 }
             };
             out.push(ReplicaFetchedItem {
+                sort_key: Default::default(),
                 handle,
                 link_id: item.link.clone(),
                 meta: ReplicaMeta(

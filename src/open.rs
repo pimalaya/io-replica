@@ -80,6 +80,7 @@ mod tests {
 
     fn placement(handle: &str) -> ReplicaPlacement {
         ReplicaPlacement {
+            sort_key: Default::default(),
             collection: "inbox".into(),
             handle: ReplicaHandle::from(handle),
             link_id: None,

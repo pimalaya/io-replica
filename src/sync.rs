@@ -30,7 +30,8 @@ use crate::{
     collection::{ReplicaCheckpoint, ReplicaCollectionId},
     coroutine::*,
     placement::{
-        ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaPlacement, ReplicaStatus,
+        ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaPlacement, ReplicaSortKey,
+        ReplicaStatus,
     },
     remote::{ReplicaPushOutcome, ReplicaRemoteItem, ReplicaRemoteSnapshot},
 };
@@ -689,6 +690,7 @@ impl ReplicaSync {
             object: Some(object),
             level: ReplicaLevel::Full,
             meta: local.meta.clone(),
+            sort_key: local.sort_key.clone(),
             flags: local.flags.clone(),
             status: ReplicaStatus::Created,
             conflict_revision: None,
@@ -804,6 +806,7 @@ impl ReplicaSync {
             object: None,
             level: ReplicaLevel::Probed,
             meta: None,
+            sort_key: ReplicaSortKey::default(),
             flags: item.flags.clone(),
             status: ReplicaStatus::Clean,
             conflict_revision: None,
@@ -1124,6 +1127,7 @@ mod tests {
     /// A pending create staged in "inbox", its body sourced from "sent".
     fn created(handle: &str) -> ReplicaPlacement {
         ReplicaPlacement {
+            sort_key: Default::default(),
             collection: "inbox".into(),
             handle: ReplicaHandle::from(handle),
             link_id: None,
@@ -1143,6 +1147,7 @@ mod tests {
 
     fn synced(handle: &str, flags: &[&str]) -> ReplicaPlacement {
         ReplicaPlacement {
+            sort_key: Default::default(),
             collection: "inbox".into(),
             handle: ReplicaHandle::from(handle),
             link_id: Some(ReplicaLinkId::from(handle)),

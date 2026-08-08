@@ -35,7 +35,7 @@ use crate::{
     coroutine::*,
     placement::{
         ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta,
-        ReplicaPlacement, ReplicaStatus,
+        ReplicaPlacement, ReplicaSortKey, ReplicaStatus,
     },
     remote::{ReplicaRemoteItem, ReplicaTier},
 };
@@ -96,7 +96,7 @@ impl ReplicaRekey {
     /// placement resolves to the same logical item.
     fn rebuild(
         &mut self,
-        links: BTreeMap<ReplicaHandle, (ReplicaLinkId, ReplicaMeta)>,
+        links: BTreeMap<ReplicaHandle, (ReplicaLinkId, ReplicaMeta, ReplicaSortKey)>,
     ) -> Vec<ReplicaWriteOp> {
         let mut writes = Vec::new();
 
@@ -121,7 +121,7 @@ impl ReplicaRekey {
         let mut carried_over = BTreeSet::new();
         for item in mem::take(&mut self.items) {
             let resolved = links.get(&item.handle);
-            let carried = resolved.and_then(|(link, _)| old_by_link.remove(link));
+            let carried = resolved.and_then(|(link, _, _)| old_by_link.remove(link));
 
             match carried {
                 Some(old) => {
@@ -185,7 +185,7 @@ impl ReplicaRekey {
         &self,
         old: ReplicaPlacement,
         item: &ReplicaRemoteItem,
-        resolved: Option<&(ReplicaLinkId, ReplicaMeta)>,
+        resolved: Option<&(ReplicaLinkId, ReplicaMeta, ReplicaSortKey)>,
     ) -> ReplicaPlacement {
         let old_base_flags = old
             .base
@@ -216,8 +216,11 @@ impl ReplicaRekey {
             link_id: old.link_id.clone(),
             object: old.object.clone(),
             level: old.level,
+            sort_key: resolved
+                .map(|(_, _, key)| key.clone())
+                .unwrap_or_else(|| old.sort_key.clone()),
             meta: resolved
-                .map(|(_, meta)| meta.clone())
+                .map(|(_, meta, _)| meta.clone())
                 .or_else(|| old.meta.clone()),
             flags,
             status,
@@ -236,19 +239,20 @@ impl ReplicaRekey {
     fn fresh(
         &self,
         item: &ReplicaRemoteItem,
-        resolved: Option<&(ReplicaLinkId, ReplicaMeta)>,
+        resolved: Option<&(ReplicaLinkId, ReplicaMeta, ReplicaSortKey)>,
     ) -> ReplicaPlacement {
         ReplicaPlacement {
             collection: self.collection.clone(),
             handle: item.handle.clone(),
-            link_id: resolved.map(|(link, _)| link.clone()),
+            link_id: resolved.map(|(link, _, _)| link.clone()),
             object: None,
             level: if resolved.is_some() {
                 ReplicaLevel::Meta
             } else {
                 ReplicaLevel::Probed
             },
-            meta: resolved.map(|(_, meta)| meta.clone()),
+            meta: resolved.map(|(_, meta, _)| meta.clone()),
+            sort_key: resolved.map(|(_, _, key)| key.clone()).unwrap_or_default(),
             flags: item.flags.clone(),
             status: ReplicaStatus::Clean,
             conflict_revision: None,
@@ -314,10 +318,11 @@ impl ReplicaCoroutine for ReplicaRekey {
             }
 
             (State::PendingFetch, Some(ReplicaArg::Fetch(fetched))) => {
-                let links: BTreeMap<ReplicaHandle, (ReplicaLinkId, ReplicaMeta)> = fetched
-                    .into_iter()
-                    .map(|f| (f.handle, (f.link_id, f.meta)))
-                    .collect();
+                let links: BTreeMap<ReplicaHandle, (ReplicaLinkId, ReplicaMeta, ReplicaSortKey)> =
+                    fetched
+                        .into_iter()
+                        .map(|f| (f.handle, (f.link_id, f.meta, f.sort_key)))
+                        .collect();
 
                 trace!("resolved {} link ids", links.len());
                 self.state = State::PendingWrite;
@@ -362,6 +367,7 @@ mod tests {
     /// An old-spine placement, synced clean at base `flags`.
     fn synced(handle: &str, link: &str, flags: &[&str]) -> ReplicaPlacement {
         ReplicaPlacement {
+            sort_key: Default::default(),
             collection: "inbox".into(),
             handle: ReplicaHandle::from(handle),
             link_id: Some(ReplicaLinkId::from(link)),
@@ -390,6 +396,7 @@ mod tests {
 
     fn fetched(handle: &str, link: &str) -> ReplicaFetchedItem {
         ReplicaFetchedItem {
+            sort_key: Default::default(),
             handle: ReplicaHandle::from(handle),
             link_id: ReplicaLinkId::from(link),
             meta: ReplicaMeta("fresh row".into()),

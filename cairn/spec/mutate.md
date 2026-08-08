@@ -52,3 +52,9 @@ when a live (non-tombstone) placement already holds `link_id`; a tombstoned
 
 > Seed spec (Cairn, 2026-08-01): captures the offline mutation vocabulary,
 > retro-documented when `Add` was added.
+
+### Requirement: A mutation may restate the sort key
+`Add` SHALL carry a sort key, and `Edit` SHALL carry an optional one on the same
+terms as its optional summary: absent keeps the stored key. An edit that changes
+what the key is derived from has to say so, or the item stays where it was in
+the list.

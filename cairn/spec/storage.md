@@ -51,3 +51,26 @@ a persist-during-fetch stays idempotent under retry.
 - GIVEN a source whose Full fetch streams the body into the blob store and reports it by (hash, size)
 - WHEN the item is hydrated and later appended to another source
 - THEN the engine holds no full body, indexes the object from its (hash, size), and the append streams from the stored blob
+
+### Requirement: A placement carries a presentation sort key
+`ReplicaPlacement` and `ReplicaFetchedItem` SHALL carry a sort key: the item's
+position in its collection's natural order, derived by the consumer wherever the
+summary is derived. The engine SHALL treat it exactly as it treats the summary,
+as an opaque value it ferries and never parses.
+
+Empty SHALL mean unknown, and SHALL be the default, so an item is orderable from
+the moment it exists and no consumer has to invent a value. It is a plain value
+rather than an option because that is what the reference storage records, and
+one representation of "not known yet" is less to get wrong than two.
+
+### Requirement: A fetch refreshes the key at every tier
+An upgrade SHALL adopt the key from the fetched item at both tiers, unlike the
+link id, which is kept once resolved. The key is a projection of content rather
+than an identity, so the later and better-informed derivation wins: a full body
+carries the real date where an envelope may have carried none.
+
+### Requirement: A key survives a rekey
+Rebuilding a collection onto a new handle space SHALL carry each placement's key
+over, preferring the one the rekey's meta fetch resolved and falling back to the
+key the old placement held, so a handle-space change does not un-sort a
+collection.

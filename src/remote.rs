@@ -9,7 +9,7 @@ use alloc::{string::String, vec::Vec};
 use crate::{
     collection::ReplicaCheckpoint,
     object::ReplicaHash,
-    placement::{ReplicaFlags, ReplicaHandle, ReplicaLinkId, ReplicaMeta},
+    placement::{ReplicaFlags, ReplicaHandle, ReplicaLinkId, ReplicaMeta, ReplicaSortKey},
 };
 
 /// The detail tier a fetch targets.
@@ -101,6 +101,9 @@ pub struct ReplicaFetchedItem {
     /// The cached summary (always set; projected from the body where the
     /// backend has no cheap summary tier).
     pub meta: ReplicaMeta,
+    /// The presentation sort key, derived from the same parse as `meta`.
+    /// Empty when the connector's kind defines none.
+    pub sort_key: ReplicaSortKey,
     /// The body; `None` at [`ReplicaTier::Meta`]. At `Full` it is either inline
     /// bytes for the engine to store or a reference to an object the consumer
     /// already streamed into its blob store.

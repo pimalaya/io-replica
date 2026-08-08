@@ -78,6 +78,38 @@ impl From<String> for ReplicaLinkId {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ReplicaMeta(pub String);
 
+/// An item's position in its collection's natural order: the newest
+/// first for mail and calendars, A to Z for contacts.
+///
+/// Opaque to the engine, like [`ReplicaMeta`], and derived in the same
+/// place: whatever parses a body or an envelope into a summary already
+/// holds the date, the display name or the start time. The engine only
+/// ferries it, so what it means and how it is encoded are the kind's
+/// business and the storage's, never this crate's.
+///
+/// Empty means **unknown**, and is the default, so an item is orderable
+/// from the moment it exists and no consumer has to invent a value. It
+/// is a plain value rather than an `Option` because that is what the
+/// reference storage records (a `NOT NULL` column defaulting to the
+/// empty string), and one representation of "not known yet" is less to
+/// get wrong than two.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReplicaSortKey(pub String);
+
+impl<T: Into<String>> From<T> for ReplicaSortKey {
+    fn from(key: T) -> Self {
+        Self(key.into())
+    }
+}
+
+impl ReplicaSortKey {
+    /// Whether the key is unknown, so a caller can tell "never derived"
+    /// from a key that genuinely sorts first.
+    pub fn is_unknown(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// An item's set of state markers, normalized by the consumer.
 ///
 /// A plain string set so the engine stays protocol-agnostic; the consumer
@@ -201,6 +233,9 @@ pub struct ReplicaPlacement {
     /// keeps the stale summary as a display fallback until the next
     /// [`ReplicaLevel::Meta`] upgrade refetches it.
     pub meta: Option<ReplicaMeta>,
+    /// The presentation sort key, derived beside the summary and opaque
+    /// here exactly as the summary is: see [`ReplicaSortKey`].
+    pub sort_key: ReplicaSortKey,
     /// The current flag set.
     pub flags: ReplicaFlags,
     /// How this placement relates to its base.

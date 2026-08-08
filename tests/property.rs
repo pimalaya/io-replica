@@ -557,6 +557,7 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
                     let staged = client.mutate(
                         "inbox",
                         ReplicaMutation::Edit {
+                            sort_key: Default::default(),
                             handle: handle.clone(),
                             object,
                             body: body.clone(),
@@ -802,6 +803,7 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
                 .mutate(
                     "inbox",
                     ReplicaMutation::Edit {
+                        sort_key: Default::default(),
                         handle,
                         object,
                         body,
@@ -1211,6 +1213,7 @@ fn duo_edit(client: &mut DuoClient, index: usize, tag: &str, n: u8) {
             .mutate(
                 "inbox",
                 ReplicaMutation::Edit {
+                    sort_key: Default::default(),
                     handle,
                     object,
                     body,
@@ -1243,6 +1246,7 @@ fn duo_resolve(client: &mut DuoClient, tag: &str) -> bool {
             .mutate(
                 "inbox",
                 ReplicaMutation::Edit {
+                    sort_key: Default::default(),
                     handle,
                     object,
                     body,

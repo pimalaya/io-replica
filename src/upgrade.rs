@@ -225,6 +225,14 @@ impl ReplicaCoroutine for ReplicaUpgrade {
                         patched.link_id = Some(item.link_id);
                     }
                     patched.meta = Some(item.meta);
+                    // NOTE: unlike the link id, the key is refreshed on
+                    // every tier. It is a projection of the content, not
+                    // an identity, so the later and better-informed
+                    // derivation should win: a `Full` body carries the
+                    // real date where an envelope may have carried none.
+                    // A connector whose kind defines no key sends an
+                    // empty one, which reads as unknown either way.
+                    patched.sort_key = item.sort_key;
 
                     match (self.tier, item.body) {
                         (ReplicaTier::Full, Some(body)) => {
@@ -316,6 +324,7 @@ mod tests {
 
     fn probed(handle: &str, link: Option<&str>, level: ReplicaLevel) -> ReplicaPlacement {
         ReplicaPlacement {
+            sort_key: Default::default(),
             collection: "inbox".into(),
             handle: ReplicaHandle::from(handle),
             link_id: link.map(ReplicaLinkId::from),
@@ -389,6 +398,7 @@ mod tests {
         assert_eq!(handles, vec![ReplicaHandle::from("1")]);
 
         let items = vec![ReplicaFetchedItem {
+            sort_key: Default::default(),
             handle: ReplicaHandle::from("1"),
             link_id: ReplicaLinkId::from("msg-b"),
             meta: ReplicaMeta("hdr".into()),
@@ -435,6 +445,7 @@ mod tests {
         // Results returned in the reverse of the requested order.
         let items = vec![
             ReplicaFetchedItem {
+                sort_key: Default::default(),
                 handle: ReplicaHandle::from("2"),
                 link_id: ReplicaLinkId::from("msg-b"),
                 meta: ReplicaMeta("h".into()),
@@ -445,6 +456,7 @@ mod tests {
                 revision: None,
             },
             ReplicaFetchedItem {
+                sort_key: Default::default(),
                 handle: ReplicaHandle::from("1"),
                 link_id: ReplicaLinkId::from("msg-a"),
                 meta: ReplicaMeta("h".into()),
@@ -492,6 +504,7 @@ mod tests {
         let _ = up.resume(Some(ReplicaArg::LookupObject(BTreeMap::new())));
 
         let items = vec![ReplicaFetchedItem {
+            sort_key: Default::default(),
             handle: ReplicaHandle::from("1"),
             // The body parses to a *different* link than the Meta tier resolved.
             link_id: ReplicaLinkId::from("alt:divergent"),
@@ -536,6 +549,7 @@ mod tests {
         let _ = up.resume(Some(ReplicaArg::LookupObject(BTreeMap::new())));
 
         let items = vec![ReplicaFetchedItem {
+            sort_key: Default::default(),
             handle: ReplicaHandle::from("1"),
             link_id: ReplicaLinkId::from("mid:resolved"),
             meta: ReplicaMeta("hdr".into()),
@@ -575,6 +589,7 @@ mod tests {
         let _ = up.resume(Some(ReplicaArg::LookupObject(BTreeMap::new())));
 
         let items = vec![ReplicaFetchedItem {
+            sort_key: Default::default(),
             handle: ReplicaHandle::from("1"),
             link_id: ReplicaLinkId::from("msg-b"),
             meta: ReplicaMeta("hdr".into()),
@@ -627,6 +642,7 @@ mod tests {
         let _ = up.resume(Some(ReplicaArg::LookupObject(BTreeMap::new())));
 
         let items = vec![ReplicaFetchedItem {
+            sort_key: Default::default(),
             handle: ReplicaHandle::from("1"),
             link_id: ReplicaLinkId::from("msg-b"),
             meta: ReplicaMeta("hdr".into()),
@@ -766,6 +782,7 @@ mod tests {
         let _ = up.resume(Some(ReplicaArg::Load(loaded)));
 
         let items = vec![ReplicaFetchedItem {
+            sort_key: Default::default(),
             handle: ReplicaHandle::from("ghost"),
             link_id: ReplicaLinkId::from("msg-x"),
             meta: ReplicaMeta("hdr".into()),
@@ -818,6 +835,7 @@ mod tests {
         );
 
         let items = vec![ReplicaFetchedItem {
+            sort_key: Default::default(),
             handle: ReplicaHandle::from("2"),
             link_id: ReplicaLinkId::from("msg-b"),
             meta: ReplicaMeta("hdr".into()),
