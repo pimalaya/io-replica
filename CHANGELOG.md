@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-24
+
 ### Added
 
 - **A flag set can be unknown**, distinct from a known-empty one. `ReplicaFlags` is now `Unknown | Known(set)`, so the state the reference storage records as a `NULL` flags column (pimdir SPEC §13) has somewhere to live: before it, a placement nobody had read the markers of claimed to carry none.
@@ -86,7 +88,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added the std client behind the client feature: a blocking ReplicaClient servicing every yield through the consumer-implemented Storage and Remote traits.
 - Documented the at-least-once push contract (an add's link_id dedups a retry, a remove of an already-missing member reads as accepted) and the pointer-derived object refcounting the consumer maintains by diffing placement upserts and drops.
 
-[unreleased]: https://github.com/pimalaya/io-replica/compare/v0.3.0..HEAD
+[unreleased]: https://github.com/pimalaya/io-replica/compare/v0.4.0..HEAD
+[0.4.0]: https://github.com/pimalaya/io-replica/compare/v0.3.0..v0.4.0
 [0.3.0]: https://github.com/pimalaya/io-replica/compare/v0.2.0..v0.3.0
 [0.2.0]: https://github.com/pimalaya/io-replica/compare/v0.1.0..v0.2.0
 [0.1.0]: https://github.com/pimalaya/io-replica/compare/root..v0.1.0
