@@ -1275,6 +1275,25 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_local_set_adopts_the_remote_one_and_pushes_nothing() {
+        // A placement whose markers nobody has read yet holds no opinion, so
+        // the sync pulls what the source reports rather than pushing an
+        // absence over it (spec §13: `NULL` flags are unknown, not empty).
+        let mut local = synced("1", &[]);
+        local.flags = ReplicaFlags::Unknown;
+
+        let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
+        let (pushes, writes, report) = run(&mut sync, vec![local], vec![remote("1", &["seen"])]);
+
+        assert!(pushes.is_none(), "nothing to push from an unknown set");
+        assert_eq!(report.pulled, 1);
+        let ReplicaWriteOp::UpsertPlacement(p) = &writes[0] else {
+            panic!("expected UpsertPlacement, got {:?}", writes[0]);
+        };
+        assert!(p.flags.contains("seen"));
+    }
+
+    #[test]
     fn local_flag_change_pushes() {
         let mut local = synced("1", &[]);
         local.flags = ReplicaFlags::from_iter(["seen"]);

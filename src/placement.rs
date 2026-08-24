@@ -114,15 +114,45 @@ impl ReplicaSortKey {
 ///
 /// A plain string set so the engine stays protocol-agnostic; the consumer
 /// folds equivalent spellings (for example `\Seen`, `$seen`, `seen`)
-/// before they reach here. Backends without per-item markers leave it
-/// empty.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ReplicaFlags(pub BTreeSet<String>);
+/// before they reach here. Backends without per-item markers report an
+/// empty [`Known`](ReplicaFlags::Known) set.
+///
+/// [`Unknown`](ReplicaFlags::Unknown) is a state of its own, distinct from
+/// a known-empty set: an item enumerated but never fetched has markers
+/// nobody has read yet, and reading that as "no markers" would push the
+/// absence onto whichever side did know them. Only a *local* placement is
+/// ever unknown, since a source that reports an item reports what it read;
+/// the engine resolves it on the first fetch that carries a set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReplicaFlags {
+    /// Never read: the item is [probed](ReplicaLevel::Probed) and nothing
+    /// has reported its markers.
+    Unknown,
+    /// The markers as read, empty when the item carries none.
+    Known(BTreeSet<String>),
+}
 
 impl ReplicaFlags {
-    /// Reports whether `flag` is present.
+    /// Reports whether `flag` is present, which an unknown set never is.
     pub fn contains(&self, flag: &str) -> bool {
-        self.0.contains(flag)
+        match self {
+            Self::Unknown => false,
+            Self::Known(flags) => flags.contains(flag),
+        }
+    }
+
+    /// Whether the set has never been read, so a caller can tell it from a
+    /// set that is genuinely empty.
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+
+    /// The markers as read, or `None` while they are unknown.
+    pub fn known(&self) -> Option<&BTreeSet<String>> {
+        match self {
+            Self::Unknown => None,
+            Self::Known(flags) => Some(flags),
+        }
     }
 
     /// Three-way merges two flag sets element-wise against their base.
@@ -133,18 +163,42 @@ impl ReplicaFlags {
     /// an element-wise merge can never conflict. As set algebra the
     /// result is (local AND remote) OR (local MINUS base) OR (remote
     /// MINUS base).
+    ///
+    /// An unknown side holds no opinion, so it never wins and never loses:
+    /// the merge is whatever the other side reports, and two unknown sides
+    /// stay unknown. An unknown *base* is the same fact as no base at all
+    /// on this axis, so nothing is derived from it and both sides' markers
+    /// are kept.
     pub fn merge(base: &ReplicaFlags, local: &ReplicaFlags, remote: &ReplicaFlags) -> ReplicaFlags {
-        let kept = local.0.intersection(&remote.0).cloned();
-        let local_adds = local.0.difference(&base.0).cloned();
-        let remote_adds = remote.0.difference(&base.0).cloned();
+        let (Some(local), Some(remote)) = (local.known(), remote.known()) else {
+            return match (local, remote) {
+                (Self::Unknown, remote) => remote.clone(),
+                (local, _) => local.clone(),
+            };
+        };
+        let base = base.known().cloned().unwrap_or_default();
 
-        ReplicaFlags(kept.chain(local_adds).chain(remote_adds).collect())
+        let kept = local.intersection(remote).cloned();
+        let local_adds = local.difference(&base).cloned();
+        let remote_adds = remote.difference(&base).cloned();
+
+        Self::Known(kept.chain(local_adds).chain(remote_adds).collect())
+    }
+}
+
+/// A known-empty set, the shape of an item whose source has no markers to
+/// report. Unknown is deliberately not the default: it is the exception a
+/// probing enumeration states outright, not what an ordinary write falls
+/// back to.
+impl Default for ReplicaFlags {
+    fn default() -> Self {
+        Self::Known(BTreeSet::new())
     }
 }
 
 impl<S: ToString> FromIterator<S> for ReplicaFlags {
     fn from_iter<I: IntoIterator<Item = S>>(flags: I) -> Self {
-        Self(flags.into_iter().map(|f| f.to_string()).collect())
+        Self::Known(flags.into_iter().map(|f| f.to_string()).collect())
     }
 }
 
@@ -310,5 +364,37 @@ mod tests {
         let both = flags(&["new"]);
         let merged = ReplicaFlags::merge(&base, &both, &both);
         assert_eq!(merged, both);
+    }
+
+    #[test]
+    fn an_unknown_side_takes_the_other_and_two_stay_unknown() {
+        let base = flags(&["seen"]);
+        let known = flags(&["flagged"]);
+        let unknown = ReplicaFlags::Unknown;
+
+        // NOTE: a side that has never read the markers holds no opinion, so
+        // it neither wins nor loses: reading it as an empty set would remove
+        // every flag the other side reports.
+        assert_eq!(ReplicaFlags::merge(&base, &unknown, &known), known);
+        assert_eq!(ReplicaFlags::merge(&base, &known, &unknown), known);
+        assert_eq!(ReplicaFlags::merge(&base, &unknown, &unknown), unknown);
+    }
+
+    #[test]
+    fn an_unknown_base_keeps_both_sides_markers() {
+        // An unknown base is the same fact as no base on this axis: with
+        // nothing to have diverged from, neither side's flag is a removal.
+        let merged = ReplicaFlags::merge(&ReplicaFlags::Unknown, &flags(&["a"]), &flags(&["b"]));
+        assert_eq!(merged, flags(&["a", "b"]));
+    }
+
+    #[test]
+    fn an_unknown_set_is_not_an_empty_one() {
+        assert_ne!(ReplicaFlags::Unknown, flags(&[]));
+        assert!(ReplicaFlags::Unknown.is_unknown());
+        assert!(!ReplicaFlags::Unknown.contains("seen"));
+        assert_eq!(ReplicaFlags::Unknown.known(), None);
+        // The default is known-empty: unknown is stated, never fallen back to.
+        assert!(!ReplicaFlags::default().is_unknown());
     }
 }

@@ -319,8 +319,13 @@ impl ReplicaHub {
         item.deleted = false;
 
         // NOTE: flags merge element-wise and never conflict; meta and level
-        // adopt unconditionally.
-        item.flags = placement.flags.clone();
+        // adopt unconditionally. An unknown set does not erase a known one,
+        // on the same terms as an absent meta below: a source that has only
+        // probed an item holds no opinion about its markers, and reading that
+        // as "no markers" would clear what another source read.
+        if !placement.flags.is_unknown() {
+            item.flags = placement.flags.clone();
+        }
         if placement.meta.is_some() {
             item.meta = placement.meta.clone();
         }
@@ -1142,5 +1147,67 @@ mod sort_key_tests {
 
         let projected = hub.project(&ReplicaCollectionId::from("inbox"), &left);
         assert_eq!(projected[0].sort_key.0, "2026-08-02T09:00:00Z");
+    }
+}
+
+/// Flags carry the same unknown state a sort key does (spec §13: the store's
+/// `flags` column is `NULL` until something reads them, distinct from a
+/// known-empty `'[]'`), and the hub owes it the same rule.
+#[cfg(test)]
+mod flags_tests {
+
+    use crate::{
+        change::ReplicaWriteOp,
+        hub::*,
+        placement::{ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaPlacement},
+    };
+
+    fn upsert(flags: ReplicaFlags) -> ReplicaWriteOp {
+        ReplicaWriteOp::UpsertPlacement(ReplicaPlacement {
+            collection: ReplicaCollectionId::from("inbox"),
+            handle: ReplicaHandle::from("1"),
+            link_id: Some(ReplicaLinkId::from("mid:a@host")),
+            object: None,
+            level: ReplicaLevel::Meta,
+            meta: None,
+            sort_key: ReplicaSortKey::default(),
+            flags,
+            status: ReplicaStatus::Clean,
+            conflict_revision: None,
+            base: None,
+            origin: None,
+        })
+    }
+
+    #[test]
+    fn an_unknown_set_does_not_erase_a_known_one() {
+        // A second source that has only probed the item must not clear the
+        // markers the first one read.
+        let mut hub = ReplicaHub::default();
+        let left = ReplicaSourceId::from("left");
+        let right = ReplicaSourceId::from("right");
+
+        hub.absorb(&left, &[upsert(ReplicaFlags::from_iter(["seen"]))]);
+        hub.absorb(&right, &[upsert(ReplicaFlags::Unknown)]);
+
+        let projected = hub.project(&ReplicaCollectionId::from("inbox"), &left);
+        assert!(projected[0].flags.contains("seen"));
+    }
+
+    #[test]
+    fn a_known_set_replaces_an_unknown_one() {
+        // Only unknown is inert: a real set always corrects another, and a
+        // deliberate clearing (known-empty) is a real set.
+        let mut hub = ReplicaHub::default();
+        let left = ReplicaSourceId::from("left");
+
+        hub.absorb(&left, &[upsert(ReplicaFlags::Unknown)]);
+        hub.absorb(&left, &[upsert(ReplicaFlags::from_iter(["seen"]))]);
+        let projected = hub.project(&ReplicaCollectionId::from("inbox"), &left);
+        assert!(projected[0].flags.contains("seen"));
+
+        hub.absorb(&left, &[upsert(ReplicaFlags::default())]);
+        let projected = hub.project(&ReplicaCollectionId::from("inbox"), &left);
+        assert_eq!(projected[0].flags, ReplicaFlags::default());
     }
 }

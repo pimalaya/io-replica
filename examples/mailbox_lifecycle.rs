@@ -303,7 +303,8 @@ fn main() {
         &client.remote().collections[&"inbox".into()][&ReplicaHandle::from("1")].flags;
     println!(
         "6. synced: {} pushed, server now sees {:?}",
-        report.pushed, server_flags.0
+        report.pushed,
+        server_flags.known()
     );
 
     // 7. Another client flags msg-2 remotely; the next sync pulls it.
@@ -318,6 +319,7 @@ fn main() {
     let local = client.storage().placements[&("inbox".into(), ReplicaHandle::from("2"))].clone();
     println!(
         "7. synced: {} pulled, inbox/2 locally carries {:?}",
-        report.pulled, local.flags.0
+        report.pulled,
+        local.flags.known()
     );
 }

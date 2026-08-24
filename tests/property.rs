@@ -66,11 +66,13 @@ proptest! {
 
         // NOTE: a removal always wins: the other side cannot concurrently
         // re-add a flag it already held in the shared base.
+        let base_set = base.known().expect("generated known").clone();
         for side in [&local, &remote] {
-            for added in side.0.difference(&base.0) {
+            let side = side.known().expect("generated known");
+            for added in side.difference(&base_set) {
                 prop_assert!(merged.contains(added), "{added} added by one side");
             }
-            for removed in base.0.difference(&side.0) {
+            for removed in base_set.difference(side) {
                 prop_assert!(!merged.contains(removed), "{removed} removed by one side");
             }
         }
@@ -217,7 +219,7 @@ proptest! {
                 Op::ServerSetFlags(i, flags) => {
                     let handles: BTreeSet<ReplicaHandle> = server_handles(&client);
                     if let Some(handle) = nth(&handles, i) {
-                        let flags: Vec<&str> = flags.0.iter().map(|f| f.as_str()).collect();
+                        let flags: Vec<&str> = flags.known().into_iter().flatten().map(|f| f.as_str()).collect();
                         client.remote_mut().set_flags("inbox", handle.as_str(), &flags);
                     }
                 }
@@ -509,8 +511,10 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
                         .and_then(|p| p.base.as_ref())
                         .map(|b| b.flags.clone())
                         .unwrap_or_default();
-                    let added = flags.0.difference(&base.0).cloned().collect();
-                    let removed = base.0.difference(&flags.0).cloned().collect();
+                    let base = base.known().cloned().unwrap_or_default();
+                    let known = flags.known().cloned().unwrap_or_default();
+                    let added = known.difference(&base).cloned().collect();
+                    let removed = base.difference(&known).cloned().collect();
                     let staged = client.mutate(
                         "inbox",
                         ReplicaMutation::SetFlags {
@@ -645,7 +649,12 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
             }
             MutOp::ServerSetFlags(i, flags) => {
                 if let Some(handle) = nth(&on_server(&client, "inbox"), i) {
-                    let flags: Vec<&str> = flags.0.iter().map(|f| f.as_str()).collect();
+                    let flags: Vec<&str> = flags
+                        .known()
+                        .into_iter()
+                        .flatten()
+                        .map(|f| f.as_str())
+                        .collect();
                     client
                         .remote_mut()
                         .set_flags("inbox", handle.as_str(), &flags);
@@ -1107,7 +1116,7 @@ proptest! {
                 }
                 PairOp::ServerSetFlags(i, flags) => {
                     if let Some(handle) = nth(&on_server(), i) {
-                        let flags: Vec<&str> = flags.0.iter().map(|f| f.as_str()).collect();
+                        let flags: Vec<&str> = flags.known().into_iter().flatten().map(|f| f.as_str()).collect();
                         server.borrow_mut().set_flags("inbox", handle.as_str(), &flags);
                     }
                 }

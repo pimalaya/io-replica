@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A flag set can be unknown**, distinct from a known-empty one. `ReplicaFlags` is now `Unknown | Known(set)`, so the state the reference storage records as a `NULL` flags column (pimdir SPEC §13) has somewhere to live: before it, a placement nobody had read the markers of claimed to carry none.
+
+  Empty is an opinion. Element-wise it says every flag the other side holds was removed here, so a source that enumerates without markers (a CardDAV `sync-collection` REPORT returns hrefs and ETags and nothing else) looked exactly like a source that had cleared them. The merge now treats an unknown side as no opinion: the result is whatever the other side reports, two unknown sides stay unknown, and an unknown base is the same fact as no base on the flag axis. In the hub an unknown set **never erases a known one**, the rule the sort key already had.
+
+  `contains` reports `false` for an unknown set, `is_unknown` tells the two absences apart, and `known` hands out the set when there is one.
+
 - **A placement carries a presentation sort key**, `ReplicaSortKey`, beside its summary: the item's position in its collection's natural order, newest first for mail and calendars, A to Z for contacts. The engine ferries it and never parses it, exactly as it does the summary, so what it means stays the kind's business and how it is stored stays the storage's.
 
   Without it the only orderings a store can serve are by link id or allocation order, neither of which means anything to a reader, so every consumer had to scan a whole collection into memory to render a list.
@@ -20,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   In the hub, an unknown key **never erases a known one**, mirroring the rule for an absent summary: a second source that has only probed an item must not un-sort what another source already placed. A rekey carries each key over, falling back to the old placement's when the meta fetch resolved none, so a handle-space change does not un-sort a collection.
 
 ### Changed
+
+- **Breaking.** `ReplicaFlags` is an enum rather than a newtype over `BTreeSet<String>`, so its set is reached through `known()` instead of `.0`. `Default` is still known-empty and `FromIterator` still builds a known set, so an ordinary construction is unchanged; unknown is stated outright.
 
 - **Breaking.** `ReplicaPlacement`, `ReplicaFetchedItem` and `ReplicaHubItem` gained a `sort_key` field; `ReplicaMutation::Add` gained one and `ReplicaMutation::Edit` an optional one, on the same terms as its optional `meta` (absent keeps the stored key).
 
