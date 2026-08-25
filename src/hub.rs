@@ -128,6 +128,37 @@ impl ReplicaHubItem {
         }
     }
 
+    /// The placement this item projects into `collection` under `handle`.
+    ///
+    /// The shared half of a projection, which is the same for every source:
+    /// the content the hub holds, at the level it can honestly claim. What a
+    /// source's binding decides (the status it reads as, its base, its
+    /// conflict revision, the handles it cannot resolve) is settled by the
+    /// caller, so the three projections state their differences and nothing
+    /// else.
+    fn project(
+        &self,
+        collection: &ReplicaCollectionId,
+        link: &ReplicaLinkId,
+        handle: ReplicaHandle,
+    ) -> ReplicaPlacement {
+        ReplicaPlacement {
+            collection: collection.clone(),
+            handle,
+            link_id: Some(link.clone()),
+            object: self.object.clone(),
+            level: self.stored_level(),
+            meta: self.meta.clone(),
+            sort_key: self.sort_key.clone(),
+            flags: self.flags.clone(),
+            status: ReplicaStatus::Clean,
+            conflict_revision: None,
+            base: None,
+            origin: None,
+            ambiguous_handles: Vec::new(),
+        }
+    }
+
     /// Whether any source holds this identity under more than one handle.
     ///
     /// Per-source state read across the item, because the two rules it gates
@@ -227,21 +258,12 @@ impl ReplicaHub {
             ReplicaStatus::Dirty
         };
 
-        ReplicaPlacement {
-            collection: collection.clone(),
-            handle: binding.handle.clone(),
-            link_id: Some(link.clone()),
-            object: item.object.clone(),
-            level: item.stored_level(),
-            meta: item.meta.clone(),
-            sort_key: item.sort_key.clone(),
-            flags: item.flags.clone(),
-            status,
-            conflict_revision: binding.conflict_revision.clone(),
-            base: binding.base.clone(),
-            origin: None,
-            ambiguous_handles: binding.ambiguous_handles.clone(),
-        }
+        let mut placement = item.project(collection, link, binding.handle.clone());
+        placement.status = status;
+        placement.conflict_revision = binding.conflict_revision.clone();
+        placement.base = binding.base.clone();
+        placement.ambiguous_handles = binding.ambiguous_handles.clone();
+        placement
     }
 
     /// A `Tombstone` for an item deleted elsewhere but still held here, so the
@@ -255,21 +277,10 @@ impl ReplicaHub {
         item: &ReplicaHubItem,
         binding: &ReplicaSourceBinding,
     ) -> ReplicaPlacement {
-        ReplicaPlacement {
-            collection: collection.clone(),
-            handle: binding.handle.clone(),
-            link_id: Some(link.clone()),
-            object: item.object.clone(),
-            level: item.stored_level(),
-            meta: item.meta.clone(),
-            sort_key: item.sort_key.clone(),
-            flags: item.flags.clone(),
-            status: ReplicaStatus::Tombstone,
-            conflict_revision: None,
-            base: binding.base.clone(),
-            origin: None,
-            ambiguous_handles: Vec::new(),
-        }
+        let mut placement = item.project(collection, link, binding.handle.clone());
+        placement.status = ReplicaStatus::Tombstone;
+        placement.base = binding.base.clone();
+        placement
     }
 
     /// A `Created` append for an item missing on this source, staged only when
@@ -285,21 +296,12 @@ impl ReplicaHub {
         let mut handle = link.0.clone();
         handle.push_str("\u{1}hub");
 
-        Some(ReplicaPlacement {
-            collection: collection.clone(),
-            handle: ReplicaHandle(handle),
-            link_id: Some(link.clone()),
-            object: item.object.clone(),
-            level: ReplicaLevel::Full,
-            meta: item.meta.clone(),
-            sort_key: item.sort_key.clone(),
-            flags: item.flags.clone(),
-            status: ReplicaStatus::Created,
-            conflict_revision: None,
-            base: None,
-            origin: None,
-            ambiguous_handles: Vec::new(),
-        })
+        let mut placement = item.project(collection, link, ReplicaHandle(handle));
+        placement.status = ReplicaStatus::Created;
+        // NOTE: the body is there (checked above), so the staged copy claims
+        // it whatever high-water mark the item carries.
+        placement.level = ReplicaLevel::Full;
+        Some(placement)
     }
 
     /// Folds a source's sync writes back into the hub: an upsert adopts the

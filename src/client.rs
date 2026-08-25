@@ -23,13 +23,13 @@ use crate::{
     coroutine::*,
     mutate::{ReplicaMutate, ReplicaMutateError, ReplicaMutation},
     object::ReplicaHash,
-    open::{ReplicaOpen, ReplicaOpenError},
+    open::ReplicaOpen,
     placement::{ReplicaHandle, ReplicaLinkId},
-    rekey::{ReplicaRekey, ReplicaRekeyError, ReplicaRekeyReport},
+    rekey::{ReplicaRekey, ReplicaRekeyReport},
     remote::{ReplicaFetchedItem, ReplicaPushResult, ReplicaRemoteSnapshot, ReplicaTier},
     storage::{ReplicaLoadScope, ReplicaLoaded},
-    sync::{ReplicaSync, ReplicaSyncError, ReplicaSyncOptions, ReplicaSyncReport},
-    upgrade::{ReplicaUpgrade, ReplicaUpgradeError, ReplicaUpgradeReport},
+    sync::{ReplicaSync, ReplicaSyncOptions, ReplicaSyncReport},
+    upgrade::{ReplicaUpgrade, ReplicaUpgradeReport},
 };
 
 /// The local index plus blob store seam.
@@ -244,7 +244,7 @@ where
     pub fn open(
         &mut self,
         collection: impl Into<ReplicaCollectionId>,
-    ) -> Result<ReplicaLoaded, ReplicaClientError<S::Error, R::Error, ReplicaOpenError>> {
+    ) -> Result<ReplicaLoaded, ReplicaClientError<S::Error, R::Error, ReplicaArgError>> {
         self.run(ReplicaOpen::new(collection))
     }
 
@@ -254,8 +254,7 @@ where
         collection: impl Into<ReplicaCollectionId>,
         handles: Vec<ReplicaHandle>,
         tier: ReplicaTier,
-    ) -> Result<ReplicaUpgradeReport, ReplicaClientError<S::Error, R::Error, ReplicaUpgradeError>>
-    {
+    ) -> Result<ReplicaUpgradeReport, ReplicaClientError<S::Error, R::Error, ReplicaArgError>> {
         self.run(ReplicaUpgrade::new(collection, handles, tier))
     }
 
@@ -273,7 +272,7 @@ where
         &mut self,
         collection: impl Into<ReplicaCollectionId>,
         opts: ReplicaSyncOptions,
-    ) -> Result<ReplicaSyncReport, ReplicaClientError<S::Error, R::Error, ReplicaSyncError>> {
+    ) -> Result<ReplicaSyncReport, ReplicaClientError<S::Error, R::Error, ReplicaArgError>> {
         self.run(ReplicaSync::new(collection, opts))
     }
 
@@ -282,7 +281,7 @@ where
     pub fn rekey(
         &mut self,
         collection: impl Into<ReplicaCollectionId>,
-    ) -> Result<ReplicaRekeyReport, ReplicaClientError<S::Error, R::Error, ReplicaRekeyError>> {
+    ) -> Result<ReplicaRekeyReport, ReplicaClientError<S::Error, R::Error, ReplicaArgError>> {
         self.run(ReplicaRekey::new(collection))
     }
 }

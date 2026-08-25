@@ -18,6 +18,8 @@
 
 use alloc::{collections::BTreeMap, vec::Vec};
 
+use thiserror::Error;
+
 use crate::{
     change::{ReplicaChange, ReplicaWriteOp},
     collection::{ReplicaCheckpoint, ReplicaCollectionId},
@@ -38,6 +40,24 @@ pub enum ReplicaCoroutineState<Y, R> {
     Yielded(Y),
     /// Terminal yield. By convention `R = Result<Output, Error>`.
     Complete(R),
+}
+
+/// A driver that broke the coroutine contract.
+///
+/// The only way any verb but [`mutate`](crate::mutate) fails: they read
+/// local state, ask for remote state and stage writes, and none of that can
+/// go wrong inside the engine. It is one type rather than one per verb
+/// because it is one bug, in the driver rather than in the coroutine, and
+/// the caller knows which verb it resumed.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum ReplicaArgError {
+    /// The driver fed back an arg that does not match the pending yield, or
+    /// resumed a coroutine that had already completed.
+    #[error("Replica coroutine failed: unexpected arg")]
+    UnexpectedArg,
+    /// The driver resumed without the arg the pending yield required.
+    #[error("Replica coroutine failed: missing arg")]
+    MissingArg,
 }
 
 /// Standard-shape offline coroutine.

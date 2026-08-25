@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ReplicaDropReason`, carried by `ReplicaWriteOp::DropPlacement`: whether the item itself is gone, or only this row of it.
 - `ReplicaPlacement::staged_edit`, the single reading of "there is a local content edit here", replacing six hand-rolled predicates that disagreed about the status guard and about what a missing base means.
 
+- `coroutine::ReplicaArgError`, the one error a driver that breaks the coroutine contract gets, replacing the four per-verb enums that said it identically.
 - `ReplicaSync::PUSH_CHUNK` and `ReplicaSync::WRITE_CHUNK`, the number of changes one push chunk holds and the number of writes one batch holds.
 
 ### Changed
@@ -32,11 +33,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ReplicaRemoteSnapshot::items` is expected sorted by handle, each handle listed once. A snapshot that arrives unsorted is sorted and a repeated handle collapsed, so a consumer that gets it wrong pays a pass rather than correctness.
 
 - `ReplicaLoadScope::Link` becomes `Links`, taking several: the reads that ask about an identity rather than a location have to see every row claiming it.
-- A completed `ReplicaSync` no longer resumes. It used to hand back an empty report, which a caller cannot tell from a run that genuinely did nothing.
+- **No coroutine resumes once it has completed**, where only `ReplicaSync` refused before. The four others handed back a default output, which is exactly what a run that genuinely did nothing returns, so a driver with a loop bug was told it had succeeded.
+- `ReplicaMutateError` keeps its three real variants and composes the shared `ReplicaArgError` as `Arg`.
+- The hub projects its three placements (bound, tombstone, create) from one `ReplicaHubItem::project`, each settling only what the source binding decides. A field added to `ReplicaPlacement` is one edit rather than three, where forgetting one was a silently wrong projection rather than a compile error.
 
 ### Removed
 
 - `ReplicaCollection`, referenced nowhere. Its `enumerated` flag stated an invariant the engine models nowhere: spine completeness comes off the consumer's snapshot on every run.
+- `ReplicaOpenError`, `ReplicaUpgradeError`, `ReplicaRekeyError` and `ReplicaSyncError`, four byte-identical enums differing only in the verb their message named. `coroutine::ReplicaArgError` replaces them: a driver breaking the coroutine contract is one bug, and none of those four verbs can fail on its own terms.
 
 ### Fixed
 

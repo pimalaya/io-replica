@@ -27,7 +27,6 @@ use alloc::{
 };
 
 use log::{debug, trace};
-use thiserror::Error;
 
 use crate::{
     change::{ReplicaDropReason, ReplicaWriteOp},
@@ -52,17 +51,6 @@ pub struct ReplicaRekeyReport {
     /// (no link id resolved before the handle-space change, or the item
     /// is gone from the new spine) and were dropped with it.
     pub dropped: usize,
-}
-
-/// Failure causes during a REKEY flow.
-#[derive(Clone, Debug, Error)]
-pub enum ReplicaRekeyError {
-    /// The driver fed back an arg that does not match the pending yield.
-    #[error("Replica REKEY failed: unexpected coroutine arg")]
-    UnexpectedArg,
-    /// The driver resumed without the arg the pending yield required.
-    #[error("Replica REKEY failed: missing coroutine arg")]
-    MissingArg,
 }
 
 /// I/O-free REKEY coroutine.
@@ -285,7 +273,7 @@ impl ReplicaRekey {
 
 impl ReplicaCoroutine for ReplicaRekey {
     type Yield = ReplicaYield;
-    type Return = Result<ReplicaRekeyReport, ReplicaRekeyError>;
+    type Return = Result<ReplicaRekeyReport, ReplicaArgError>;
 
     fn resume(
         &mut self,
@@ -355,11 +343,14 @@ impl ReplicaCoroutine for ReplicaRekey {
                     "rekey done: {} carried, {} pulled, {} pending dropped",
                     self.report.rekeyed, self.report.pulled, self.report.dropped,
                 );
+                // NOTE: a completed coroutine stays completed; resuming one
+                // is a driver bug, not an empty success.
+                self.state = State::Done;
                 ReplicaCoroutineState::Complete(Ok(self.report))
             }
 
-            (_, Some(_)) => ReplicaCoroutineState::Complete(Err(ReplicaRekeyError::UnexpectedArg)),
-            (_, None) => ReplicaCoroutineState::Complete(Err(ReplicaRekeyError::MissingArg)),
+            (_, Some(_)) => ReplicaCoroutineState::Complete(Err(ReplicaArgError::UnexpectedArg)),
+            (_, None) => ReplicaCoroutineState::Complete(Err(ReplicaArgError::MissingArg)),
         }
     }
 }
@@ -370,6 +361,7 @@ enum State {
     PendingEnumerate,
     PendingFetch,
     PendingWrite,
+    Done,
 }
 
 #[cfg(test)]
@@ -661,8 +653,29 @@ mod tests {
         let mut rekey = ReplicaRekey::new("inbox");
         let _ = rekey.resume(None);
         match rekey.resume(None) {
-            ReplicaCoroutineState::Complete(Err(ReplicaRekeyError::MissingArg)) => {}
+            ReplicaCoroutineState::Complete(Err(ReplicaArgError::MissingArg)) => {}
             state => panic!("expected MissingArg, got {state:?}"),
+        }
+    }
+
+    /// An empty report is indistinguishable from a run that genuinely did
+    /// nothing, so a driver resuming a finished coroutine must be told.
+    #[test]
+    fn a_completed_rekey_does_not_resume() {
+        let mut rekey = ReplicaRekey::new("inbox");
+        let _ = rekey.resume(None);
+        let _ = rekey.resume(Some(ReplicaArg::Load(ReplicaLoaded::default())));
+        let _ = rekey.resume(Some(ReplicaArg::Enumerate(ReplicaRemoteSnapshot {
+            items: Vec::new(),
+            vanished: Vec::new(),
+            complete: true,
+            checkpoint: ReplicaCheckpoint(b"v2".to_vec()),
+        })));
+        let _ = rekey.resume(Some(ReplicaArg::Write));
+
+        match rekey.resume(Some(ReplicaArg::Write)) {
+            ReplicaCoroutineState::Complete(Err(ReplicaArgError::UnexpectedArg)) => {}
+            state => panic!("expected UnexpectedArg, got {state:?}"),
         }
     }
 
@@ -671,7 +684,7 @@ mod tests {
         let mut rekey = ReplicaRekey::new("inbox");
         let _ = rekey.resume(None);
         match rekey.resume(Some(ReplicaArg::Write)) {
-            ReplicaCoroutineState::Complete(Err(ReplicaRekeyError::UnexpectedArg)) => {}
+            ReplicaCoroutineState::Complete(Err(ReplicaArgError::UnexpectedArg)) => {}
             state => panic!("expected UnexpectedArg, got {state:?}"),
         }
     }

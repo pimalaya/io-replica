@@ -158,12 +158,9 @@ pub enum ReplicaMutateError {
     /// the source has to hold the identity once again first.
     #[error("Replica MUTATE failed: ambiguous identity at handle {0}")]
     Ambiguous(String),
-    /// The driver fed back an arg that does not match the pending yield.
-    #[error("Replica MUTATE failed: unexpected coroutine arg")]
-    UnexpectedArg,
-    /// The driver resumed without the arg the pending yield required.
-    #[error("Replica MUTATE failed: missing coroutine arg")]
-    MissingArg,
+    /// The driver broke the coroutine contract.
+    #[error(transparent)]
+    Arg(#[from] ReplicaArgError),
 }
 
 /// I/O-free MUTATE coroutine.
@@ -425,10 +422,15 @@ impl ReplicaCoroutine for ReplicaMutate {
             }
             (State::PendingWrite, Some(ReplicaArg::Write)) => {
                 debug!("local change written");
+                // NOTE: a completed coroutine stays completed; resuming one
+                // is a driver bug, not an empty success.
+                self.state = State::Done;
                 ReplicaCoroutineState::Complete(Ok(()))
             }
-            (_, Some(_)) => ReplicaCoroutineState::Complete(Err(ReplicaMutateError::UnexpectedArg)),
-            (_, None) => ReplicaCoroutineState::Complete(Err(ReplicaMutateError::MissingArg)),
+            (_, Some(_)) => {
+                ReplicaCoroutineState::Complete(Err(ReplicaArgError::UnexpectedArg.into()))
+            }
+            (_, None) => ReplicaCoroutineState::Complete(Err(ReplicaArgError::MissingArg.into())),
         }
     }
 }
@@ -437,6 +439,7 @@ enum State {
     Start,
     PendingLoad,
     PendingWrite,
+    Done,
 }
 
 #[cfg(test)]
@@ -709,8 +712,28 @@ mod tests {
         let _ = mutate.resume(None);
 
         match mutate.resume(None) {
-            ReplicaCoroutineState::Complete(Err(ReplicaMutateError::MissingArg)) => {}
+            ReplicaCoroutineState::Complete(Err(ReplicaMutateError::Arg(
+                ReplicaArgError::MissingArg,
+            ))) => {}
             state => panic!("expected MissingArg, got {state:?}"),
+        }
+    }
+
+    /// An empty success is indistinguishable from a run that genuinely did
+    /// nothing, so a driver resuming a finished coroutine must be told.
+    #[test]
+    fn a_completed_mutate_does_not_resume() {
+        let mutation = ReplicaMutation::Remove(ReplicaHandle::from("1"));
+        let mut mutate = ReplicaMutate::new("inbox", mutation);
+        let _ = mutate.resume(None);
+        let _ = mutate.resume(Some(ReplicaArg::Load(loaded("1"))));
+        let _ = mutate.resume(Some(ReplicaArg::Write));
+
+        match mutate.resume(Some(ReplicaArg::Write)) {
+            ReplicaCoroutineState::Complete(Err(ReplicaMutateError::Arg(
+                ReplicaArgError::UnexpectedArg,
+            ))) => {}
+            state => panic!("expected UnexpectedArg, got {state:?}"),
         }
     }
 
@@ -721,7 +744,9 @@ mod tests {
         let _ = mutate.resume(None);
 
         match mutate.resume(Some(ReplicaArg::Write)) {
-            ReplicaCoroutineState::Complete(Err(ReplicaMutateError::UnexpectedArg)) => {}
+            ReplicaCoroutineState::Complete(Err(ReplicaMutateError::Arg(
+                ReplicaArgError::UnexpectedArg,
+            ))) => {}
             state => panic!("expected UnexpectedArg, got {state:?}"),
         }
     }

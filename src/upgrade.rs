@@ -12,7 +12,6 @@ use core::mem;
 use alloc::{collections::BTreeMap, vec::Vec};
 
 use log::{debug, trace};
-use thiserror::Error;
 
 use crate::{
     change::ReplicaWriteOp,
@@ -33,17 +32,6 @@ pub struct ReplicaUpgradeReport {
     pub fetched: usize,
     /// Bodies linked from the object store without a fetch.
     pub deduped: usize,
-}
-
-/// Failure causes during an UPGRADE flow.
-#[derive(Clone, Debug, Error)]
-pub enum ReplicaUpgradeError {
-    /// The driver fed back an arg that does not match the pending yield.
-    #[error("Replica UPGRADE failed: unexpected coroutine arg")]
-    UnexpectedArg,
-    /// The driver resumed without the arg the pending yield required.
-    #[error("Replica UPGRADE failed: missing coroutine arg")]
-    MissingArg,
 }
 
 /// I/O-free UPGRADE coroutine.
@@ -144,7 +132,7 @@ impl ReplicaUpgrade {
 
 impl ReplicaCoroutine for ReplicaUpgrade {
     type Yield = ReplicaYield;
-    type Return = Result<ReplicaUpgradeReport, ReplicaUpgradeError>;
+    type Return = Result<ReplicaUpgradeReport, ReplicaArgError>;
 
     fn resume(
         &mut self,
@@ -170,6 +158,7 @@ impl ReplicaCoroutine for ReplicaUpgrade {
                 let pending = self.pending_handles();
                 if pending.is_empty() {
                     debug!("nothing to upgrade");
+                    self.state = State::Done;
                     return ReplicaCoroutineState::Complete(Ok(self.report));
                 }
 
@@ -313,13 +302,14 @@ impl ReplicaCoroutine for ReplicaUpgrade {
                     "upgraded {} items ({} fetched, {} linked from store)",
                     self.report.upgraded, self.report.fetched, self.report.deduped,
                 );
+                // NOTE: a completed coroutine stays completed; resuming one
+                // is a driver bug, not an empty success.
+                self.state = State::Done;
                 ReplicaCoroutineState::Complete(Ok(self.report))
             }
 
-            (_, Some(_)) => {
-                ReplicaCoroutineState::Complete(Err(ReplicaUpgradeError::UnexpectedArg))
-            }
-            (_, None) => ReplicaCoroutineState::Complete(Err(ReplicaUpgradeError::MissingArg)),
+            (_, Some(_)) => ReplicaCoroutineState::Complete(Err(ReplicaArgError::UnexpectedArg)),
+            (_, None) => ReplicaCoroutineState::Complete(Err(ReplicaArgError::MissingArg)),
         }
     }
 }
@@ -473,6 +463,7 @@ enum State {
     PendingFetch,
     PendingLinkCheck,
     PendingWrite,
+    Done,
 }
 
 #[cfg(test)]
@@ -926,8 +917,29 @@ mod tests {
             ReplicaUpgrade::new("inbox", vec![ReplicaHandle::from("1")], ReplicaTier::Meta);
         let _ = up.resume(None);
         match up.resume(None) {
-            ReplicaCoroutineState::Complete(Err(ReplicaUpgradeError::MissingArg)) => {}
+            ReplicaCoroutineState::Complete(Err(ReplicaArgError::MissingArg)) => {}
             state => panic!("expected MissingArg, got {state:?}"),
+        }
+    }
+
+    /// An empty report is indistinguishable from a run that genuinely did
+    /// nothing, so a driver resuming a finished coroutine must be told.
+    #[test]
+    fn a_completed_upgrade_does_not_resume() {
+        let mut placement = probed("1", Some("x"), ReplicaLevel::Full);
+        placement.object = Some(ReplicaHash::from("h1"));
+        let loaded = ReplicaLoaded {
+            placements: vec![placement],
+            checkpoint: None,
+        };
+        let mut up =
+            ReplicaUpgrade::new("inbox", vec![ReplicaHandle::from("1")], ReplicaTier::Full);
+        let _ = up.resume(None);
+        let _ = up.resume(Some(ReplicaArg::Load(loaded)));
+
+        match up.resume(Some(ReplicaArg::Write)) {
+            ReplicaCoroutineState::Complete(Err(ReplicaArgError::UnexpectedArg)) => {}
+            state => panic!("expected UnexpectedArg, got {state:?}"),
         }
     }
 
@@ -937,7 +949,7 @@ mod tests {
             ReplicaUpgrade::new("inbox", vec![ReplicaHandle::from("1")], ReplicaTier::Meta);
         let _ = up.resume(None);
         match up.resume(Some(ReplicaArg::Write)) {
-            ReplicaCoroutineState::Complete(Err(ReplicaUpgradeError::UnexpectedArg)) => {}
+            ReplicaCoroutineState::Complete(Err(ReplicaArgError::UnexpectedArg)) => {}
             state => panic!("expected UnexpectedArg, got {state:?}"),
         }
     }
@@ -1089,8 +1101,7 @@ mod tests {
     fn upgrade_with_lookup(
         placement: ReplicaPlacement,
         known: BTreeMap<ReplicaLinkId, ReplicaHash>,
-    ) -> ReplicaCoroutineState<ReplicaYield, Result<ReplicaUpgradeReport, ReplicaUpgradeError>>
-    {
+    ) -> ReplicaCoroutineState<ReplicaYield, Result<ReplicaUpgradeReport, ReplicaArgError>> {
         let handle = placement.handle.clone();
         let loaded = ReplicaLoaded {
             placements: vec![placement],

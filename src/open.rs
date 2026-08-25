@@ -4,24 +4,12 @@
 //! straight back. No network is ever touched.
 
 use log::{debug, trace};
-use thiserror::Error;
 
 use crate::{
     collection::ReplicaCollectionId,
     coroutine::*,
     storage::{ReplicaLoadScope, ReplicaLoaded},
 };
-
-/// Failure causes during an OPEN flow.
-#[derive(Clone, Debug, Error)]
-pub enum ReplicaOpenError {
-    /// The driver fed back an arg that does not match the pending yield.
-    #[error("Replica OPEN failed: unexpected coroutine arg")]
-    UnexpectedArg,
-    /// The driver resumed without the arg the pending yield required.
-    #[error("Replica OPEN failed: missing coroutine arg")]
-    MissingArg,
-}
 
 /// I/O-free OPEN coroutine.
 pub struct ReplicaOpen {
@@ -44,7 +32,7 @@ impl ReplicaOpen {
 
 impl ReplicaCoroutine for ReplicaOpen {
     type Yield = ReplicaYield;
-    type Return = Result<ReplicaLoaded, ReplicaOpenError>;
+    type Return = Result<ReplicaLoaded, ReplicaArgError>;
 
     fn resume(
         &mut self,
@@ -62,10 +50,14 @@ impl ReplicaCoroutine for ReplicaOpen {
             (State::PendingLoad, Some(ReplicaArg::Load(loaded))) => {
                 debug!("opened collection with {} items", loaded.placements.len());
                 trace!("loaded placements: {:?}", loaded.placements);
+                // NOTE: a completed coroutine stays completed, or resuming a
+                // finished run would hand back an empty success a caller
+                // cannot tell from a run that genuinely did nothing.
+                self.state = State::Done;
                 ReplicaCoroutineState::Complete(Ok(loaded))
             }
-            (_, Some(_)) => ReplicaCoroutineState::Complete(Err(ReplicaOpenError::UnexpectedArg)),
-            (_, None) => ReplicaCoroutineState::Complete(Err(ReplicaOpenError::MissingArg)),
+            (_, Some(_)) => ReplicaCoroutineState::Complete(Err(ReplicaArgError::UnexpectedArg)),
+            (_, None) => ReplicaCoroutineState::Complete(Err(ReplicaArgError::MissingArg)),
         }
     }
 }
@@ -73,6 +65,7 @@ impl ReplicaCoroutine for ReplicaOpen {
 enum State {
     Start,
     PendingLoad,
+    Done,
 }
 
 #[cfg(test)]
@@ -130,11 +123,28 @@ mod tests {
         }
     }
 
+    /// An empty success is indistinguishable from a run that genuinely did
+    /// nothing, so a driver resuming a finished coroutine must be told.
+    #[test]
+    fn a_completed_open_does_not_resume() {
+        let mut open = ReplicaOpen::new("inbox");
+        let _ = open.resume(None);
+        let _ = open.resume(Some(ReplicaArg::Load(ReplicaLoaded {
+            placements: vec![placement("1")],
+            checkpoint: None,
+        })));
+
+        match open.resume(Some(ReplicaArg::Write)) {
+            ReplicaCoroutineState::Complete(Err(ReplicaArgError::UnexpectedArg)) => {}
+            state => panic!("expected UnexpectedArg, got {state:?}"),
+        }
+    }
+
     #[test]
     fn unexpected_arg_at_start_errors() {
         let mut open = ReplicaOpen::new("inbox");
         match open.resume(Some(ReplicaArg::Write)) {
-            ReplicaCoroutineState::Complete(Err(ReplicaOpenError::UnexpectedArg)) => {}
+            ReplicaCoroutineState::Complete(Err(ReplicaArgError::UnexpectedArg)) => {}
             state => panic!("expected UnexpectedArg, got {state:?}"),
         }
     }
@@ -144,7 +154,7 @@ mod tests {
         let mut open = ReplicaOpen::new("inbox");
         let _ = open.resume(None);
         match open.resume(None) {
-            ReplicaCoroutineState::Complete(Err(ReplicaOpenError::MissingArg)) => {}
+            ReplicaCoroutineState::Complete(Err(ReplicaArgError::MissingArg)) => {}
             state => panic!("expected MissingArg, got {state:?}"),
         }
     }
@@ -154,7 +164,7 @@ mod tests {
         let mut open = ReplicaOpen::new("inbox");
         let _ = open.resume(None);
         match open.resume(Some(ReplicaArg::Write)) {
-            ReplicaCoroutineState::Complete(Err(ReplicaOpenError::UnexpectedArg)) => {}
+            ReplicaCoroutineState::Complete(Err(ReplicaArgError::UnexpectedArg)) => {}
             state => panic!("expected UnexpectedArg, got {state:?}"),
         }
     }

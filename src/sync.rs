@@ -26,7 +26,6 @@ use alloc::{
 };
 
 use log::{debug, trace};
-use thiserror::Error;
 
 use crate::{
     change::{ReplicaChange, ReplicaChangeKind, ReplicaDropReason, ReplicaWriteOp},
@@ -189,17 +188,6 @@ pub struct ReplicaSyncReport {
     pub events: Vec<ReplicaEvent>,
 }
 
-/// Failure causes during a SYNC flow.
-#[derive(Clone, Debug, Error)]
-pub enum ReplicaSyncError {
-    /// The driver fed back an arg that does not match the pending yield.
-    #[error("Replica SYNC failed: unexpected coroutine arg")]
-    UnexpectedArg,
-    /// The driver resumed without the arg the pending yield required.
-    #[error("Replica SYNC failed: missing coroutine arg")]
-    MissingArg,
-}
-
 /// I/O-free SYNC coroutine.
 pub struct ReplicaSync {
     collection: ReplicaCollectionId,
@@ -297,7 +285,7 @@ impl ReplicaSync {
     /// when there is no chunk left to send.
     fn step(
         &mut self,
-    ) -> ReplicaCoroutineState<ReplicaYield, Result<ReplicaSyncReport, ReplicaSyncError>> {
+    ) -> ReplicaCoroutineState<ReplicaYield, Result<ReplicaSyncReport, ReplicaArgError>> {
         if self.pushes.is_empty() {
             debug!("write {} storage ops", self.writes.len());
             self.state = State::PendingWrite;
@@ -390,7 +378,7 @@ impl ReplicaSync {
     /// runs out and the run moves on to its pushes.
     fn merge_step(
         &mut self,
-    ) -> ReplicaCoroutineState<ReplicaYield, Result<ReplicaSyncReport, ReplicaSyncError>> {
+    ) -> ReplicaCoroutineState<ReplicaYield, Result<ReplicaSyncReport, ReplicaArgError>> {
         while let Some(candidate) = self.next_candidate() {
             // NOTE: the merge derives what to do; keying it is the last
             // thing that happens to it, in one place, so no change can exist
@@ -1124,7 +1112,7 @@ impl ReplicaSync {
 
 impl ReplicaCoroutine for ReplicaSync {
     type Yield = ReplicaYield;
-    type Return = Result<ReplicaSyncReport, ReplicaSyncError>;
+    type Return = Result<ReplicaSyncReport, ReplicaArgError>;
 
     fn resume(
         &mut self,
@@ -1285,8 +1273,8 @@ impl ReplicaCoroutine for ReplicaSync {
                 ReplicaCoroutineState::Complete(Ok(mem::take(&mut self.report)))
             }
 
-            (_, Some(_)) => ReplicaCoroutineState::Complete(Err(ReplicaSyncError::UnexpectedArg)),
-            (_, None) => ReplicaCoroutineState::Complete(Err(ReplicaSyncError::MissingArg)),
+            (_, Some(_)) => ReplicaCoroutineState::Complete(Err(ReplicaArgError::UnexpectedArg)),
+            (_, None) => ReplicaCoroutineState::Complete(Err(ReplicaArgError::MissingArg)),
         }
     }
 }
@@ -3179,7 +3167,7 @@ mod tests {
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
         let _ = sync.resume(None);
         match sync.resume(None) {
-            ReplicaCoroutineState::Complete(Err(ReplicaSyncError::MissingArg)) => {}
+            ReplicaCoroutineState::Complete(Err(ReplicaArgError::MissingArg)) => {}
             state => panic!("expected MissingArg, got {state:?}"),
         }
     }
@@ -3191,7 +3179,7 @@ mod tests {
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
         let _ = run(&mut sync, vec![], vec![]);
         match sync.resume(Some(ReplicaArg::Write)) {
-            ReplicaCoroutineState::Complete(Err(ReplicaSyncError::UnexpectedArg)) => {}
+            ReplicaCoroutineState::Complete(Err(ReplicaArgError::UnexpectedArg)) => {}
             state => panic!("expected UnexpectedArg, got {state:?}"),
         }
     }
@@ -3201,7 +3189,7 @@ mod tests {
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
         let _ = sync.resume(None);
         match sync.resume(Some(ReplicaArg::Write)) {
-            ReplicaCoroutineState::Complete(Err(ReplicaSyncError::UnexpectedArg)) => {}
+            ReplicaCoroutineState::Complete(Err(ReplicaArgError::UnexpectedArg)) => {}
             state => panic!("expected UnexpectedArg, got {state:?}"),
         }
     }

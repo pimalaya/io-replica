@@ -187,3 +187,8 @@ The freeze is per source otherwise: in a two-sided store one side may hold the d
 - GIVEN that item
 - WHEN the ambiguous source drops its bound handle as deleted
 - THEN the shared item is not marked deleted and the other source is untouched
+
+### Requirement: A hub projection states only what its source decides
+The three placements the hub projects (a bound member, a tombstone for one deleted elsewhere, a create for one this source lacks) SHALL be built from one projection carrying the item's shared content, each settling only what the source's binding decides: the status it reads as, its base, its conflict revision, the handles it cannot resolve.
+
+Stating the shared content once is what makes a field added to `ReplicaPlacement` a change in one place: three hand-written projections make forgetting one a silent wrong answer rather than a compile error.
