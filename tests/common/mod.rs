@@ -20,7 +20,7 @@ use io_replica::{
         ReplicaFetchedBody, ReplicaFetchedItem, ReplicaPushOutcome, ReplicaPushResult,
         ReplicaRemoteItem, ReplicaRemoteSnapshot, ReplicaTier,
     },
-    storage::ReplicaLoaded,
+    storage::{ReplicaLoadScope, ReplicaLoaded},
 };
 
 #[derive(Default)]
@@ -41,12 +41,25 @@ impl MemStorage {
 impl ReplicaStorage for MemStorage {
     type Error = Infallible;
 
-    fn load(&self, collection: &ReplicaCollectionId) -> Result<ReplicaLoaded, Infallible> {
+    fn load(
+        &self,
+        collection: &ReplicaCollectionId,
+        scope: &ReplicaLoadScope,
+    ) -> Result<ReplicaLoaded, Infallible> {
+        // NOTE: honoured exactly rather than over-delivered, so a verb
+        // that asks for too narrow a scope fails a test here rather than
+        // passing on rows it never said it needed.
+        let in_scope = |p: &ReplicaPlacement| match scope {
+            ReplicaLoadScope::All => true,
+            ReplicaLoadScope::Handles(handles) => handles.contains(&p.handle),
+            ReplicaLoadScope::Link(link) => p.link_id.as_ref() == Some(link),
+        };
         let placements = self
             .placements
             .iter()
             .filter(|((c, _), _)| c == collection)
             .map(|(_, p)| p.clone())
+            .filter(in_scope)
             .collect();
         let checkpoint = self.checkpoints.get(collection).cloned();
 
@@ -84,7 +97,9 @@ impl ReplicaStorage for MemStorage {
                     self.placements
                         .insert((p.collection.clone(), p.handle.clone()), p);
                 }
-                ReplicaWriteOp::DropPlacement { collection, handle } => {
+                ReplicaWriteOp::DropPlacement {
+                    collection, handle, ..
+                } => {
                     self.placements.remove(&(collection, handle));
                 }
                 ReplicaWriteOp::StoreObject { object, body } => {
@@ -244,6 +259,31 @@ impl MemRemote {
         self.item(collection, handle).rev
     }
 
+    /// The member of `collection` holding `link`, ignoring `except`: the
+    /// delivery key both halves of a move check before delivering.
+    fn link_holder(
+        &self,
+        collection: &ReplicaCollectionId,
+        link: Option<&ReplicaLinkId>,
+        except: Option<&ReplicaHandle>,
+    ) -> Option<ReplicaHandle> {
+        let link = link?;
+        self.items
+            .get(collection)?
+            .iter()
+            .find(|(handle, item)| &item.link_id == link && Some(*handle) != except)
+            .map(|(handle, _)| handle.clone())
+    }
+
+    fn holds_link(
+        &self,
+        collection: &ReplicaCollectionId,
+        link: Option<&ReplicaLinkId>,
+        except: Option<&ReplicaHandle>,
+    ) -> bool {
+        self.link_holder(collection, link, except).is_some()
+    }
+
     fn item(&self, collection: &str, handle: &str) -> &ServerItem {
         self.items
             .get(&collection.into())
@@ -399,8 +439,14 @@ impl ReplicaRemote for MemRemote {
                 ReplicaChange::Remove {
                     handle,
                     to,
+                    link_id,
                     if_match,
                 } => {
+                    // NOTE: the move's other half already delivered this
+                    // item, so the remove is a plain delete of the source
+                    // rather than a second relocation.
+                    let to = to
+                        .filter(|target| !self.holds_link(target, link_id.as_ref(), Some(&handle)));
                     let stale = self.mutable
                         && self
                             .items

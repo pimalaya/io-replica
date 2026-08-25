@@ -17,7 +17,7 @@
 use alloc::{collections::BTreeMap, string::String, vec::Vec};
 
 use crate::{
-    change::ReplicaWriteOp,
+    change::{ReplicaDropReason, ReplicaWriteOp},
     collection::ReplicaCollectionId,
     object::ReplicaHash,
     placement::{
@@ -294,7 +294,9 @@ impl ReplicaHub {
         for op in writes {
             match op {
                 ReplicaWriteOp::UpsertPlacement(placement) => self.absorb_upsert(source, placement),
-                ReplicaWriteOp::DropPlacement { handle, .. } => self.absorb_drop(source, handle),
+                ReplicaWriteOp::DropPlacement { handle, reason, .. } => {
+                    self.absorb_drop(source, handle, *reason)
+                }
                 ReplicaWriteOp::StoreObject { .. } | ReplicaWriteOp::SetCheckpoint { .. } => {}
             }
         }
@@ -440,16 +442,23 @@ impl ReplicaHub {
         // body, which the next projection pushes to the lagging source.
     }
 
-    fn absorb_drop(&mut self, source: &ReplicaSourceId, handle: &ReplicaHandle) {
+    fn absorb_drop(
+        &mut self,
+        source: &ReplicaSourceId,
+        handle: &ReplicaHandle,
+        reason: ReplicaDropReason,
+    ) {
         for item in self.items.values_mut() {
             let bound_here = item
                 .sources
                 .get(source)
                 .is_some_and(|binding| &binding.handle == handle);
             if bound_here {
-                // NOTE: a bound member removed is a genuine delete: mark the
-                // item so it propagates to the sources that still hold it.
-                item.deleted = true;
+                // NOTE: only a genuine delete propagates to the sources
+                // that still hold the item. A superseded row is a handle
+                // the same batch replaces, and reading it as a delete
+                // would push a Remove nobody asked for.
+                item.deleted |= reason == ReplicaDropReason::Deleted;
                 item.sources.remove(source);
             }
         }
@@ -461,7 +470,7 @@ mod tests {
     use alloc::vec::Vec;
 
     use crate::{
-        change::ReplicaWriteOp,
+        change::{ReplicaDropReason, ReplicaWriteOp},
         hub::*,
         object::ReplicaHash,
         placement::{
@@ -645,12 +654,37 @@ mod tests {
             &[ReplicaWriteOp::DropPlacement {
                 collection: "inbox".into(),
                 handle: ReplicaHandle::from("l1"),
+                reason: ReplicaDropReason::Deleted,
             }],
         );
 
         let item = hub.items.get(&ReplicaLinkId::from("m1")).expect("kept");
         assert!(!item.sources.contains_key(&ReplicaSourceId::from("left")));
         assert!(item.sources.contains_key(&ReplicaSourceId::from("right")));
+    }
+
+    #[test]
+    fn a_superseded_row_does_not_delete_the_shared_item() {
+        // A placeholder reconciled to its server-assigned handle, or a
+        // spine rebuilt onto a new handle space, drops a row without the
+        // item going anywhere. Reading that as a delete would push a
+        // Remove to every other source: housekeeping turned into loss.
+        let mut hub = hub_with_left(&["seen"]);
+        bind_right(&mut hub, &["seen"]);
+
+        hub.absorb(
+            &ReplicaSourceId::from("left"),
+            &[ReplicaWriteOp::DropPlacement {
+                collection: "inbox".into(),
+                handle: ReplicaHandle::from("l1"),
+                reason: ReplicaDropReason::Superseded,
+            }],
+        );
+
+        let item = hub.items.get(&ReplicaLinkId::from("m1")).expect("kept");
+        assert!(!item.deleted, "no delete propagates");
+        let right = placements(&hub, "right");
+        assert_eq!(right[0].status, ReplicaStatus::Clean, "right is untouched");
     }
 
     #[test]
@@ -664,6 +698,7 @@ mod tests {
             &[ReplicaWriteOp::DropPlacement {
                 collection: "inbox".into(),
                 handle: ReplicaHandle::from("l1"),
+                reason: ReplicaDropReason::Deleted,
             }],
         );
 
@@ -729,6 +764,7 @@ mod tests {
                 &[ReplicaWriteOp::DropPlacement {
                     collection: "inbox".into(),
                     handle: ReplicaHandle::from(handle),
+                    reason: ReplicaDropReason::Deleted,
                 }],
             );
         }
@@ -747,6 +783,7 @@ mod tests {
             &[ReplicaWriteOp::DropPlacement {
                 collection: "inbox".into(),
                 handle: ReplicaHandle::from("r1"),
+                reason: ReplicaDropReason::Deleted,
             }],
         );
         assert!(hub.items.get(&ReplicaLinkId::from("m1")).unwrap().deleted);

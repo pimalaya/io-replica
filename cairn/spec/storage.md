@@ -105,3 +105,23 @@ set says every flag the other side holds was removed here.
 Absorbing an upsert whose flag set is unknown SHALL leave the shared set alone,
 on the same terms as an absent summary and an unknown sort key. A known set,
 empty or not, SHALL replace another known set: only unknown is inert.
+
+### Requirement: A drop says whether the item is gone
+`ReplicaWriteOp::DropPlacement` SHALL carry a `ReplicaDropReason`: `Deleted` when the item itself is gone (a local delete the remote confirmed, a member that vanished upstream), `Superseded` when only this row is gone, replaced by another the same batch writes (a provisional placeholder reconciled to its server-assigned handle, a spine rebuilt onto a new handle space).
+
+This refines the retention decision point above rather than replacing it: a storage still chooses what a removal means for its rows, but a storage that shares one item across sources SHALL propagate a delete only for `Deleted`. Reading a superseded row as a delete turns housekeeping into data loss on every other source, and it is what made the drop-then-upsert order of a rebuilt spine load-bearing.
+
+#### Scenario: A rebuilt spine is not a mass delete
+- GIVEN an item bound to two sources
+- WHEN one source's row is dropped as `Superseded`
+- THEN the item is not marked deleted and the other source projects it unchanged
+
+### Requirement: A load states what it needs
+`ReplicaYield::WantsLoad` SHALL carry a `ReplicaLoadScope`: `All`, `Handles`, or `Link`. A mutation asks for the one placement it edits, or, for an `Add`, every row holding the link id it must not collide with; an upgrade asks for the handles it raises; only the merge and the rebuild ask for the whole collection, because only they reason about what is missing from it.
+
+The scope is a floor, not a ceiling: a storage SHALL return at least the placements it names and MAY return more, so a storage that ignores it stays correct, just as expensive as before. Under-delivering is not correct: a mutation that cannot see a colliding link id creates a duplicate.
+
+#### Scenario: A one-row edit reads one row
+- GIVEN a storage that honours the scope exactly
+- WHEN any mutation other than `Add` runs
+- THEN it is served only the placement it names, and still produces the same writes

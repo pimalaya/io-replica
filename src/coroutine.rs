@@ -24,7 +24,7 @@ use crate::{
     object::ReplicaHash,
     placement::{ReplicaHandle, ReplicaLinkId},
     remote::{ReplicaFetchedItem, ReplicaPushResult, ReplicaRemoteSnapshot, ReplicaTier},
-    storage::ReplicaLoaded,
+    storage::{ReplicaLoadScope, ReplicaLoaded},
 };
 
 /// State yielded by an [`ReplicaCoroutine::resume`] step.
@@ -97,7 +97,12 @@ pub enum ReplicaYield {
     },
     /// Consumer must load the collection's placements and checkpoint and
     /// feed back [`ReplicaArg::Load`].
-    WantsLoad(ReplicaCollectionId),
+    WantsLoad {
+        /// The collection to read.
+        collection: ReplicaCollectionId,
+        /// Which of its placements are needed.
+        scope: ReplicaLoadScope,
+    },
     /// Consumer must resolve which link ids already have a stored object
     /// and feed back [`ReplicaArg::LookupObject`]. This is the dedup
     /// check that skips re-downloading a body shared across collections.

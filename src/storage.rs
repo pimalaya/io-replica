@@ -7,7 +7,32 @@
 
 use alloc::vec::Vec;
 
-use crate::{collection::ReplicaCheckpoint, placement::ReplicaPlacement};
+use crate::{
+    collection::ReplicaCheckpoint,
+    placement::{ReplicaHandle, ReplicaLinkId, ReplicaPlacement},
+};
+
+/// Which of a collection's placements a load has to return.
+///
+/// Most verbs read a handful of rows and merge nothing: a mutation reads
+/// the one placement it edits, an upgrade the ones it raises. Only the
+/// merge and the rebuild need the whole collection, because only they
+/// reason about what is *missing* from it.
+///
+/// A scope is a floor, not a ceiling: a storage SHALL return at least the
+/// placements named here and MAY return more, so returning the whole
+/// collection is always correct, just as expensive as it sounds. Under-
+/// delivering is not: a mutation that cannot see a colliding link id
+/// creates a duplicate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReplicaLoadScope {
+    /// Every placement of the collection.
+    All,
+    /// The placements holding these handles.
+    Handles(Vec<ReplicaHandle>),
+    /// Every placement holding this link id, however many rows that is.
+    Link(ReplicaLinkId),
+}
 
 /// A loaded collection: its placements and its last checkpoint.
 ///

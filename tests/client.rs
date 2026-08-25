@@ -15,7 +15,7 @@ use io_replica::{
     object::ReplicaHash,
     placement::{ReplicaHandle, ReplicaLinkId},
     remote::{ReplicaFetchedItem, ReplicaPushResult, ReplicaRemoteSnapshot, ReplicaTier},
-    storage::ReplicaLoaded,
+    storage::{ReplicaLoadScope, ReplicaLoaded},
     sync::ReplicaSyncOptions,
 };
 
@@ -27,7 +27,11 @@ struct BrokenStorage;
 impl ReplicaStorage for BrokenStorage {
     type Error = &'static str;
 
-    fn load(&self, _: &ReplicaCollectionId) -> Result<ReplicaLoaded, Self::Error> {
+    fn load(
+        &self,
+        _: &ReplicaCollectionId,
+        _: &ReplicaLoadScope,
+    ) -> Result<ReplicaLoaded, Self::Error> {
         Err("disk on fire")
     }
 

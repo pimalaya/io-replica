@@ -24,7 +24,7 @@ use io_replica::{
         ReplicaFetchedBody, ReplicaFetchedItem, ReplicaPushOutcome, ReplicaPushResult,
         ReplicaRemoteItem, ReplicaRemoteSnapshot, ReplicaTier,
     },
-    storage::ReplicaLoaded,
+    storage::{ReplicaLoadScope, ReplicaLoaded},
     sync::ReplicaSyncOptions,
 };
 
@@ -41,7 +41,14 @@ struct MemStorage {
 impl ReplicaStorage for MemStorage {
     type Error = Infallible;
 
-    fn load(&self, collection: &ReplicaCollectionId) -> Result<ReplicaLoaded, Infallible> {
+    // NOTE: a storage may ignore the scope and return the whole
+    // collection, which is what this one does: the scope is a floor, not
+    // a ceiling. A real store narrows the query instead.
+    fn load(
+        &self,
+        collection: &ReplicaCollectionId,
+        _scope: &ReplicaLoadScope,
+    ) -> Result<ReplicaLoaded, Infallible> {
         Ok(ReplicaLoaded {
             placements: self
                 .placements
@@ -80,7 +87,9 @@ impl ReplicaStorage for MemStorage {
                     self.placements
                         .insert((p.collection.clone(), p.handle.clone()), p);
                 }
-                ReplicaWriteOp::DropPlacement { collection, handle } => {
+                ReplicaWriteOp::DropPlacement {
+                    collection, handle, ..
+                } => {
                     self.placements.remove(&(collection, handle));
                 }
                 ReplicaWriteOp::StoreObject { object, body } => {

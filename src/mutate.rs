@@ -19,6 +19,7 @@ use crate::{
         ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta, ReplicaOrigin,
         ReplicaPlacement, ReplicaSortKey, ReplicaStatus,
     },
+    storage::ReplicaLoadScope,
 };
 
 /// A local edit applied offline.
@@ -73,11 +74,17 @@ pub enum ReplicaMutation {
         /// The provisional handle the copy is staged under in `target`.
         placeholder: ReplicaHandle,
     },
-    /// Move a placement into `target`: stage a `Created` placement in `target`
-    /// under `placeholder` (carrying the source origin), and tombstone the
-    /// source. The next sync derives a copy into the target and a remove from
-    /// the source — the target create and the source tombstone land in their
-    /// respective collection hubs.
+    /// Move a placement into `target`: stage a `Created` placement in
+    /// `target` under `placeholder` (carrying the source origin), and
+    /// tombstone the source carrying `target` as its destination. Each
+    /// collection's next sync derives one half, a copy into the target and
+    /// a relocation of the source, and whichever runs first delivers the
+    /// item; the link id keeps the other from delivering a second copy
+    /// (see [`ReplicaChange`](crate::change::ReplicaChange)).
+    ///
+    /// An item whose link id is not resolved yet has no such key, so only
+    /// the source half is staged: the relocation delivers it alone, and
+    /// the target picks it up on its next enumerate.
     Move {
         /// The source placement to move.
         handle: ReplicaHandle,
@@ -120,6 +127,19 @@ impl ReplicaMutation {
             Self::Copy { handle, .. } => Some(handle),
             Self::Move { handle, .. } => Some(handle),
             Self::Add { .. } => None,
+        }
+    }
+
+    /// What the mutation has to read: the one placement it edits, or, for
+    /// an [`Add`](Self::Add), every row holding the link id it must not
+    /// collide with.
+    fn scope(&self) -> ReplicaLoadScope {
+        match self {
+            Self::Add { link_id, .. } => ReplicaLoadScope::Link(link_id.clone()),
+            other => match other.handle() {
+                Some(handle) => ReplicaLoadScope::Handles(alloc::vec![handle.clone()]),
+                None => ReplicaLoadScope::All,
+            },
         }
     }
 }
@@ -223,23 +243,7 @@ impl ReplicaMutate {
                 placeholder,
                 ..
             } => {
-                let create = ReplicaPlacement {
-                    collection: target.clone(),
-                    handle: placeholder.clone(),
-                    link_id: source.link_id.clone(),
-                    object: source.object.clone(),
-                    level: source.level,
-                    meta: source.meta.clone(),
-                    sort_key: source.sort_key.clone(),
-                    flags: source.flags.clone(),
-                    status: ReplicaStatus::Created,
-                    conflict_revision: None,
-                    base: None,
-                    origin: Some(ReplicaOrigin {
-                        collection: source.collection.clone(),
-                        handle: source.handle.clone(),
-                    }),
-                };
+                let create = Self::staged_copy(&source, target, placeholder);
                 vec![ReplicaWriteOp::UpsertPlacement(create)]
             }
             ReplicaMutation::Move {
@@ -247,39 +251,69 @@ impl ReplicaMutate {
                 placeholder,
                 ..
             } => {
-                // NOTE: stage a Created placement in the target (like Copy),
-                // carrying the source origin, and tombstone the source. The
-                // sync derives a copy into the target and a remove from the
-                // source; a hub binding cannot carry a single atomic UID MOVE.
-                let create = ReplicaPlacement {
-                    collection: target.clone(),
-                    handle: placeholder.clone(),
-                    link_id: source.link_id.clone(),
-                    object: source.object.clone(),
-                    level: source.level,
-                    meta: source.meta.clone(),
-                    sort_key: source.sort_key.clone(),
-                    flags: source.flags.clone(),
-                    status: ReplicaStatus::Created,
-                    conflict_revision: None,
-                    base: None,
-                    origin: Some(ReplicaOrigin {
-                        collection: source.collection.clone(),
-                        handle: source.handle.clone(),
-                    }),
-                };
+                // NOTE: a move is staged twice over, and whichever half
+                // reaches the server first is the one that delivers: the
+                // target's create (a server-side copy, or an upload when
+                // the origin is gone) and the source's remove (a
+                // server-side move, since the tombstone carries the
+                // destination). Both carry the link id, so the second half
+                // recognises what the first already did instead of
+                // delivering a second copy — the same at-least-once
+                // discipline `ReplicaChange` states for a retried add.
+                //
+                // An item whose link id is not resolved yet has no such
+                // key, and no create is staged for it: the relocation
+                // delivers it alone, and the target picks it up on its
+                // next enumerate. Staging both halves blind is what
+                // delivers two copies.
+                let create = source
+                    .link_id
+                    .is_some()
+                    .then(|| Self::staged_copy(&source, target, placeholder));
+
                 source.status = ReplicaStatus::Tombstone;
                 source.origin = Some(ReplicaOrigin {
                     collection: target.clone(),
                     handle: source.handle.clone(),
                 });
-                vec![
-                    ReplicaWriteOp::UpsertPlacement(create),
-                    ReplicaWriteOp::UpsertPlacement(source),
-                ]
+
+                create
+                    .map(ReplicaWriteOp::UpsertPlacement)
+                    .into_iter()
+                    .chain([ReplicaWriteOp::UpsertPlacement(source)])
+                    .collect()
             }
             // NOTE: Add reads no source; it is staged via `create_writes`.
             ReplicaMutation::Add { .. } => self.create_writes(),
+        }
+    }
+
+    /// The `Created` placement a copy or a move stages in its target,
+    /// carrying the source as its [`ReplicaOrigin`] so the push is a
+    /// server-side copy rather than a body upload.
+    fn staged_copy(
+        source: &ReplicaPlacement,
+        target: &ReplicaCollectionId,
+        placeholder: &ReplicaHandle,
+    ) -> ReplicaPlacement {
+        let origin = Some(ReplicaOrigin {
+            collection: source.collection.clone(),
+            handle: source.handle.clone(),
+        });
+
+        ReplicaPlacement {
+            collection: target.clone(),
+            handle: placeholder.clone(),
+            link_id: source.link_id.clone(),
+            object: source.object.clone(),
+            level: source.level,
+            meta: source.meta.clone(),
+            sort_key: source.sort_key.clone(),
+            flags: source.flags.clone(),
+            status: ReplicaStatus::Created,
+            conflict_revision: None,
+            base: None,
+            origin,
         }
     }
 
@@ -336,7 +370,10 @@ impl ReplicaCoroutine for ReplicaMutate {
             (State::Start, None) => {
                 debug!("load target item from storage");
                 self.state = State::PendingLoad;
-                ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad(self.collection.clone()))
+                ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad {
+                    collection: self.collection.clone(),
+                    scope: self.mutation.scope(),
+                })
             }
             (State::PendingLoad, Some(ReplicaArg::Load(loaded))) => {
                 let ops = if let ReplicaMutation::Add { link_id, .. } = &self.mutation {
@@ -392,6 +429,7 @@ mod tests {
 
     use crate::{
         mutate::*,
+        object::ReplicaHash,
         placement::{ReplicaBase, ReplicaLevel, ReplicaStatus},
         storage::ReplicaLoaded,
     };
@@ -403,7 +441,7 @@ mod tests {
                 sort_key: Default::default(),
                 collection: "inbox".into(),
                 handle: ReplicaHandle::from(handle),
-                link_id: None,
+                link_id: Some(ReplicaLinkId::from(handle)),
                 object: None,
                 level: ReplicaLevel::Meta,
                 meta: None,
@@ -851,10 +889,75 @@ mod tests {
             source
                 .origin
                 .as_ref()
-                .expect("a move target")
+                .expect("a move destination, so a source-first sync relocates rather than deletes")
                 .collection
                 .as_str(),
             "archive",
         );
+    }
+
+    #[test]
+    fn a_mutation_reads_only_what_it_edits() {
+        // The collection is not the unit of a local edit: a mutation
+        // touches one row, and an Add only has to see the rows that could
+        // collide with its link id.
+        let mut mutate = ReplicaMutate::new("inbox", ReplicaMutation::Remove("7".into()));
+        match mutate.resume(None) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad { scope, .. }) => {
+                assert_eq!(
+                    scope,
+                    ReplicaLoadScope::Handles(vec![ReplicaHandle::from("7")])
+                );
+            }
+            state => panic!("expected WantsLoad, got {state:?}"),
+        }
+
+        let add = ReplicaMutation::Add {
+            handle: ReplicaHandle::from("tmp"),
+            link_id: ReplicaLinkId::from("m1"),
+            flags: ReplicaFlags::default(),
+            object: ReplicaObject {
+                hash: ReplicaHash::from("h"),
+                size: 1,
+            },
+            body: vec![],
+            meta: None,
+            sort_key: Default::default(),
+        };
+        let mut mutate = ReplicaMutate::new("inbox", add);
+        match mutate.resume(None) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad { scope, .. }) => {
+                assert_eq!(scope, ReplicaLoadScope::Link(ReplicaLinkId::from("m1")));
+            }
+            state => panic!("expected WantsLoad, got {state:?}"),
+        }
+    }
+
+    #[test]
+    fn a_move_of_an_unlinked_item_stages_the_relocation_alone() {
+        // With no link id there is no key for either half to recognise
+        // what the other did, so only the source-side relocation is
+        // staged; staging both blind is what delivers two copies.
+        let mut source = loaded("1");
+        source.placements[0].link_id = None;
+
+        let mutation = ReplicaMutation::Move {
+            handle: ReplicaHandle::from("1"),
+            target: "archive".into(),
+            placeholder: ReplicaHandle::from("tmp-1"),
+        };
+        let mut mutate = ReplicaMutate::new("inbox", mutation);
+        let _ = mutate.resume(None);
+
+        let ops = match mutate.resume(Some(ReplicaArg::Load(source))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+        assert_eq!(ops.len(), 1, "the tombstone alone, no target create");
+        let ReplicaWriteOp::UpsertPlacement(source) = &ops[0] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[0]);
+        };
+        assert_eq!(source.collection.as_str(), "inbox");
+        assert_eq!(source.status, ReplicaStatus::Tombstone);
     }
 }

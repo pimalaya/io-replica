@@ -140,3 +140,60 @@ date) from stranding the linked item and duplicating it under the body's link.
 - GIVEN a consumer that fetches a Full batch across a bounded connection pool, largest first (by its own member sizes)
 - WHEN the batch is hydrated
 - THEN the heavy member is fetched concurrently with the light ones, results are matched by handle, and no fetch order is assumed
+
+### Requirement: A move delivers exactly one copy
+A move is staged as a create in the target plus a remove of the source, each derived by its own collection's sync in whichever order the consumer runs them, and both halves can deliver the item on their own: the create by copying from its origin, the remove by relocating the member into its destination. `ReplicaChange::Remove` carries the `link_id` its destination would receive, and a consumer SHALL relocate only while that destination does not already hold it; otherwise the create already delivered, and the remove is a plain delete of the source.
+
+Neither half may be dropped in favour of the other: the remove is what keeps a move safe when the target syncs last, since the source is relocated rather than deleted out from under a copy that never ran, and the create is what keeps a move working through a hub, whose bindings carry no origin. When the target syncs last its create finds its origin already relocated, so the push is rejected and the placeholder stays visibly pending: an add carries no key that separates a second copy the user asked for from one the remove already served.
+
+An item whose link id is not resolved yet has no such key, so `ReplicaMutation::Move` stages the source half alone for it: the relocation delivers it, and the target picks it up on its next enumerate.
+
+#### Scenario: The target syncs first
+- GIVEN a linked member moved into a target
+- WHEN the target's sync copies it, then the source's sync derives its remove
+- THEN the destination already holds the link id, so the source is deleted rather than relocated, and the target holds exactly one member
+
+#### Scenario: The source syncs first
+- GIVEN the same move
+- WHEN the source's sync runs first
+- THEN the member is relocated into the target, and the target's create finds its origin gone: it is rejected and stays visibly pending rather than delivering a second copy
+
+#### Scenario: A never-fetched item
+- GIVEN a member whose link id is not resolved
+- WHEN it is moved
+- THEN only the source tombstone is staged, and the target holds exactly one member in either sync order
+
+### Requirement: A read-only source reverts a local delete
+Where `ReplicaSyncOptions::push` is false a local delete can never propagate and the replica mirrors the source, so the merge SHALL revert the tombstone rather than apply it. Applying it and waiting for a later enumerate to re-add the member only works against a complete snapshot: an incremental enumerate never lists an untouched member again, so the dropped row would never come back, leaving the replica permanently short of an item the source still holds. Reverting also keeps whatever the placement had cached.
+
+#### Scenario: A delta enumerate
+- GIVEN a read-only source with a locally deleted member, unchanged upstream
+- WHEN an incremental enumerate lists nothing
+- THEN the placement is written back clean, keeping its body
+
+### Requirement: Both axes reconcile, every run
+The flag axis SHALL run for every placement present on both sides, including one whose content axis derived a push. A push result is matched by handle, so one handle yields at most one change: the flag axis withholds its own push in that case, but still merges and writes. Skipping it outright loses a remote flag change until some later run happens to list the item again, which an incremental enumerate may never do.
+
+#### Scenario: A remote flag change beside a local content edit
+- GIVEN a placement with a staged content edit whose remote also changed a flag
+- WHEN the sync derives the content push
+- THEN the merged flags are written in the same batch
+
+### Requirement: A keep-both duplicate is a new item
+The duplicate a `KeepBoth` resolution stages SHALL carry an identity derived from the body it forked, both as its provisional handle and as its link id. It is a new item rather than another copy of the one it forked from, since the two hold different bodies, and giving it the original's link id would have a storage sharing items by link collapse the fork back. Deriving both from the body is also what makes two resolutions staged before either is pushed keep both versions, and what gives the retried add an idempotency key.
+
+#### Scenario: Two resolutions of one handle
+- GIVEN two keep-both resolutions of the same placement, forking different bodies
+- WHEN both are staged before either is pushed
+- THEN their handles and link ids differ, so neither overwrites the other
+
+### Requirement: An upgrade revisits what it never got
+An upgrade SHALL revisit a placement whose level claims a tier it does not hold: `Full` with no object, `Meta` with no summary. The level is a claim and the payload is the fact, and nothing else revisits what already reads as reached, so such a row would be skipped for good.
+
+#### Scenario: A body-less full row
+- GIVEN a placement recorded at `Full` holding no object
+- WHEN it is upgraded to `Full`
+- THEN it is fetched rather than skipped
+
+### Requirement: A push is counted when it matched
+`ReplicaSyncReport::pushed` SHALL count the changes this run derived and the remote accepted, not the results the consumer reported: a result naming a handle nobody pushed, or naming one twice, cannot inflate it.

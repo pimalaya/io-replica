@@ -29,7 +29,7 @@ use io_replica::{
     open::ReplicaOpen,
     placement::{ReplicaFlags, ReplicaHandle, ReplicaLinkId, ReplicaPlacement, ReplicaStatus},
     remote::{ReplicaFetchedItem, ReplicaPushResult, ReplicaRemoteSnapshot, ReplicaTier},
-    storage::ReplicaLoaded,
+    storage::{ReplicaLoadScope, ReplicaLoaded},
     sync::{ReplicaSync, ReplicaSyncOptions, ReplicaSyncReport},
     upgrade::ReplicaUpgrade,
 };
@@ -289,8 +289,12 @@ struct CrashyStorage {
 impl ReplicaStorage for CrashyStorage {
     type Error = &'static str;
 
-    fn load(&self, collection: &ReplicaCollectionId) -> Result<ReplicaLoaded, Self::Error> {
-        Ok(self.inner.load(collection).unwrap())
+    fn load(
+        &self,
+        collection: &ReplicaCollectionId,
+        scope: &ReplicaLoadScope,
+    ) -> Result<ReplicaLoaded, Self::Error> {
+        Ok(self.inner.load(collection, scope).unwrap())
     }
 
     fn lookup_objects(

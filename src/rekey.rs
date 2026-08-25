@@ -30,7 +30,7 @@ use log::{debug, trace};
 use thiserror::Error;
 
 use crate::{
-    change::ReplicaWriteOp,
+    change::{ReplicaDropReason, ReplicaWriteOp},
     collection::{ReplicaCheckpoint, ReplicaCollectionId},
     coroutine::*,
     placement::{
@@ -38,6 +38,7 @@ use crate::{
         ReplicaPlacement, ReplicaSortKey, ReplicaStatus,
     },
     remote::{ReplicaRemoteItem, ReplicaTier},
+    storage::ReplicaLoadScope,
 };
 
 /// What a rekey did.
@@ -111,10 +112,17 @@ impl ReplicaRekey {
             .filter_map(|p| Some((p.link_id.clone()?, p.clone())))
             .collect();
 
+        // NOTE: the whole old spine goes, but nothing here is a delete:
+        // every row is either about to be rewritten under its new handle
+        // or lost with a handle space the server has already discarded.
+        // Marking the drops superseded is what keeps a storage sharing one
+        // item across sources from reading a renumbering as a mass delete,
+        // and what makes the batch order-insensitive.
         for placement in &old {
             writes.push(ReplicaWriteOp::DropPlacement {
                 collection: self.collection.clone(),
                 handle: placement.handle.clone(),
+                reason: ReplicaDropReason::Superseded,
             });
         }
 
@@ -278,7 +286,10 @@ impl ReplicaCoroutine for ReplicaRekey {
             (State::Start, None) => {
                 debug!("load local state from storage");
                 self.state = State::PendingLoad;
-                ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad(self.collection.clone()))
+                ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad {
+                    collection: self.collection.clone(),
+                    scope: ReplicaLoadScope::All,
+                })
             }
 
             (State::PendingLoad, Some(ReplicaArg::Load(loaded))) => {

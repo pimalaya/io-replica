@@ -27,7 +27,7 @@ use crate::{
     placement::{ReplicaHandle, ReplicaLinkId},
     rekey::{ReplicaRekey, ReplicaRekeyError, ReplicaRekeyReport},
     remote::{ReplicaFetchedItem, ReplicaPushResult, ReplicaRemoteSnapshot, ReplicaTier},
-    storage::ReplicaLoaded,
+    storage::{ReplicaLoadScope, ReplicaLoaded},
     sync::{ReplicaSync, ReplicaSyncError, ReplicaSyncOptions, ReplicaSyncReport},
     upgrade::{ReplicaUpgrade, ReplicaUpgradeError, ReplicaUpgradeReport},
 };
@@ -38,7 +38,16 @@ pub trait ReplicaStorage {
     type Error;
 
     /// Loads a collection's placements and checkpoint.
-    fn load(&self, collection: &ReplicaCollectionId) -> Result<ReplicaLoaded, Self::Error>;
+    ///
+    /// `scope` is a floor: the reply SHALL hold at least the placements it
+    /// names and MAY hold more, so a storage that ignores it and returns
+    /// the whole collection stays correct. Honouring it is what keeps a
+    /// one-row edit from reading a whole mailbox.
+    fn load(
+        &self,
+        collection: &ReplicaCollectionId,
+        scope: &ReplicaLoadScope,
+    ) -> Result<ReplicaLoaded, Self::Error>;
 
     /// Resolves which link ids already map to a stored object.
     fn lookup_objects(
@@ -207,10 +216,10 @@ where
                         .map_err(ReplicaClientError::Remote)?;
                     arg = Some(ReplicaArg::Push(results));
                 }
-                ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad(collection)) => {
+                ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad { collection, scope }) => {
                     let loaded = self
                         .storage
-                        .load(&collection)
+                        .load(&collection, &scope)
                         .map_err(ReplicaClientError::Storage)?;
                     arg = Some(ReplicaArg::Load(loaded));
                 }

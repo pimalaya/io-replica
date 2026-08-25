@@ -23,7 +23,7 @@ use io_replica::{
     collection::{ReplicaCheckpoint, ReplicaCollectionId},
     object::{ReplicaHash, ReplicaObject},
     placement::{ReplicaHandle, ReplicaLinkId, ReplicaPlacement},
-    storage::ReplicaLoaded,
+    storage::{ReplicaLoadScope, ReplicaLoaded},
     sync::{ReplicaSyncOptions, ReplicaSyncReport},
 };
 
@@ -50,7 +50,11 @@ impl SoftDeleteStorage {
 impl ReplicaStorage for SoftDeleteStorage {
     type Error = Infallible;
 
-    fn load(&self, collection: &ReplicaCollectionId) -> Result<ReplicaLoaded, Infallible> {
+    fn load(
+        &self,
+        collection: &ReplicaCollectionId,
+        _: &ReplicaLoadScope,
+    ) -> Result<ReplicaLoaded, Infallible> {
         let placements = self
             .placements
             .iter()
@@ -88,7 +92,9 @@ impl ReplicaStorage for SoftDeleteStorage {
                     self.hidden.remove(&key);
                     self.placements.insert(key, p);
                 }
-                ReplicaWriteOp::DropPlacement { collection, handle } => {
+                ReplicaWriteOp::DropPlacement {
+                    collection, handle, ..
+                } => {
                     // NOTE: retain the row and hide it, rather than remove it.
                     self.hidden.insert((collection, handle));
                 }
@@ -115,7 +121,10 @@ fn soft_delete_retains_and_hides_a_remote_expunge() {
     let mut client = ReplicaClient::new(SoftDeleteStorage::default(), remote);
 
     client.sync("inbox", ReplicaSyncOptions::default()).unwrap();
-    let loaded = client.storage().load(&"inbox".into()).unwrap();
+    let loaded = client
+        .storage()
+        .load(&"inbox".into(), &ReplicaLoadScope::All)
+        .unwrap();
     assert_eq!(loaded.placements.len(), 1, "the item is pulled");
 
     // The source expunges the item.
@@ -124,7 +133,10 @@ fn soft_delete_retains_and_hides_a_remote_expunge() {
     assert_eq!(report.pulled, 1, "the vanish is observed");
 
     // The row is retained for restore, but hidden from the offline view.
-    let loaded = client.storage().load(&"inbox".into()).unwrap();
+    let loaded = client
+        .storage()
+        .load(&"inbox".into(), &ReplicaLoadScope::All)
+        .unwrap();
     assert!(loaded.placements.is_empty(), "hidden from load");
     assert!(
         client.storage().is_retained("inbox", "1"),

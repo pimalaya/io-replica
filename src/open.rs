@@ -6,7 +6,11 @@
 use log::{debug, trace};
 use thiserror::Error;
 
-use crate::{collection::ReplicaCollectionId, coroutine::*, storage::ReplicaLoaded};
+use crate::{
+    collection::ReplicaCollectionId,
+    coroutine::*,
+    storage::{ReplicaLoadScope, ReplicaLoaded},
+};
 
 /// Failure causes during an OPEN flow.
 #[derive(Clone, Debug, Error)]
@@ -50,7 +54,10 @@ impl ReplicaCoroutine for ReplicaOpen {
             (State::Start, None) => {
                 debug!("load collection from storage");
                 self.state = State::PendingLoad;
-                ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad(self.collection.clone()))
+                ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad {
+                    collection: self.collection.clone(),
+                    scope: ReplicaLoadScope::All,
+                })
             }
             (State::PendingLoad, Some(ReplicaArg::Load(loaded))) => {
                 debug!("opened collection with {} items", loaded.placements.len());
@@ -99,8 +106,8 @@ mod tests {
     fn start_yields_load() {
         let mut open = ReplicaOpen::new("inbox");
         match open.resume(None) {
-            ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad(id)) => {
-                assert_eq!(id.as_str(), "inbox");
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad { collection, .. }) => {
+                assert_eq!(collection.as_str(), "inbox");
             }
             state => panic!("expected WantsLoad, got {state:?}"),
         }

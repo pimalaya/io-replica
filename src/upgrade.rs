@@ -21,6 +21,7 @@ use crate::{
     object::ReplicaObject,
     placement::{ReplicaHandle, ReplicaLevel, ReplicaPlacement},
     remote::{ReplicaFetchedBody, ReplicaTier},
+    storage::ReplicaLoadScope,
 };
 
 /// What an upgrade did.
@@ -83,13 +84,18 @@ impl ReplicaUpgrade {
     }
 
     /// Requested handles that still need work for the target tier.
+    ///
+    /// The level is a claim and the payload is the fact, so a row that
+    /// reads as high enough while holding nothing is upgraded again: it
+    /// would otherwise be skipped forever, since nothing else revisits
+    /// what already reads as reached.
     fn pending_handles(&self) -> Vec<ReplicaHandle> {
         self.handles
             .iter()
             .filter(|h| match self.placements.get(h) {
                 Some(p) => match self.tier {
-                    ReplicaTier::Meta => p.level < ReplicaLevel::Meta,
-                    ReplicaTier::Full => p.level < ReplicaLevel::Full,
+                    ReplicaTier::Meta => p.level < ReplicaLevel::Meta || p.meta.is_none(),
+                    ReplicaTier::Full => p.level < ReplicaLevel::Full || p.object.is_none(),
                 },
                 None => false,
             })
@@ -110,7 +116,10 @@ impl ReplicaCoroutine for ReplicaUpgrade {
             (State::Start, None) => {
                 debug!("load target items from storage");
                 self.state = State::PendingLoad;
-                ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad(self.collection.clone()))
+                ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad {
+                    collection: self.collection.clone(),
+                    scope: ReplicaLoadScope::Handles(self.handles.clone()),
+                })
             }
 
             (State::PendingLoad, Some(ReplicaArg::Load(loaded))) => {
@@ -713,8 +722,10 @@ mod tests {
 
     #[test]
     fn already_full_completes_without_work() {
+        let mut placement = probed("1", Some("x"), ReplicaLevel::Full);
+        placement.object = Some(ReplicaHash::from("h1"));
         let loaded = ReplicaLoaded {
-            placements: vec![probed("1", Some("x"), ReplicaLevel::Full)],
+            placements: vec![placement],
             checkpoint: None,
         };
         let mut up =
@@ -724,6 +735,45 @@ mod tests {
         match up.resume(Some(ReplicaArg::Load(loaded))) {
             ReplicaCoroutineState::Complete(Ok(report)) => assert_eq!(report.upgraded, 0),
             state => panic!("expected Complete(Ok), got {state:?}"),
+        }
+    }
+
+    #[test]
+    fn a_full_row_holding_no_body_is_upgraded_again() {
+        // The level is a claim, the object is the fact. A row recorded at
+        // Full with no body would otherwise be skipped forever, since
+        // nothing revisits what already reads as Full.
+        let loaded = ReplicaLoaded {
+            placements: vec![probed("1", None, ReplicaLevel::Full)],
+            checkpoint: None,
+        };
+        let mut up =
+            ReplicaUpgrade::new("inbox", vec![ReplicaHandle::from("1")], ReplicaTier::Full);
+        let _ = up.resume(None);
+
+        match up.resume(Some(ReplicaArg::Load(loaded))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsFetch { handles, .. }) => {
+                assert_eq!(handles, vec![ReplicaHandle::from("1")]);
+            }
+            state => panic!("expected WantsFetch, got {state:?}"),
+        }
+    }
+
+    #[test]
+    fn a_meta_row_holding_no_summary_is_upgraded_again() {
+        let loaded = ReplicaLoaded {
+            placements: vec![probed("1", None, ReplicaLevel::Meta)],
+            checkpoint: None,
+        };
+        let mut up =
+            ReplicaUpgrade::new("inbox", vec![ReplicaHandle::from("1")], ReplicaTier::Meta);
+        let _ = up.resume(None);
+
+        match up.resume(Some(ReplicaArg::Load(loaded))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsFetch { handles, .. }) => {
+                assert_eq!(handles, vec![ReplicaHandle::from("1")]);
+            }
+            state => panic!("expected WantsFetch, got {state:?}"),
         }
     }
 

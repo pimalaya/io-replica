@@ -1,5 +1,5 @@
-//! A mailbox, address book or calendar: a set of placements plus a sync
-//! checkpoint.
+//! A mailbox, address book or calendar: the id the engine scopes every
+//! verb to, and the opaque token it round-trips between the two seams.
 
 use alloc::{string::String, vec::Vec};
 
@@ -32,19 +32,6 @@ impl From<String> for ReplicaCollectionId {
 /// never inspects it, it only round-trips it between storage and remote.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ReplicaCheckpoint(pub Vec<u8>);
-
-/// A collection's metadata, independent of its placements.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReplicaCollection {
-    /// The account-scoped id.
-    pub id: ReplicaCollectionId,
-    /// The human-facing name.
-    pub name: String,
-    /// The last sync checkpoint, if ever synced.
-    pub checkpoint: Option<ReplicaCheckpoint>,
-    /// Whether the probed spine is complete as of the checkpoint.
-    pub enumerated: bool,
-}
 
 #[cfg(test)]
 mod tests {

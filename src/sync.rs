@@ -26,14 +26,15 @@ use log::{debug, trace};
 use thiserror::Error;
 
 use crate::{
-    change::{ReplicaChange, ReplicaWriteOp},
+    change::{ReplicaChange, ReplicaDropReason, ReplicaWriteOp},
     collection::{ReplicaCheckpoint, ReplicaCollectionId},
     coroutine::*,
     placement::{
-        ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaPlacement, ReplicaSortKey,
-        ReplicaStatus,
+        ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaPlacement,
+        ReplicaSortKey, ReplicaStatus,
     },
     remote::{ReplicaPushOutcome, ReplicaRemoteItem, ReplicaRemoteSnapshot},
+    storage::ReplicaLoadScope,
 };
 
 /// Which push kinds a writable source may derive, refining
@@ -113,9 +114,9 @@ pub enum ReplicaConflictPolicy {
 pub struct ReplicaSyncOptions {
     /// The master push switch. When false the source is treated read-only:
     /// local flag and content changes are kept dirty and never pushed
-    /// (permission gating). Local deletes instead apply locally only,
-    /// deliberately: they can never propagate, so the replica mirrors the
-    /// source and the next enumerate re-adds the member.
+    /// (permission gating). A local delete is reverted instead of kept
+    /// pending: it can never propagate, so the replica mirrors the source
+    /// and the member comes back, keeping whatever it had cached.
     pub push: bool,
     /// Per-kind refinement of `push`, consulted only when `push` is true. A
     /// forbidden push kind is kept pending (never pushed, and a forbidden
@@ -130,14 +131,6 @@ pub struct ReplicaSyncOptions {
     /// any locally-missing message and drops any local phantom. The
     /// recovery path for a replica that drifted out of sync.
     pub full: bool,
-}
-
-impl ReplicaSyncOptions {
-    /// Whether a push of the kind selected by `right` may be derived: the
-    /// master switch on, and the specific right permitted.
-    fn may_push(&self, right: impl Fn(&ReplicaPushRights) -> bool) -> bool {
-        self.push && right(&self.rights)
-    }
 }
 
 impl Default for ReplicaSyncOptions {
@@ -400,8 +393,15 @@ impl ReplicaSync {
                 }
 
                 if !self.opts.push {
-                    // NOTE: read-only source: apply the delete locally only.
-                    self.drop(handle);
+                    // NOTE: read-only source: the delete can never
+                    // propagate and the replica mirrors the source, so it
+                    // is reverted here rather than applied and left for a
+                    // later enumerate to undo. An incremental enumerate
+                    // never lists an untouched member again, so a dropped
+                    // row would never come back at all.
+                    let mut reverted = local.clone();
+                    reverted.status = ReplicaStatus::Clean;
+                    self.writes.push(ReplicaWriteOp::UpsertPlacement(reverted));
                     return None;
                 }
 
@@ -410,12 +410,7 @@ impl ReplicaSync {
                 // edited body; the move itself derives again on the next
                 // sync, once the base holds the pushed content. A plain
                 // delete supersedes the edit instead.
-                let edited = local.object.is_some()
-                    && local
-                        .base
-                        .as_ref()
-                        .is_some_and(|b| local.object != b.object);
-                if edited && local.origin.is_some() {
+                if local.staged_edit().is_some() && local.origin.is_some() {
                     if !self.opts.rights.content {
                         // NOTE: content push forbidden, keep the tombstone
                         // pending.
@@ -439,19 +434,21 @@ impl ReplicaSync {
 
                 // NOTE: hold the drop until the remote confirms it (in
                 // PendingPush); a rejected push keeps the tombstone for the
-                // next retry. A move carries its destination in `origin`; a
-                // plain delete has none, and the consumer routes it to trash.
+                // next retry. An origin on a tombstone is a move
+                // destination, which no mutation stages today: a move is
+                // the target copy plus this plain remove.
                 self.pending_drops.insert(handle.clone());
                 let to = local.origin.as_ref().map(|o| o.collection.clone());
                 Some(ReplicaChange::Remove {
                     handle: handle.clone(),
                     to,
+                    link_id: local.link_id.clone(),
                     if_match: base_revision,
                 })
             }
             // NOTE: local delete of something already gone remote
             (false, _, false) if local_tombstone => {
-                self.drop(handle);
+                self.drop(handle, ReplicaDropReason::Deleted);
                 None
             }
             // NOTE: remote delete: we had it in sync, it vanished upstream
@@ -480,7 +477,7 @@ impl ReplicaSync {
                     self.writes
                         .push(ReplicaWriteOp::UpsertPlacement(resurrected.clone()));
 
-                    if !self.opts.may_push(|r| r.add) {
+                    if !(self.opts.push && self.opts.rights.add) {
                         // NOTE: read-only or add forbidden, keep the
                         // resurrected create staged and pending, do not push.
                         return None;
@@ -495,7 +492,7 @@ impl ReplicaSync {
                     });
                 }
 
-                self.drop(handle);
+                self.drop(handle, ReplicaDropReason::Deleted);
                 self.report.pulled += 1;
                 self.emit(ReplicaEvent::Vanished(handle.clone()));
                 None
@@ -518,10 +515,23 @@ impl ReplicaSync {
                 // one write chain. A remote flag change must survive even
                 // a content conflict: a delta lists it exactly once, so
                 // skipping the flag merge here would lose it for good.
+                //
+                // A derived content push does not skip it either, it only
+                // withholds the flag *push*: a push result is matched by
+                // handle, so one handle yields at most one change. The
+                // merged flags are still written, dirty on the old base,
+                // and their own push derives again next sync.
                 match self.reconcile_content(local, item) {
-                    ContentOutcome::Push(change) => Some(change),
-                    ContentOutcome::Rewritten(rewritten) => self.reconcile_flags(&rewritten, item),
-                    ContentOutcome::Untouched => self.reconcile_flags(local, item),
+                    ContentOutcome::Push(change) => {
+                        self.reconcile_flags(local, item, PushFlags::Withhold);
+                        Some(change)
+                    }
+                    ContentOutcome::Rewritten(rewritten) => {
+                        self.reconcile_flags(&rewritten, item, PushFlags::Derive)
+                    }
+                    ContentOutcome::Untouched => {
+                        self.reconcile_flags(local, item, PushFlags::Derive)
+                    }
                 }
             }
             // NOTE: local create (no base, not upstream): a pending copy,
@@ -530,7 +540,8 @@ impl ReplicaSync {
             // plain base-less placement that is not Created is left untouched.
             (true, false, false) => {
                 let local = local.as_ref().expect("local present");
-                if self.opts.may_push(|r| r.add) && local.status == ReplicaStatus::Created {
+                if self.opts.push && self.opts.rights.add && local.status == ReplicaStatus::Created
+                {
                     self.pending_creates.insert(handle.clone(), local.clone());
                     return Some(ReplicaChange::Add {
                         handle: handle.clone(),
@@ -607,7 +618,7 @@ impl ReplicaSync {
             (false, false) => ContentOutcome::Untouched,
             (false, true) => ContentOutcome::Rewritten(self.pull_content(local, item)),
             (true, false) => {
-                if !self.opts.may_push(|r| r.content) {
+                if !(self.opts.push && self.opts.rights.content) {
                     // NOTE: read-only source or content push forbidden, keep
                     // dirty and do not push
                     return ContentOutcome::Untouched;
@@ -640,7 +651,7 @@ impl ReplicaSync {
                 // NOTE: overwrite the remote's *current* version, so the
                 // precondition is the observed remote revision, not the stale
                 // base (which would be rejected on optimistic concurrency).
-                if !self.opts.may_push(|r| r.content) {
+                if !(self.opts.push && self.opts.rights.content) {
                     return self.mark_conflict(local, item);
                 }
                 self.pending_content_pushes
@@ -677,16 +688,29 @@ impl ReplicaSync {
 
     /// Stages the local body as a fresh `Created` member so a `KeepBoth`
     /// resolution loses neither version; the next sync appends it.
+    ///
+    /// The duplicate is a new item rather than another copy of the one it
+    /// forked from: the two hold different bodies, and giving it the
+    /// original's link id would have a storage that shares items by link
+    /// treat them as one and collapse the fork back. Its identity is
+    /// therefore its content, which also makes both the handle and the
+    /// add's idempotency key unique per forked body: two resolutions
+    /// staged before either is pushed keep both versions, and a replayed
+    /// add is recognised rather than appended twice.
     fn stage_conflict_dup(&mut self, local: &ReplicaPlacement) {
-        let Some(object) = local.object.clone() else {
-            return;
-        };
+        let object = local.object.clone().expect("a staged edited body");
+
         let mut handle = local.handle.0.clone();
-        handle.push_str("\u{1}keepboth");
+        handle.push('\u{1}');
+        handle.push_str(object.as_str());
+
+        let mut link = String::from("keepboth\u{1}");
+        link.push_str(object.as_str());
+
         let dup = ReplicaPlacement {
             collection: self.collection.clone(),
             handle: ReplicaHandle(handle),
-            link_id: None,
+            link_id: Some(ReplicaLinkId(link)),
             object: Some(object),
             level: ReplicaLevel::Full,
             meta: local.meta.clone(),
@@ -711,6 +735,7 @@ impl ReplicaSync {
         &mut self,
         local: &ReplicaPlacement,
         remote: &ReplicaRemoteItem,
+        allow: PushFlags,
     ) -> Option<ReplicaChange> {
         let base_flags = local.base.as_ref().map(|b| b.flags.clone());
 
@@ -767,8 +792,9 @@ impl ReplicaSync {
                     self.emit(ReplicaEvent::FlagsChanged(local.handle.clone()));
                 }
 
-                if !self.opts.may_push(|r| r.flags) {
-                    // NOTE: read-only source or flag push forbidden, keep dirty
+                if allow == PushFlags::Withhold || !(self.opts.push && self.opts.rights.flags) {
+                    // NOTE: read-only source, flag push forbidden, or a
+                    // content push already claimed this handle: keep dirty
                     // and do not push
                     return None;
                 }
@@ -791,10 +817,11 @@ impl ReplicaSync {
         self.report.events.push(event);
     }
 
-    fn drop(&mut self, handle: &ReplicaHandle) {
+    fn drop(&mut self, handle: &ReplicaHandle, reason: ReplicaDropReason) {
         self.writes.push(ReplicaWriteOp::DropPlacement {
             collection: self.collection.clone(),
             handle: handle.clone(),
+            reason,
         });
     }
 
@@ -918,7 +945,7 @@ impl ReplicaSync {
         handle: ReplicaHandle,
         revision: Option<String>,
     ) {
-        self.drop(&placeholder.handle);
+        self.drop(&placeholder.handle, ReplicaDropReason::Superseded);
         let mut placed = placeholder;
         placed.handle = handle;
         placed.status = ReplicaStatus::Clean;
@@ -944,7 +971,10 @@ impl ReplicaCoroutine for ReplicaSync {
             (State::Start, None) => {
                 debug!("load local state from storage");
                 self.state = State::PendingLoad;
-                ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad(self.collection.clone()))
+                ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad {
+                    collection: self.collection.clone(),
+                    scope: ReplicaLoadScope::All,
+                })
             }
 
             (State::PendingLoad, Some(ReplicaArg::Load(loaded))) => {
@@ -1010,9 +1040,14 @@ impl ReplicaCoroutine for ReplicaSync {
                         // handle, so the local state matches what the
                         // remote now holds.
                         ReplicaPushOutcome::Accepted => {
-                            self.report.pushed += 1;
+                            // NOTE: counted per change this run actually
+                            // derived, so a consumer reporting a handle
+                            // twice, or one nobody pushed, cannot inflate
+                            // it.
+                            let mut matched = false;
                             if let Some(placement) = self.pending_flag_pushes.remove(&result.handle)
                             {
+                                matched = true;
                                 let flags = placement.flags.clone();
                                 self.rebase(&placement, &flags);
                                 self.emit(ReplicaEvent::FlagsChanged(result.handle.clone()));
@@ -1020,14 +1055,17 @@ impl ReplicaCoroutine for ReplicaSync {
                             if let Some(placement) =
                                 self.pending_content_pushes.remove(&result.handle)
                             {
+                                matched = true;
                                 self.rebase_content(&placement, result.revision.clone());
                                 self.emit(ReplicaEvent::ContentChanged(result.handle.clone()));
                             }
                             if self.pending_drops.remove(&result.handle) {
-                                self.drop(&result.handle);
+                                matched = true;
+                                self.drop(&result.handle, ReplicaDropReason::Deleted);
                                 self.emit(ReplicaEvent::Vanished(result.handle.clone()));
                             }
                             if let Some(placeholder) = self.pending_creates.remove(&result.handle) {
+                                matched = true;
                                 // NOTE: the created member's handle is the
                                 // assigned one when the remote reports it,
                                 // else the provisional.
@@ -1048,10 +1086,12 @@ impl ReplicaCoroutine for ReplicaSync {
                                     // placeholder; the next enumerate re-adds
                                     // it by its real handle and links the
                                     // body by link id.
-                                    None => self.drop(&placeholder.handle),
+                                    None => self
+                                        .drop(&placeholder.handle, ReplicaDropReason::Superseded),
                                 }
                                 self.emit(ReplicaEvent::Created(created));
                             }
+                            self.report.pushed += usize::from(matched);
                         }
                         // NOTE: the remote refused it: leave the dirty
                         // placement, tombstone or placeholder untouched so
@@ -1089,6 +1129,17 @@ impl ReplicaCoroutine for ReplicaSync {
             (_, None) => ReplicaCoroutineState::Complete(Err(ReplicaSyncError::MissingArg)),
         }
     }
+}
+
+/// Whether the flag axis may derive a push of its own.
+///
+/// A push result is matched by handle, so one handle yields at most one
+/// change: when the content axis already claimed it, the flag axis still
+/// merges and writes, it just leaves its own push for the next sync.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PushFlags {
+    Derive,
+    Withhold,
 }
 
 /// What the content axis decided for a placement present on both sides.
@@ -2032,6 +2083,30 @@ mod tests {
     }
 
     #[test]
+    fn a_content_push_still_pulls_a_remote_flag_change() {
+        // The two axes are independent, and a delta lists the item exactly
+        // once: a remote flag change dropped here is invisible until some
+        // later run happens to list the item again.
+        let mut local = edited("1");
+        let mut item = remote_rev("1", "r1");
+        item.flags = ReplicaFlags::from_iter(["seen"]);
+        local.base.as_mut().expect("a base").revision = Some("r1".into());
+
+        let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
+        let (pushes, writes, _report) = run(&mut sync, vec![local], vec![item]);
+
+        match &pushes.expect("a push")[0] {
+            ReplicaChange::Update { .. } => {}
+            other => panic!("expected an Update push, got {other:?}"),
+        }
+        let pulled = upserted(&writes, "1").expect("the flag pull");
+        assert!(
+            pulled.flags.contains("seen"),
+            "the remote flag lands with the content push, not a run later",
+        );
+    }
+
+    #[test]
     fn local_content_edit_pushes_update_and_rebases() {
         // A staged edit against an unchanged remote pushes an Update gated
         // on the base revision; once accepted, the base pins the pushed
@@ -2310,76 +2385,44 @@ mod tests {
     }
 
     #[test]
-    fn move_with_staged_edit_pushes_the_edit_before_the_move() {
-        // A moved placement carrying a staged edit pushes the Update
-        // first, so the relocated member holds the edited body; the
-        // tombstone survives the rebase and the move derives next sync.
+    fn a_tombstone_carrying_a_staged_edit_still_removes() {
+        // The edit rides into the target's create, which `Move` stages
+        // origin-less so the staged body is uploaded. The source is being
+        // removed, so its own edit has nowhere to go: pushing an Update
+        // against a member about to be deleted would only race it.
         let mut placement = edited("1");
+        placement.status = ReplicaStatus::Tombstone;
+
+        let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
+        let (pushes, _writes, _report) =
+            run(&mut sync, vec![placement], vec![remote_rev("1", "r1")]);
+
+        match &pushes.expect("a push")[0] {
+            ReplicaChange::Remove { to, if_match, .. } => {
+                assert_eq!(*to, None, "a plain remove, not a server-side move");
+                assert_eq!(if_match.as_deref(), Some("r1"));
+            }
+            other => panic!("expected a Remove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tombstone_origin_derives_a_move_remove() {
+        // No mutation stages a tombstone origin today, but a storage that
+        // plumbs one through (an atomic server-side move) still derives
+        // the destination: the seam is live, not dead.
+        let mut placement = synced("1", &[]);
         placement.status = ReplicaStatus::Tombstone;
         placement.origin = Some(ReplicaOrigin {
             collection: "archive".into(),
             handle: ReplicaHandle::from("1"),
         });
 
-        let mut first = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
-        let _ = first.resume(None);
-        let _ = first.resume(Some(ReplicaArg::Load(ReplicaLoaded {
-            placements: vec![placement],
-            checkpoint: None,
-        })));
-        let pushes = match first.resume(Some(ReplicaArg::Enumerate(full(vec![remote_rev(
-            "1", "r1",
-        )])))) {
-            ReplicaCoroutineState::Yielded(ReplicaYield::WantsPush { changes, .. }) => changes,
-            state => panic!("expected WantsPush, got {state:?}"),
-        };
-        match &pushes[0] {
-            ReplicaChange::Update {
-                object, if_match, ..
-            } => {
-                assert_eq!(object, &ReplicaHash::from("h2"), "the edit pushes first");
-                assert_eq!(if_match.as_deref(), Some("r1"));
-            }
-            other => panic!("expected an Update push, got {other:?}"),
-        }
+        let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
+        let (pushes, _writes, _report) = run(&mut sync, vec![placement], vec![remote("1", &[])]);
 
-        let results = vec![ReplicaPushResult {
-            handle: ReplicaHandle::from("1"),
-            outcome: ReplicaPushOutcome::Accepted,
-            assigned: None,
-            revision: Some("r2".into()),
-        }];
-        let writes = match first.resume(Some(ReplicaArg::Push(results))) {
-            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(writes)) => writes,
-            state => panic!("expected WantsWrite, got {state:?}"),
-        };
-        let rebased = upserted(&writes, "1").expect("a rebased placement");
-        assert_eq!(
-            rebased.status,
-            ReplicaStatus::Tombstone,
-            "the move stays pending"
-        );
-        let base = rebased.base.as_ref().expect("a base");
-        assert_eq!(base.revision.as_deref(), Some("r2"));
-        assert_eq!(base.object, Some(ReplicaHash::from("h2")));
-
-        // second sync: the edit landed, so the move itself derives now,
-        // gated on the pushed revision
-        let mut second = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
-        let (pushes, _writes, _report) = run(
-            &mut second,
-            vec![rebased.clone()],
-            vec![remote_rev("1", "r2")],
-        );
         match &pushes.expect("a push")[0] {
-            ReplicaChange::Remove {
-                to: Some(to),
-                if_match,
-                ..
-            } => {
-                assert_eq!(to.as_str(), "archive");
-                assert_eq!(if_match.as_deref(), Some("r2"));
-            }
+            ReplicaChange::Remove { to: Some(to), .. } => assert_eq!(to.as_str(), "archive"),
             other => panic!("expected a move Remove, got {other:?}"),
         }
     }
@@ -2494,10 +2537,11 @@ mod tests {
     }
 
     #[test]
-    fn read_only_delete_applies_locally_without_push() {
-        // A local delete on a read-only source can never propagate: the
-        // replica mirrors the source, so the delete is applied locally
-        // only and the next enumerate re-adds the member.
+    fn read_only_delete_is_reverted_rather_than_applied() {
+        // A local delete on a read-only source can never propagate, and
+        // the replica mirrors the source: the tombstone is reverted, so
+        // the member stays with its cached body rather than being dropped
+        // and refetched by a later full enumerate.
         let mut local = synced("1", &["seen"]);
         local.status = ReplicaStatus::Tombstone;
 
@@ -2513,11 +2557,35 @@ mod tests {
         assert!(pushes.is_none(), "read-only source must not push");
         assert_eq!(report.pushed, 0);
         assert!(
-            writes.iter().any(
-                |w| matches!(w, ReplicaWriteOp::DropPlacement { handle, .. } if handle.as_str() == "1")
-            ),
-            "the tombstone is applied locally: {writes:?}",
+            !writes
+                .iter()
+                .any(|w| matches!(w, ReplicaWriteOp::DropPlacement { .. })),
+            "the member is not dropped: {writes:?}",
         );
+        let reverted = upserted(&writes, "1").expect("the reverted placement");
+        assert_eq!(reverted.status, ReplicaStatus::Clean);
+    }
+
+    #[test]
+    fn a_read_only_delete_survives_a_delta_enumerate() {
+        // The revert has to happen here, not by waiting for a re-add: an
+        // incremental enumerate never lists an untouched member again, so
+        // a dropped row would leave the replica permanently short of one
+        // item the source still holds.
+        let mut local = synced("1", &["seen"]);
+        local.status = ReplicaStatus::Tombstone;
+
+        let opts = ReplicaSyncOptions {
+            push: false,
+            ..Default::default()
+        };
+        let mut sync = ReplicaSync::new("inbox", opts);
+        // the handle is unchanged upstream, so a delta lists nothing at all
+        let (_pushes, writes, _report) =
+            run_snapshot(&mut sync, vec![local], delta(vec![], vec![]));
+
+        let reverted = upserted(&writes, "1").expect("the reverted placement");
+        assert_eq!(reverted.status, ReplicaStatus::Clean);
     }
 
     #[test]
@@ -2807,6 +2875,46 @@ mod tests {
             Some(ReplicaHash::from("h2")),
             "the duplicate carries the local body",
         );
-        assert!(dup.handle.as_str().contains("keepboth"));
+        assert!(
+            dup.handle.as_str().contains("h2"),
+            "the handle is per forked body, so two resolutions never collide",
+        );
+        assert!(
+            dup.link_id.is_some(),
+            "the duplicate needs an identity: a link id is what makes a \
+             retried add idempotent and what a shared-item storage keys on",
+        );
+    }
+
+    #[test]
+    fn two_keep_both_duplicates_of_one_handle_do_not_collide() {
+        // Both are staged before either is pushed, so a handle derived
+        // from the placement alone would have the second overwrite the
+        // first: exactly the version keep-both exists to preserve.
+        let mut first = edited("1");
+        first.object = Some(ReplicaHash::from("h2"));
+        let mut second = edited("1");
+        second.object = Some(ReplicaHash::from("h3"));
+
+        let dup_of = |local: ReplicaPlacement| {
+            let mut sync =
+                ReplicaSync::new("inbox", with_conflict(ReplicaConflictPolicy::KeepBoth));
+            let (_pushes, writes, _report) =
+                run(&mut sync, vec![local], vec![remote_rev("1", "r2")]);
+            writes
+                .iter()
+                .find_map(|w| match w {
+                    ReplicaWriteOp::UpsertPlacement(p) if p.status == ReplicaStatus::Created => {
+                        Some(p.clone())
+                    }
+                    _ => None,
+                })
+                .expect("a keep-both duplicate")
+        };
+
+        let first = dup_of(first);
+        let second = dup_of(second);
+        assert_ne!(first.handle, second.handle);
+        assert_ne!(first.link_id, second.link_id);
     }
 }

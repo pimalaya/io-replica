@@ -306,6 +306,28 @@ pub struct ReplicaPlacement {
     pub origin: Option<ReplicaOrigin>,
 }
 
+impl ReplicaPlacement {
+    /// The body staged locally but never synced: the object the placement
+    /// points at, when its base holds a different one or none at all.
+    ///
+    /// The single reading of "there is a local content edit here", so every
+    /// caller asks the same question: the merge deciding whether an edit
+    /// beats a delete, the flag axis deciding whether a dirty placement is
+    /// really a no-op, the rekey deciding what survives a handle-space
+    /// change. It says nothing about the status, which each caller guards
+    /// for itself: a [`ReplicaStatus::Created`] placement has no base, so
+    /// every body of it is staged, which is a create rather than an edit.
+    pub fn staged_edit(&self) -> Option<&ReplicaHash> {
+        let object = self.object.as_ref()?;
+        let synced = self
+            .base
+            .as_ref()
+            .is_some_and(|base| base.object.as_ref() == Some(object));
+
+        (!synced).then_some(object)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::string::String;

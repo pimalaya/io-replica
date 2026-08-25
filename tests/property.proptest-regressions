@@ -18,3 +18,4 @@ cc 8f24d232c26dd6e67c986d90d86d78cd6901aa528db5cc1a113fa3584764d3bc # shrinks to
 cc 8d20e43847831fb15b3e05c1c1e25f0af6584e179d56d80796a36be8ef28956b # shrinks to ops = [LocalEdit(0, 0), ServerSetFlags(0, Flags({})), Sync, Bump, LocalMove(39577130958355886), ServerEdit(4380278204943753373, 0)]
 cc 05e876b3c43b13279c8bc8f54d76df17f51a7af48da52d8fa08e928bb51f2469 # shrinks to ops = [Upgrade(0), LocalEdit(0, 0), ServerEdit(0, 0), Bump, LocalSetFlags(0, Flags({})), Sync, Bump, LocalEdit(1847393290279647333, 0)], crash_after = 1
 cc b51200cbc6e58fd6849da176838e1e5c37433e91eac7d816a101f8569be1bd71 # shrinks to ops = [LocalRemove(0), LocalEdit(0, 0), Sync, Bump, LocalEdit(0, 0)]
+cc 6ee8564192505d5820f69beb0b63dbec8449834d1f42dc1c2ca1aa5fa5452688 # shrinks to ops = [Bump, ServerEdit(0, 0), LocalSetFlags(0, Known({})), LocalSetFlags(0, Known({})), LocalEdit(3235705035267023605, 0), LocalCopy(11752528989996121831)]

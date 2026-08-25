@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `ReplicaLoadScope`, carried by `ReplicaYield::WantsLoad` and by `ReplicaStorage::load`: a mutation now reads the one placement it edits (an `Add`, the rows holding its link id) and an upgrade the handles it raises, instead of the whole collection. The scope is a floor rather than a ceiling, so a storage that ignores it stays correct.
+- `ReplicaDropReason`, carried by `ReplicaWriteOp::DropPlacement`: whether the item itself is gone, or only this row of it.
+- `ReplicaPlacement::staged_edit`, the single reading of "there is a local content edit here", replacing six hand-rolled predicates that disagreed about the status guard and about what a missing base means.
+
+### Changed
+
+- `ReplicaChange::Remove` carries the `link_id` its destination would receive, so a consumer relocates a moved member only while the destination does not already hold it.
+- `ReplicaSyncReport::pushed` counts the changes a run derived and the remote accepted, rather than the results the consumer reported: a result naming an unknown handle, or one twice, no longer inflates it.
+
+### Removed
+
+- `ReplicaCollection`, referenced nowhere. Its `enumerated` flag stated an invariant the engine models nowhere: spine completeness comes off the consumer's snapshot on every run.
+
+### Fixed
+
+- **A move delivered the item to the target twice.** Both halves of a move can deliver on their own, the target's create by copying from its origin and the source's tombstone by relocating the member, so syncing the target first left the server holding the copy *and* the relocation. Both now recognise what the other did through the link id, and an item whose link id is not resolved yet stages the source half alone, since it has no such key. Neither half could simply be dropped: the create is what makes a move work through a hub, whose bindings carry no origin, and the relocation is what keeps a never-fetched item from being deleted before its copy can run.
+
+- **A read-only source's local delete was lost for good under a delta enumerate.** The delete was applied locally on the promise that the next enumerate would re-add the member, which holds only for a complete snapshot: an incremental one never lists an untouched member again, and the merge only revisits local rows that are not clean, which a dropped row is not. The tombstone is reverted instead, keeping whatever the placement had cached.
+
+- **A housekeeping drop propagated as a delete to every other source.** Reconciling a provisional placeholder to its server-assigned handle, or rebuilding a spine after a UIDVALIDITY bump, drops rows without the item going anywhere, but a storage sharing one item across sources read every drop as a delete and pushed a `Remove` to sources nobody had touched. Only `ReplicaDropReason::Deleted` propagates now, which also ends rekey's reliance on the write batch being applied in list order.
+
+- **A placement recorded at `Full` holding no body was skipped for ever**, since nothing revisits what already reads as reached. The level is a claim and the payload is the fact, so an upgrade revisits either rung whose payload is missing. 0.4.1 fixed this for hub-backed stores only; the plain path needed a resync.
+
+- **A keep-both duplicate could not be identified.** It carried no link id and a constant handle suffix, so a retried add had no idempotency key, a storage sharing items by link could not hold it, and a second resolution overwrote the first. Both are derived from the forked body now: the duplicate is a new item, not another copy of the one it forked from.
+
+- **A derived content push suppressed the flag merge for that item.** It self-healed only because the recorded checkpoint is the pre-push one, so a concurrent remote flag change stayed invisible, and emitted no event, until some later run happened to list the item again. The flag axis always runs now and withholds only its own push, so one handle still yields at most one change.
+
 ## [0.4.2] - 2026-08-25
 
 ### Fixed
