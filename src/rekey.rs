@@ -7,13 +7,12 @@
 //! and pending local changes with them. This verb enumerates the new
 //! spine, resolves the new link ids at the meta tier, and carries every
 //! old placement over to the new handle of the same logical item: the
-//! cache (level, summary, body) survives without a refetch, flag deltas
-//! re-derive against the new base, tombstones keep their pending remove
-//! (and move destination), and staged edits keep their body. A staged
-//! edit whose item found no new home survives as a pending create (the
-//! same edit-beats-delete rule the sync applies); any other pending
-//! state that cannot be matched is dropped and counted. Pending creates
-//! are local staging, not spine, and are left untouched.
+//! cache survives without a refetch, flag deltas re-derive against the
+//! new base, tombstones keep their pending remove and staged edits their
+//! body. An edit whose item found no new home survives as a pending
+//! create, the same edit-beats-delete rule the sync applies; any other
+//! unmatched pending state is dropped and counted. Pending creates are
+//! local staging, not spine, and are left untouched.
 //!
 //! The carried base adopts the new observed revision, so a carried edit
 //! pushes last-writer-wins on its first sync: the old revision chain is
@@ -47,9 +46,9 @@ pub struct ReplicaRekeyReport {
     pub rekeyed: usize,
     /// New members with no old placement to carry, pulled fresh.
     pub pulled: usize,
-    /// Old placements with pending local state that could not be matched
-    /// (no link id resolved before the handle-space change, or the item
-    /// is gone from the new spine) and were dropped with it.
+    /// Old placements whose pending local state could not be matched, no
+    /// link id having been resolved before the change or the item being
+    /// gone from the new spine, and were dropped with it.
     pub dropped: usize,
 }
 
@@ -89,7 +88,7 @@ impl ReplicaRekey {
     ) -> Vec<ReplicaWriteOp> {
         let mut writes = Vec::new();
 
-        // NOTE: pending creates are local staging, not spine: left untouched
+        // NOTE: pending creates are local staging, not spine.
         let old: Vec<ReplicaPlacement> = mem::take(&mut self.old)
             .into_iter()
             .filter(|p| p.status != ReplicaStatus::Created)
@@ -122,10 +121,9 @@ impl ReplicaRekey {
             }
         }
 
-        // NOTE: an unmatched staged edit survives as a pending create, the
-        // same edit-beats-delete rule the sync applies when a remote delete
-        // races a local edit; every other unmatched pending state is lost
-        // with the old handle space
+        // NOTE: an unmatched staged edit survives as a pending create,
+        // the same edit-beats-delete rule the sync applies; every other
+        // unmatched pending state is lost with the old handle space.
         for placement in &old {
             if carried_over.contains(&placement.handle) {
                 continue;
@@ -155,15 +153,13 @@ impl ReplicaRekey {
             .filter(|p| p.status != ReplicaStatus::Clean && !carried_over.contains(&p.handle))
             .count();
 
-        // NOTE: the old spine goes, but only the rows this batch does not
-        // write itself. A handle the new space reuses, and the old handle a
-        // resurrected edit keeps, are written by an upsert above; dropping
-        // them too would leave the batch deciding by the order a storage
-        // applies it in, which the storage contract has never promised. The
-        // drop is not a delete either: every row here is lost with a handle
-        // space the server has already discarded, so marking it superseded
-        // is what keeps a storage sharing one item across sources from
-        // reading a renumbering as a mass delete.
+        // NOTE: only the rows this batch does not write itself. A handle
+        // the new space reuses, and the old handle a resurrected edit
+        // keeps, are written by an upsert above, and dropping them too
+        // would leave the batch deciding by the order a storage applies
+        // it in. Superseded rather than deleted, so a storage sharing an
+        // item across sources does not read a renumbering as a mass
+        // delete.
         for placement in &old {
             if written.contains(&placement.handle) {
                 continue;
@@ -205,11 +201,10 @@ impl ReplicaRekey {
         let status = match old.status {
             ReplicaStatus::Tombstone => ReplicaStatus::Tombstone,
             ReplicaStatus::Conflict => ReplicaStatus::Conflict,
-            // NOTE: a handle-space change renumbers the copies, it does not
-            // merge them: the source still holds the identity twice, so the
-            // freeze carries over. The recorded handles belong to the old
-            // space, and the next complete enumeration clears them, after
-            // which the meta fetch re-detects the duplicate under its new
+            // NOTE: a renumbering does not merge the copies, so the
+            // freeze carries over. The recorded handles belong to the
+            // old space; the next complete enumeration clears them and
+            // the meta fetch re-detects the duplicate under its new
             // handles if it is still there.
             ReplicaStatus::Ambiguous => ReplicaStatus::Ambiguous,
             _ if content_edit => ReplicaStatus::Dirty,
@@ -314,8 +309,8 @@ impl ReplicaCoroutine for ReplicaRekey {
                 self.items = snapshot.items;
                 self.checkpoint = Some(snapshot.checkpoint);
 
-                // NOTE: without a single resolved link id there is nothing
-                // to match against: rebuild the spine without a fetch
+                // NOTE: without a resolved link id there is nothing to
+                // match against, so the spine rebuilds with no fetch.
                 if !self.old.iter().any(|p| p.link_id.is_some()) {
                     debug!("no link ids to match, rebuild the spine");
                     self.state = State::PendingWrite;
@@ -352,8 +347,8 @@ impl ReplicaCoroutine for ReplicaRekey {
                     "rekey done: {} carried, {} pulled, {} pending dropped",
                     self.report.rekeyed, self.report.pulled, self.report.dropped,
                 );
-                // NOTE: a completed coroutine stays completed; resuming one
-                // is a driver bug, not an empty success.
+                // NOTE: a completed coroutine stays completed: resuming
+                // one is a driver bug, not an empty success.
                 self.state = State::Done;
                 ReplicaCoroutineState::Complete(Ok(self.report))
             }
@@ -427,8 +422,8 @@ mod tests {
         }
     }
 
-    /// Runs a rekey to completion over the given old spine, new spine and
-    /// meta replies, returning the writes and the report.
+    /// Runs a rekey over the given old spine, new spine and meta
+    /// replies, returning the writes and the report.
     fn run(
         old: Vec<ReplicaPlacement>,
         items: Vec<ReplicaRemoteItem>,
@@ -474,8 +469,8 @@ mod tests {
         })
     }
 
-    /// Whether the batch drops a handle it also writes, which is the one
-    /// way a rekey can depend on the order a storage applies it in.
+    /// Whether the batch drops a handle it also writes, the one way a
+    /// rekey can depend on the order a storage applies it in.
     fn dropped_and_upserted(writes: &[ReplicaWriteOp]) -> Vec<&str> {
         writes
             .iter()
@@ -487,8 +482,8 @@ mod tests {
             .collect()
     }
 
-    /// A rekey whose new handle space reuses an old handle, which is the
-    /// common case: the server renumbers into the same range.
+    /// A rekey whose new handle space reuses an old handle, the common
+    /// case when a server renumbers into the same range.
     #[test]
     fn a_reused_handle_is_not_dropped_by_the_batch_that_writes_it() {
         let old = synced("1", "a", &[]);
@@ -506,8 +501,8 @@ mod tests {
         );
     }
 
-    /// The same hazard without any handle reuse: an unmatched staged edit
-    /// is resurrected under the handle it already had.
+    /// The same hazard with no handle reuse: an unmatched staged edit is
+    /// resurrected under the handle it already had.
     #[test]
     fn a_resurrected_edit_is_not_dropped_by_the_batch_that_writes_it() {
         let mut old = synced("1", "a", &[]);
@@ -537,8 +532,8 @@ mod tests {
 
     #[test]
     fn a_pending_flag_delta_survives_the_bump() {
-        // The old placement had staged "flagged" on top of a "seen" base;
-        // the new handle re-derives that delta against the new base.
+        // the old placement staged "flagged" on a "seen" base, and the
+        // new handle re-derives that delta against the new base
         let mut old = synced("1", "msg-a", &["seen"]);
         old.flags = ReplicaFlags::from_iter(["seen", "flagged"]);
         old.status = ReplicaStatus::Dirty;
@@ -640,9 +635,8 @@ mod tests {
 
     #[test]
     fn an_unmatched_staged_edit_resurrects_as_a_pending_create() {
-        // The edited item is gone from the new spine (deleted during the
-        // outage that came with the bump): the edit survives as a pending
-        // create, the same edit-beats-delete rule the sync applies.
+        // the edited item is gone from the new spine, so the edit
+        // survives as a pending create
         let mut old = synced("1", "msg-a", &[]);
         old.object = Some(ReplicaHash::from("h2"));
         old.level = ReplicaLevel::Full;
@@ -660,8 +654,8 @@ mod tests {
 
     #[test]
     fn unmatched_pending_state_is_dropped_and_counted() {
-        // A probed-only placement (no link id resolved) cannot be matched:
-        // its pending flag edit is lost with the old handle space.
+        // a probed-only placement cannot be matched, so its pending flag
+        // edit is lost with the old handle space
         let mut old = synced("1", "msg-a", &[]);
         old.link_id = None;
         old.flags = ReplicaFlags::from_iter(["flagged"]);
@@ -728,8 +722,8 @@ mod tests {
         }
     }
 
-    /// An empty report is indistinguishable from a run that genuinely did
-    /// nothing, so a driver resuming a finished coroutine must be told.
+    /// An empty report is indistinguishable from a run that did nothing,
+    /// so a driver resuming a finished coroutine must be told.
     #[test]
     fn a_completed_rekey_does_not_resume() {
         let mut rekey = ReplicaRekey::new("inbox");
@@ -761,9 +755,9 @@ mod tests {
 
     #[test]
     fn an_ambiguous_identity_survives_a_handle_space_change() {
-        // Renumbering the copies does not merge them: the source still holds
-        // the identity twice, so the freeze carries over rather than the item
-        // becoming deletable again on the other side of a UIDVALIDITY bump.
+        // renumbering does not merge the copies, so the freeze carries
+        // over rather than the item becoming deletable again on the
+        // other side of a UIDVALIDITY bump
         let mut old = synced("7", "m1", &[]);
         old.status = ReplicaStatus::Ambiguous;
         old.ambiguous_handles = vec![ReplicaHandle::from("8")];

@@ -3,9 +3,9 @@
 //!
 //! A placement is one of the two identity axes (see [`crate::object`] for
 //! the other). It pins a logical item to a single collection through the
-//! protocol [`ReplicaHandle`], carries the per-location mutable state (flags,
-//! membership), records the detail [`ReplicaLevel`], and holds the
-//! [`ReplicaBase`] the three-way merge reconciles against.
+//! protocol [`ReplicaHandle`], carries the per-location mutable state,
+//! records the detail [`ReplicaLevel`], and holds the [`ReplicaBase`] the
+//! three-way merge reconciles against.
 
 use alloc::{
     collections::BTreeSet,
@@ -18,9 +18,8 @@ use crate::{collection::ReplicaCollectionId, object::ReplicaHash};
 crate::replica_id! {
     /// The protocol's per-collection location of an item.
     ///
-    /// IMAP uidvalidity plus uid, WebDAV href, JMAP id; always a string so
-    /// non-integer ids are a non-issue. Identifies a placement within its
-    /// collection.
+    /// IMAP uidvalidity plus uid, WebDAV href, JMAP id, always a string
+    /// so non-integer ids are a non-issue.
     ReplicaHandle, Ord, PartialOrd, Hash,
 }
 
@@ -28,18 +27,17 @@ crate::replica_id! {
     /// The logical-item identity used to group copies and map across
     /// protocols.
     ///
-    /// A source global id (a provider message id, a JMAP id), else a stable
-    /// content id (the Message-ID header, the vCard or iCalendar UID). Never
-    /// derived from a size or other per-copy value a provider may rewrite.
+    /// A source global id (a provider message id, a JMAP id), else a
+    /// stable content id (the Message-ID header, the vCard or iCalendar
+    /// UID). Never derived from a per-copy value a provider may rewrite.
     ReplicaLinkId, Ord, PartialOrd, Hash,
 }
 
 /// A minimal cached summary: enough for a list row and to resolve the
 /// link id without a body.
 ///
-/// Opaque to the engine (json in the reference store: sender, title, date
-/// and the like; projected from the body where the backend has no cheap
-/// summary tier).
+/// Opaque to the engine, json in the reference store, and projected from
+/// the body where the backend has no cheap summary tier.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ReplicaMeta(pub String);
 
@@ -48,16 +46,12 @@ pub struct ReplicaMeta(pub String);
 ///
 /// Opaque to the engine, like [`ReplicaMeta`], and derived in the same
 /// place: whatever parses a body or an envelope into a summary already
-/// holds the date, the display name or the start time. The engine only
-/// ferries it, so what it means and how it is encoded are the kind's
-/// business and the storage's, never this crate's.
+/// holds the date, the display name or the start time.
 ///
-/// Empty means **unknown**, and is the default, so an item is orderable
-/// from the moment it exists and no consumer has to invent a value. It
-/// is a plain value rather than an `Option` because that is what the
-/// reference storage records (a `NOT NULL` column defaulting to the
-/// empty string), and one representation of "not known yet" is less to
-/// get wrong than two.
+/// Empty means unknown, and is the default, so an item is orderable from
+/// the moment it exists. It is a plain value rather than an `Option`
+/// because that is what the reference storage records, a `NOT NULL`
+/// column defaulting to the empty string.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ReplicaSortKey(pub String);
 
@@ -77,17 +71,17 @@ impl ReplicaSortKey {
 
 /// An item's set of state markers, normalized by the consumer.
 ///
-/// A plain string set so the engine stays protocol-agnostic; the consumer
-/// folds equivalent spellings (for example `\Seen`, `$seen`, `seen`)
-/// before they reach here. Backends without per-item markers report an
-/// empty [`Known`](ReplicaFlags::Known) set.
+/// A plain string set so the engine stays protocol-agnostic: the
+/// consumer folds equivalent spellings (`\Seen`, `$seen`, `seen`) before
+/// they reach here. Backends without per-item markers report an empty
+/// [`Known`](ReplicaFlags::Known) set.
 ///
-/// [`Unknown`](ReplicaFlags::Unknown) is a state of its own, distinct from
-/// a known-empty set: an item enumerated but never fetched has markers
-/// nobody has read yet, and reading that as "no markers" would push the
-/// absence onto whichever side did know them. Only a *local* placement is
-/// ever unknown, since a source that reports an item reports what it read;
-/// the engine resolves it on the first fetch that carries a set.
+/// [`Unknown`](ReplicaFlags::Unknown) is a state of its own, distinct
+/// from a known-empty set: an item enumerated but never fetched has
+/// markers nobody has read yet, and reading that as "no markers" would
+/// push the absence onto whichever side did know them. Only a local
+/// placement is ever unknown, and the engine resolves it on the first
+/// fetch that carries a set.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReplicaFlags {
     /// Never read: the item is [probed](ReplicaLevel::Probed) and nothing
@@ -123,17 +117,15 @@ impl ReplicaFlags {
     /// Three-way merges two flag sets element-wise against their base.
     ///
     /// Each flag is independent: the side that changed a flag's presence
-    /// from the base wins for that flag, and both sides changing always
-    /// agree (a presence flip from the base has only one direction), so
-    /// an element-wise merge can never conflict. As set algebra the
-    /// result is (local AND remote) OR (local MINUS base) OR (remote
-    /// MINUS base).
+    /// from the base wins for it, and both sides changing always agree,
+    /// a presence flip having only one direction, so an element-wise
+    /// merge can never conflict. As set algebra the result is (local AND
+    /// remote) OR (local MINUS base) OR (remote MINUS base).
     ///
-    /// An unknown side holds no opinion, so it never wins and never loses:
-    /// the merge is whatever the other side reports, and two unknown sides
-    /// stay unknown. An unknown *base* is the same fact as no base at all
-    /// on this axis, so nothing is derived from it and both sides' markers
-    /// are kept.
+    /// An unknown side holds no opinion, so it never wins and never
+    /// loses: the merge is whatever the other side reports, and two
+    /// unknown sides stay unknown. An unknown base is the same fact as
+    /// no base at all, so both sides' markers are kept.
     pub fn merge(base: &ReplicaFlags, local: &ReplicaFlags, remote: &ReplicaFlags) -> ReplicaFlags {
         let (Some(local), Some(remote)) = (local.known(), remote.known()) else {
             return match (local, remote) {
@@ -151,10 +143,9 @@ impl ReplicaFlags {
     }
 }
 
-/// A known-empty set, the shape of an item whose source has no markers to
-/// report. Unknown is deliberately not the default: it is the exception a
-/// probing enumeration states outright, not what an ordinary write falls
-/// back to.
+/// A known-empty set, the shape of an item whose source has no markers
+/// to report. Unknown is deliberately not the default: it is the
+/// exception a probing enumeration states outright.
 impl Default for ReplicaFlags {
     fn default() -> Self {
         Self::Known(BTreeSet::new())
@@ -192,31 +183,31 @@ pub enum ReplicaStatus {
     /// Flags never conflict (they merge element-wise), so this is a
     /// mutable-content state only.
     Conflict,
-    /// Locally created (a copy, move or append) with no remote handle yet;
-    /// a create is pending. Its [`ReplicaPlacement::handle`] is a provisional
-    /// placeholder until the push reconciles it to the server-assigned one.
+    /// Locally created (a copy, move or append) with no remote handle
+    /// yet. Its [`ReplicaPlacement::handle`] is a provisional placeholder
+    /// until the push reconciles it to the server-assigned one.
     Created,
-    /// The source holds this identity under more than one handle, so which
-    /// copy a change belongs to cannot be decided. The identity-axis twin of
-    /// [`Conflict`](Self::Conflict): the engine derives nothing for it, in
-    /// either direction, until the source holds the identity once again.
+    /// The source holds this identity under more than one handle, so
+    /// which copy a change belongs to cannot be decided. The
+    /// identity-axis twin of [`Conflict`](Self::Conflict): the engine
+    /// derives nothing for it, in either direction, until the source
+    /// holds the identity once again.
     ///
-    /// A placement is identified by its collection and link id, and a source
-    /// binds it with one handle, so a second copy of one identity has nowhere
-    /// to live. Guessing which copy a delete or a flag change refers to
-    /// destroys mail: a delete of the copy the engine happens to have bound
-    /// propagates to every other source and removes the only copy there, while
-    /// the source still holds the message. Deriving nothing mirrors the item
-    /// zero times instead of once, which is the cost of not guessing.
+    /// A placement is identified by its collection and link id, and a
+    /// source binds it with one handle, so a second copy has nowhere to
+    /// live. Guessing which copy a delete refers to destroys mail: the
+    /// delete propagates to every other source and removes the only copy
+    /// there while the source still holds the message. Deriving nothing
+    /// mirrors the item zero times instead of once.
     Ambiguous,
 }
 
 /// Where a pending create's content already lives, so the push can reuse a
 /// server-side copy or move instead of re-uploading the body.
 ///
-/// `None` on the placement means a genuine append (new content the server
-/// has never seen); `Some` means the body is already a member of `collection`
-/// under `handle`, so the push issues a copy or move from there.
+/// `None` on the placement means a genuine append, new content the
+/// server has never seen; `Some` means the body is already a member of
+/// `collection` under `handle`, so the push copies or moves from there.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplicaOrigin {
     /// The collection the source member lives in.
@@ -228,22 +219,22 @@ pub struct ReplicaOrigin {
 /// The last-synced state a placement reconciles against.
 ///
 /// Its existence is the membership base: a based placement was a member
-/// of the collection as of the last sync (`ReplicaPlacement::base` is `None`
-/// until first reconciled). Where content is immutable only flags and
-/// membership mutate; where it is mutable, `revision` holds the
-/// last-synced content revision so an in-place edit is detected.
+/// of the collection as of the last sync. Where content is immutable
+/// only flags and membership mutate; where it is mutable, `revision`
+/// holds the last-synced content revision so an in-place edit is
+/// detected.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplicaBase {
     /// Last-synced flag set.
     pub flags: ReplicaFlags,
-    /// Last-synced content revision for mutable-content backends (a WebDAV
-    /// etag, an MS Graph changeKey); `None` where content is immutable.
+    /// Last-synced content revision for mutable-content backends (a
+    /// WebDAV etag, an MS Graph changeKey); `None` where content is
+    /// immutable.
     pub revision: Option<String>,
-    /// Last-synced body, kept pinned in the object store (the consumer
-    /// counts it as a reference) so a content three-way merge has its base
-    /// bytes even after a local edit points the placement at a new object.
-    /// `None` where content is immutable (the current object is always the
-    /// synced one) or while no body has been synced.
+    /// Last-synced body, kept pinned in the object store so a content
+    /// three-way merge has its base bytes even after a local edit
+    /// repoints the placement. `None` where content is immutable, the
+    /// current object then always being the synced one.
     pub object: Option<ReplicaHash>,
 }
 
@@ -261,37 +252,35 @@ pub struct ReplicaPlacement {
     /// The current detail level.
     pub level: ReplicaLevel,
     /// The cached summary; `None` until fetched. After a remote content
-    /// change the sync drops the level back to [`ReplicaLevel::Probed`] but
-    /// keeps the stale summary as a display fallback until the next
+    /// change the sync drops the level back to [`ReplicaLevel::Probed`]
+    /// but keeps the stale summary as a display fallback until the next
     /// [`ReplicaLevel::Meta`] upgrade refetches it.
     pub meta: Option<ReplicaMeta>,
-    /// The presentation sort key, derived beside the summary and opaque
-    /// here exactly as the summary is: see [`ReplicaSortKey`].
+    /// The presentation sort key, derived beside the summary and as
+    /// opaque here: see [`ReplicaSortKey`].
     pub sort_key: ReplicaSortKey,
     /// The current flag set.
     pub flags: ReplicaFlags,
     /// How this placement relates to its base.
     pub status: ReplicaStatus,
-    /// The remote content revision observed when the placement was marked
-    /// [`ReplicaStatus::Conflict`]: what the consumer resolves against (fetch
-    /// that revision's body, merge, then edit). `None` otherwise.
+    /// The remote content revision observed when the placement was
+    /// marked [`ReplicaStatus::Conflict`], what the consumer resolves
+    /// against. `None` otherwise.
     pub conflict_revision: Option<String>,
     /// The last-synced base; `None` until first reconciled.
     pub base: Option<ReplicaBase>,
     /// For a [`ReplicaStatus::Created`] placement, where its body already
-    /// lives so the push can copy or move it; `None` otherwise (and for an
-    /// append).
+    /// lives so the push can copy or move it; `None` for an append.
     pub origin: Option<ReplicaOrigin>,
-    /// The other handles the source holds this identity under, empty in the
-    /// ordinary case: what makes the placement
-    /// [`Ambiguous`](ReplicaStatus::Ambiguous), and what a later enumeration
-    /// clears as those handles stop being reported.
+    /// The other handles the source holds this identity under, empty in
+    /// the ordinary case: what makes the placement
+    /// [`Ambiguous`](ReplicaStatus::Ambiguous), and what a later
+    /// enumeration clears as those handles stop being reported.
     ///
-    /// Recorded here rather than inferred, because the evidence appears in
-    /// exactly one enumeration, the one that discovers the second copy: an
-    /// incremental enumeration never mentions it again, so a freeze that is
-    /// not persisted forgets on the next run and the item goes back to being
-    /// deletable.
+    /// Recorded rather than inferred, because the evidence appears in
+    /// exactly one enumeration: an incremental one never mentions the
+    /// second copy again, so an unpersisted freeze forgets on the next
+    /// run and the item goes back to being deletable.
     pub ambiguous_handles: Vec<ReplicaHandle>,
 }
 
@@ -299,13 +288,11 @@ impl ReplicaPlacement {
     /// The body staged locally but never synced: the object the placement
     /// points at, when its base holds a different one or none at all.
     ///
-    /// The single reading of "there is a local content edit here", so every
-    /// caller asks the same question: the merge deciding whether an edit
-    /// beats a delete, the flag axis deciding whether a dirty placement is
-    /// really a no-op, the rekey deciding what survives a handle-space
-    /// change. It says nothing about the status, which each caller guards
-    /// for itself: a [`ReplicaStatus::Created`] placement has no base, so
-    /// every body of it is staged, which is a create rather than an edit.
+    /// The single reading of "there is a local content edit here", so
+    /// every caller asks the same question. It says nothing about the
+    /// status, which each caller guards for itself: a
+    /// [`ReplicaStatus::Created`] placement has no base, so every body of
+    /// it is staged, which is a create rather than an edit.
     pub fn staged_edit(&self) -> Option<&ReplicaHash> {
         let object = self.object.as_ref()?;
         let synced = self
@@ -370,7 +357,7 @@ mod tests {
 
     #[test]
     fn merge_agreeing_changes_converge() {
-        // both sides added and removed the same flags: no double effect
+        // both sides added and removed the same flags
         let base = flags(&["old"]);
         let both = flags(&["new"]);
         let merged = ReplicaFlags::merge(&base, &both, &both);
@@ -383,9 +370,8 @@ mod tests {
         let known = flags(&["flagged"]);
         let unknown = ReplicaFlags::Unknown;
 
-        // NOTE: a side that has never read the markers holds no opinion, so
-        // it neither wins nor loses: reading it as an empty set would remove
-        // every flag the other side reports.
+        // a side that has never read the markers holds no opinion, so it
+        // neither wins nor loses
         assert_eq!(ReplicaFlags::merge(&base, &unknown, &known), known);
         assert_eq!(ReplicaFlags::merge(&base, &known, &unknown), known);
         assert_eq!(ReplicaFlags::merge(&base, &unknown, &unknown), unknown);
@@ -393,8 +379,8 @@ mod tests {
 
     #[test]
     fn an_unknown_base_keeps_both_sides_markers() {
-        // An unknown base is the same fact as no base on this axis: with
-        // nothing to have diverged from, neither side's flag is a removal.
+        // an unknown base is the same fact as no base on this axis, so
+        // neither side's flag is a removal
         let merged = ReplicaFlags::merge(&ReplicaFlags::Unknown, &flags(&["a"]), &flags(&["b"]));
         assert_eq!(merged, flags(&["a", "b"]));
     }
@@ -405,7 +391,8 @@ mod tests {
         assert!(ReplicaFlags::Unknown.is_unknown());
         assert!(!ReplicaFlags::Unknown.contains("seen"));
         assert_eq!(ReplicaFlags::Unknown.known(), None);
-        // The default is known-empty: unknown is stated, never fallen back to.
+        // the default is known-empty: unknown is stated, never fallen
+        // back to
         assert!(!ReplicaFlags::default().is_unknown());
     }
 }

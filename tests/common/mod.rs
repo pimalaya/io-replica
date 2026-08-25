@@ -1,12 +1,11 @@
 //! Shared in-memory storage and fake remote for the std-client tests.
 //!
 //! The in-memory backends prove the engine drives the protocol purely
-//! through its `Wants`, knowing nothing of either side. The fake remote
-//! models both backend families: with `mutable` unset it behaves like
-//! IMAP (no content revisions), with it set like WebDAV (per-item
-//! revisions, optimistic-concurrency rejections on stale if_match). It
-//! also serves real delta snapshots from a numeric checkpoint, with
-//! explicit vanished tracking, so incremental sync paths run end to end.
+//! through its `Wants`. The fake remote models both backend families:
+//! with `mutable` unset it behaves like IMAP, with it set like WebDAV
+//! (per-item revisions, rejections on stale if_match). It also serves
+//! real delta snapshots from a numeric checkpoint, with explicit vanished
+//! tracking, so incremental sync paths run end to end.
 
 use std::{collections::BTreeMap, convert::Infallible};
 
@@ -47,8 +46,8 @@ impl ReplicaStorage for MemStorage {
         scope: &ReplicaLoadScope,
     ) -> Result<ReplicaLoaded, Infallible> {
         // NOTE: honoured exactly rather than over-delivered, so a verb
-        // that asks for too narrow a scope fails a test here rather than
-        // passing on rows it never said it needed.
+        // asking for too narrow a scope fails here rather than passing on
+        // rows it never said it needed.
         let in_scope = |p: &ReplicaPlacement| match scope {
             ReplicaLoadScope::All => true,
             ReplicaLoadScope::Handles(handles) => handles.contains(&p.handle),
@@ -142,12 +141,12 @@ pub struct MemRemote {
     /// The handle assigned to the next accepted append (an add with no
     /// origin); incremented per append.
     pub next_appended: usize,
-    /// The size of each push batch it was handed, in order: how a run split
-    /// its changes into chunks.
+    /// The size of each push batch it was handed, in order: how a run
+    /// split its changes into chunks.
     pub push_batches: Vec<usize>,
-    /// When true the remote reports content revisions (a WebDAV etag) and
-    /// rejects pushes whose if_match is stale; when false it behaves like
-    /// an immutable-content backend (IMAP) and reports none.
+    /// When true the remote reports content revisions and rejects pushes
+    /// whose if_match is stale; when false it behaves like an
+    /// immutable-content backend and reports none.
     pub mutable: bool,
     /// The global change counter; every mutation bumps it, and a delta
     /// snapshot serves everything past the cursor's value.
@@ -234,7 +233,7 @@ impl MemRemote {
 
     /// A handle-space change (an IMAP UIDVALIDITY bump): every member is
     /// renumbered onto a fresh handle, contents untouched. Returns the
-    /// old-to-new handle mapping.
+    /// old-to-new mapping.
     #[allow(dead_code)]
     pub fn renumber(
         &mut self,
@@ -340,9 +339,9 @@ impl ReplicaRemote for MemRemote {
                         revision: self.revision(item.rev),
                     })
                     .collect();
-                // NOTE: a vanished entry is dropped when the handle exists
-                // again (a real server never reuses handles; the fake only
-                // reports the current truth)
+                // NOTE: a vanished entry is dropped when the handle
+                // exists again. A real server never reuses handles; the
+                // fake only reports the current truth.
                 let vanished = self
                     .vanished
                     .get(collection)
@@ -449,8 +448,8 @@ impl ReplicaRemote for MemRemote {
                     if_match,
                 } => {
                     // NOTE: the move's other half already delivered this
-                    // item, so the remove is a plain delete of the source
-                    // rather than a second relocation.
+                    // item, so the remove is a plain delete rather than a
+                    // second relocation.
                     let to = to
                         .filter(|target| !self.holds_link(target, link_id.as_ref(), Some(&handle)));
                     let stale = self.mutable
@@ -467,9 +466,9 @@ impl ReplicaRemote for MemRemote {
                         rejected(handle)
                     } else {
                         let seq = self.bump();
-                        // a move relocates the item; a plain delete drops
-                        // it; a missing item means the delete already
-                        // landed, which is an accept by contract
+                        // a move relocates the item and a plain delete
+                        // drops it; a missing item means the delete
+                        // already landed, an accept by contract
                         if let Some(item) = self
                             .items
                             .get_mut(collection)
@@ -523,10 +522,10 @@ impl ReplicaRemote for MemRemote {
                         accepted(handle, None, revision)
                     }
                 }
-                // A create: server-side copy the origin item (COPYUID), or
-                // append the uploaded body under a fresh handle. A copy
-                // whose origin is gone is rejected (a real server errors
-                // on copying an expunged message).
+                // server-side copy the origin item (COPYUID), or append
+                // the uploaded body under a fresh handle. A copy whose
+                // origin is gone is rejected, as a real server errors on
+                // copying an expunged message.
                 ReplicaChangeKind::Add {
                     handle,
                     link_id,

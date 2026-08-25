@@ -2,9 +2,9 @@
 //!
 //! A move is staged as a copy into the target plus a remove from the
 //! source (see `ReplicaMutation::Move`), so the two halves are derived by
-//! two independent syncs. These tests pin what each sync order produces:
-//! one member in the target, never two, and never a source deleted before
-//! its copy landed.
+//! two independent syncs. These tests pin what each order produces: one
+//! member in the target, never two, and never a source deleted before its
+//! copy landed.
 
 // NOTE: shared across test targets; not every target uses every helper
 #[allow(dead_code)]
@@ -113,8 +113,8 @@ fn a_move_synced_source_first_delivers_exactly_one_copy() {
     resolve_link(&mut client);
     stage_move(&mut client);
 
-    // the source's remove lands first, relocating the member: the copy's
-    // origin is gone by the time the target syncs
+    // the source's remove lands first and relocates the member, so the
+    // copy's origin is gone by the time the target syncs
     client.sync("inbox", opts).unwrap();
     client.sync("archive", opts).unwrap();
 
@@ -124,10 +124,10 @@ fn a_move_synced_source_first_delivers_exactly_one_copy() {
         "the relocation delivered it; the copy must not deliver a second",
     );
     assert!(remote_members(&client, "inbox").is_empty());
-    // NOTE: the create can no longer copy from a source that has already
-    // been relocated, so it stays visibly pending beside the member the
-    // remove delivered. An add carries no key that would separate a
-    // second copy the user asked for from one the remove already served.
+    // NOTE: the create can no longer copy from a relocated source, so it
+    // stays visibly pending beside the member the remove delivered: an
+    // add carries no key separating a second copy the user asked for from
+    // one the remove already served.
     assert_eq!(
         client.storage().placement("archive", "tmp-i1").status,
         ReplicaStatus::Created,
@@ -167,10 +167,10 @@ fn a_copy_leaves_the_source_and_delivers_one_member() {
 
 #[test]
 fn a_move_of_a_never_fetched_item_delivers_exactly_one_copy() {
-    // With no link id resolved, neither half of a move can recognise what
-    // the other did, so only the source-side relocation is staged: it
-    // delivers in either order, and the target picks the member up on its
-    // next enumerate.
+    // with no link id resolved neither half can recognise what the other
+    // did, so only the source-side relocation is staged: it delivers in
+    // either order, and the target picks the member up on its next
+    // enumerate
     for target_first in [true, false] {
         let mut client = seeded_client();
         let opts = ReplicaSyncOptions::default();

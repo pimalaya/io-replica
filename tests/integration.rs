@@ -1,10 +1,10 @@
 //! End-to-end concept validation with an in-memory storage and a fake
 //! remote.
 //!
-//! Exercises the whole lifecycle on a generic collection of items: initial
-//! pull, fully offline open, progressive upgrade with cross-collection
-//! object dedup (one item present in two collections), local mutation,
-//! push, remote pull, and a divergent flag merge where both sides survive.
+//! Exercises the whole lifecycle on a generic collection of items:
+//! initial pull, fully offline open, progressive upgrade with
+//! cross-collection object dedup, local mutation, push, remote pull, and
+//! a divergent flag merge where both sides survive.
 
 // NOTE: shared across test targets; not every target uses every helper
 #[allow(dead_code)]
@@ -25,8 +25,8 @@ fn seeded_client() -> ReplicaClient<MemStorage, MemRemote> {
     let body_b = b"From: b\r\nMessage-ID: <msg-b>\r\n\r\nother body\r\n";
 
     let mut remote = MemRemote::default();
-    // NOTE: inbox/i1 and archive/a1 are the SAME logical item (link msg-a,
-    // identical body) present in two collections: the dedup case
+    // NOTE: inbox/i1 and archive/a1 are the same logical item, link
+    // msg-a and identical body, in two collections: the dedup case.
     remote.seed("inbox", "i1", "msg-a", &[], body_a);
     remote.seed("inbox", "i2", "msg-b", &[], body_b);
     remote.seed("archive", "a1", "msg-a", &["seen"], body_a);
@@ -43,8 +43,7 @@ fn full_offline_lifecycle() {
     assert_eq!(report.pulled, 2, "both inbox items pulled");
     assert_eq!(report.pushed, 0);
 
-    // 2. open is fully offline: it must touch storage only, never the
-    // remote
+    // 2. open is fully offline: storage only, never the remote
     let calls_before = client.remote().calls;
     let loaded = client.open("inbox").unwrap();
     assert_eq!(loaded.placements.len(), 2);
@@ -85,10 +84,10 @@ fn full_offline_lifecycle() {
     );
     assert_eq!(client.storage().objects.len(), 1, "one stored body");
 
-    // NOTE: a second collection holding the same logical item: upgrading its
-    // body must dedup against the already-stored object, with zero new fetch.
-    // A Meta fetch resolves a1's link id (enumerate does not carry it), then
-    // the Full upgrade links the shared body by that link id.
+    // NOTE: upgrading the second collection's body dedups against the
+    // already-stored object, with no new fetch. A Meta fetch resolves
+    // a1's link id, which enumerate does not carry, then the Full upgrade
+    // links the shared body by it.
     client
         .sync("archive", ReplicaSyncOptions::default())
         .unwrap();
@@ -158,9 +157,9 @@ fn full_offline_lifecycle() {
             .contains("flagged")
     );
 
-    // 7. divergent flag edits on both sides merge element-wise: the local
-    // removal of "seen" and addition of "draft" and the remote addition of
-    // "important" all survive, with no conflict and no silent loss
+    // 7. divergent flag edits merge element-wise: the local removal of
+    // "seen", the local addition of "draft" and the remote addition of
+    // "important" all survive, with no conflict
     client
         .mutate(
             "inbox",
@@ -199,11 +198,11 @@ fn offline_copy_creates_pushes_and_rekeys() {
     let mut client = seeded_client();
     let opts = ReplicaSyncOptions::default();
 
-    // Know the inbox spine, so inbox/i2 is a real placement to copy.
+    // know the inbox spine, so inbox/i2 is a real placement to copy
     client.sync("inbox", opts).unwrap();
 
-    // Copy inbox/i2 into archive offline: a Created placeholder is staged in
-    // archive carrying its origin, and the source is left untouched.
+    // the Created placeholder carries its origin, and the source is left
+    // untouched
     client
         .mutate(
             "inbox",
@@ -223,8 +222,8 @@ fn offline_copy_creates_pushes_and_rekeys() {
         "the copy source is untouched",
     );
 
-    // Syncing archive pushes the create (a server-side copy) and rekeys the
-    // placeholder to the server-assigned handle, clean and based.
+    // syncing archive pushes the create as a server-side copy and rekeys
+    // the placeholder to the assigned handle, clean and based
     let report = client.sync("archive", opts).unwrap();
     assert_eq!(report.pushed, 1);
     assert!(

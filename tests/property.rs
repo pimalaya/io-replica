@@ -1,12 +1,11 @@
 //! Property-based safety net over the sync engine.
 //!
-//! Byte-fuzzing does not fit this crate (there is no parser); the input
-//! space is operation sequences. proptest generates random interleavings
-//! of local mutations, server-side mutations and syncs, then asserts the
-//! invariants that make the engine trustworthy: no panic on any protocol
-//! misuse, no user intent silently lost by the flag merge, convergence to
-//! the server state once quiescent, and idempotence of a quiescent sync.
-//! Shrinking turns any violation into a minimal counterexample sequence.
+//! There is no parser to byte-fuzz here; the input space is operation
+//! sequences. proptest generates random interleavings of local
+//! mutations, server-side mutations and syncs, then asserts what makes
+//! the engine trustworthy: no panic on any protocol misuse, no user
+//! intent silently lost, convergence to the server state once quiescent,
+//! and idempotence of a quiescent sync.
 
 // NOTE: shared across test targets; not every target uses every helper
 #[allow(dead_code)]
@@ -38,7 +37,7 @@ use proptest::{prelude::*, test_runner::TestCaseError};
 use crate::common::{MemRemote, MemStorage, hash};
 
 /// A small flag universe keeps the sets overlapping, which is where the
-/// merge actually has work to do.
+/// merge has work to do.
 fn arb_flags() -> impl Strategy<Value = ReplicaFlags> {
     proptest::collection::btree_set(
         prop_oneof![
@@ -53,9 +52,9 @@ fn arb_flags() -> impl Strategy<Value = ReplicaFlags> {
 }
 
 proptest! {
-    /// Every change a side made against the base survives the merge:
-    /// a side's addition is present, a side's removal is absent. This is
-    /// the no-silent-loss property of the flag axis.
+    /// Every change a side made against the base survives the merge: an
+    /// addition is present, a removal absent. The no-silent-loss
+    /// property of the flag axis.
     #[test]
     fn flags_merge_loses_no_intent(
         base in arb_flags(),
@@ -94,8 +93,8 @@ proptest! {
     }
 }
 
-/// Any coroutine arg, mostly empty payloads: the point is protocol
-/// misuse (wrong variant, missing arg), not payload realism.
+/// Any coroutine arg, mostly empty payloads: the point is protocol misuse
+/// (wrong variant, missing arg), not payload realism.
 fn arb_arg() -> impl Strategy<Value = Option<ReplicaArg>> {
     prop_oneof![
         Just(None),
@@ -113,8 +112,9 @@ fn arb_arg() -> impl Strategy<Value = Option<ReplicaArg>> {
     ]
 }
 
-/// Feeds the sequence until the coroutine completes; the property is that
-/// it always returns (never panics, never runs past its state machine).
+/// Feeds the sequence until the coroutine completes; the property is
+/// that it always returns, never panicking or running past its state
+/// machine.
 fn feed<C: ReplicaCoroutine>(mut coroutine: C, args: Vec<Option<ReplicaArg>>) {
     for arg in args {
         if let ReplicaCoroutineState::Complete(_) = coroutine.resume(arg) {
@@ -139,7 +139,7 @@ proptest! {
     }
 }
 
-/// One step of the random scenario. ReplicaHandle picks are indices resolved
+/// One step of the random scenario. Handle picks are indices resolved
 /// modulo the live set at execution time, so every generated op is valid
 /// by construction and shrinking stays meaningful.
 #[derive(Clone, Debug)]
@@ -178,10 +178,9 @@ fn nth(handles: &BTreeSet<ReplicaHandle>, i: usize) -> Option<ReplicaHandle> {
 
 proptest! {
     /// Whatever the interleaving of local edits, server edits and syncs,
-    /// two quiescent syncs converge the replica onto the server (same
-    /// members, same flags, everything clean) and a third sync is a
-    /// no-op. The fake remote accepts every push and its content is
-    /// immutable, so no conflict can remain to excuse a divergence.
+    /// two quiescent syncs converge the replica onto the server and a
+    /// third is a no-op. The fake remote accepts every push and its
+    /// content is immutable, so no conflict can excuse a divergence.
     #[test]
     fn random_interleavings_converge(ops in proptest::collection::vec(arb_op(), 0..25)) {
         let mut client = ReplicaClient::new(MemStorage::default(), MemRemote::default());
@@ -277,8 +276,8 @@ fn server_handles(client: &ReplicaClient<MemStorage, MemRemote>) -> BTreeSet<Rep
         .unwrap_or_default()
 }
 
-/// A storage that drops exactly one write batch (simulating a crash after
-/// the pushes were serviced but before the write landed), then recovers.
+/// A storage that drops exactly one write batch, a crash after the pushes
+/// were serviced but before the write landed, then recovers.
 struct CrashyStorage {
     inner: MemStorage,
     /// Write batches left before the crash; `None` = never crash (or
@@ -324,9 +323,9 @@ impl ReplicaStorage for CrashyStorage {
 }
 
 /// One step of the mutable-content scenario; indices resolve modulo the
-/// live set at execution time. Local ops target the inbox; a copy or move
-/// targets the archive; server ops touch the inbox only, so the archive
-/// changes exclusively through engine pushes.
+/// live set at execution time. Local ops target the inbox, a copy or move
+/// the archive; server ops touch the inbox only, so the archive changes
+/// exclusively through engine pushes.
 #[derive(Clone, Debug)]
 enum MutOp {
     LocalSetFlags(usize, ReplicaFlags),
@@ -342,14 +341,14 @@ enum MutOp {
     ServerRemove(usize),
     /// A server-side content edit: the revision advances.
     ServerEdit(usize, u8),
-    /// A new message arrives server-side, always under a fresh handle (a
-    /// real server never reuses one within a uidvalidity).
+    /// A new message arrives server-side, always under a fresh handle: a
+    /// real server never reuses one within a uidvalidity.
     ServerAdd(u8),
     /// Raise the i-th live inbox placement to full detail (resolves its
     /// link id, caches its body).
     Upgrade(usize),
-    /// A handle-space change (a UIDVALIDITY bump): the server renumbers
-    /// every member and the replica runs the rekey verb.
+    /// A handle-space change: the server renumbers every member and the
+    /// replica runs the rekey verb.
     Bump,
     Sync,
     SyncArchive,
@@ -375,8 +374,8 @@ fn arb_mut_op() -> impl Strategy<Value = MutOp> {
 
 /// What the user asked for, to be accounted for at the end: every intent
 /// must land, stay visibly pending, or be superseded by a strictly later
-/// action on the same item; nothing may just evaporate. Entries are
-/// removed exactly when a later op legitimately overrides them.
+/// action on the same item. Entries are removed exactly when a later op
+/// legitimately overrides them.
 #[derive(Default)]
 struct Ledger {
     /// Last staged edit per inbox handle: the body's hash.
@@ -384,7 +383,7 @@ struct Ledger {
     /// Last staged flag change per inbox handle, as the per-element delta
     /// against the base the replica held: (added, removed). Only changed
     /// elements carry an obligation; setting a flag the base already has
-    /// claims nothing (the element-wise merge owes nothing for it).
+    /// claims nothing.
     flags: BTreeMap<ReplicaHandle, (BTreeSet<String>, BTreeSet<String>)>,
     /// Staged copies: the placeholder and the source's server link.
     copies: Vec<(ReplicaHandle, Option<ReplicaLinkId>)>,
@@ -446,19 +445,17 @@ fn held_object(client: &ModelClient, handle: &ReplicaHandle) -> Option<ReplicaHa
         .and_then(|p| p.object.clone())
 }
 
-/// Voids the edit intents whose content a server-side change destroyed:
-/// a landed edit dies with the content it landed as (matched by body,
-/// since a resurrect may have re-keyed the handle), unless a local
-/// placement still pends it and the resurrect or resolution path will
-/// re-upload it.
+/// Voids the edit intents whose content a server-side change destroyed: a
+/// landed edit dies with the content it landed as, matched by body since
+/// a resurrect may have re-keyed the handle, unless a local placement
+/// still pends it and will re-upload it.
 fn void_superseded_edits(ledger: &mut Ledger, client: &ModelClient, destroyed: &[u8]) {
     let placements = &client.storage().inner.placements;
     ledger.edits.retain(|_, staged| {
         let landed_here = destroyed == staged.as_str().as_bytes();
         // pending mirrors the engine's resurrect predicate: an unlanded
-        // staged edit (object differs from the base object), not a
-        // placement that merely holds the landed content while dirty on
-        // its flag axis
+        // staged edit, not a placement that merely holds the landed
+        // content while dirty on its flag axis
         let pending = placements.iter().any(|((c, _), p)| {
             c.as_str() == "inbox"
                 && p.object.as_ref() == Some(staged)
@@ -480,10 +477,9 @@ fn collection_has_link(client: &ModelClient, collection: &str, link: &ReplicaLin
         .any(|(_, item)| &item.link_id == link)
 }
 
-/// Runs the mutable-content scenario: seeded server, random ops (syncs may
-/// crash once at the injected write batch), quiescence, then conflict
-/// resolution, then the convergence and ledger assertions. Shared by the
-/// crash-free and the crash-injected properties.
+/// Runs the mutable-content scenario: seeded server, random ops, syncs
+/// that may crash once at the injected write batch, quiescence, conflict
+/// resolution, then the convergence and ledger assertions.
 fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<(), TestCaseError> {
     let storage = CrashyStorage {
         inner: MemStorage::default(),
@@ -541,9 +537,9 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
                     {
                         // the user's own delete supersedes their edits:
                         // the content their placement pends, and the
-                        // content that already landed in the deleted item
-                        // (matched by body, the local pointer may be gone
-                        // after a rekey rebuilt the spine)
+                        // content that already landed in the deleted
+                        // item, matched by body since a rekey may have
+                        // rebuilt the spine
                         if let Some(held) = held {
                             ledger.edits.retain(|_, staged| staged != &held);
                         }
@@ -575,8 +571,7 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
                     if staged.is_ok() {
                         // editing over content supersedes the edit that
                         // put it there: the content the placement pends,
-                        // and the content that landed in the item (the
-                        // local pointer may be gone after a rekey)
+                        // and the content that landed in the item
                         if let Some(held) = held {
                             ledger.edits.retain(|_, staged| staged != &held);
                         }
@@ -607,9 +602,9 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
                 if let Some(handle) = nth(&live(&client), i) {
                     let link = server_link(&client, &handle);
                     let server_body = server_body(&client, &handle);
-                    // a remote content edit the replica has not reconciled
-                    // yet beats the delete half of the move: the move is
-                    // legitimately overridden from the start
+                    // an unreconciled remote content edit beats the
+                    // delete half of the move, so it is legitimately
+                    // overridden from the start
                     let doomed = client
                         .storage()
                         .inner
@@ -722,10 +717,10 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
             MutOp::Bump => {
                 bumps += 1;
 
-                // rekey matches by link id: pending flag deltas and
+                // rekey matches by link id, so pending flag deltas and
                 // tombstones on link-less placements are dropped by
-                // design, so their ledger claims void with them (staged
-                // edits always survive, through carry or resurrect)
+                // design and their ledger claims void with them; staged
+                // edits always survive, through carry or resurrect
                 let linked: BTreeSet<ReplicaHandle> = client
                     .storage()
                     .inner
@@ -741,8 +736,8 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
 
                 let mapping = client.remote_mut().renumber("inbox", bumps);
 
-                // a crash may eat the rekey write; the old spine is then
-                // intact and the recovery is simply to run it again
+                // a crash may eat the rekey write, leaving the old spine
+                // intact, and the recovery is to run it again
                 for _ in 0..3 {
                     if client.rekey("inbox").is_ok() {
                         break;
@@ -769,8 +764,8 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
         }
     }
 
-    // drain the injected crash if it has not fired yet (every sync writes
-    // at least a checkpoint batch, so this terminates), then quiesce
+    // drain the injected crash if it has not fired yet, which terminates
+    // because every sync writes at least a checkpoint batch, then quiesce
     while client.storage().remaining.is_some() {
         let _ = client.sync("inbox", opts);
         let _ = client.sync("archive", opts);
@@ -780,10 +775,9 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
         client.sync("archive", opts).unwrap();
     }
 
-    // resolve every content conflict the scenario produced (divergent
-    // edits, or the at-least-once echo of a push whose recording write
-    // crashed), the way a consumer would: merge with an edit. Resolutions
-    // are local edits, so they register in the ledger like any other.
+    // resolve every content conflict the way a consumer would, with an
+    // edit; resolutions are local edits, so they register in the ledger
+    // like any other
     for round in 0..3 {
         let conflicted: Vec<ReplicaHandle> = client
             .storage()
@@ -836,7 +830,7 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
     }
 
     // a copy whose source vanished can never land: its placeholder stays
-    // visibly pending (Created), which is the accounted end state
+    // visibly pending, which is the accounted end state
     let inbox_server = on_server(&client, "inbox");
     let lingering = |p: &ReplicaPlacement| {
         p.status == ReplicaStatus::Created
@@ -845,7 +839,7 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
                 .is_some_and(|o| !inbox_server.contains(&o.handle))
     };
 
-    // convergence: each collection mirrors its server side exactly, dead
+    // convergence: each collection mirrors its server side, dead
     // placeholders aside
     for collection in ["inbox", "archive"] {
         let placements: Vec<ReplicaPlacement> = client
@@ -891,8 +885,8 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
         }
     }
 
-    // ledger: every surviving edit intent's content is on the server (the
-    // handle may have changed through a resurrect, so match by body)
+    // ledger: every surviving edit intent's content is on the server,
+    // matched by body since a resurrect may have changed the handle
     for (handle, staged) in &ledger.edits {
         let found = client
             .remote()
@@ -905,8 +899,7 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
     }
 
     // ledger: a surviving flag intent holds per element on the server
-    // while its handle exists (a resurrect re-keys the handle and ends
-    // the claim)
+    // while its handle exists; a resurrect re-keys it and ends the claim
     for (handle, (added, removed)) in &ledger.flags {
         if let Some(items) = client.remote().items.get(&"inbox".into()) {
             if let Some(item) = items.get(handle) {
@@ -942,9 +935,7 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
     }
 
     // ledger: a move either landed in the archive or was overridden by an
-    // edit that beat the delete, leaving the item in the inbox (a voided
-    // entry saw the overriding server action directly; the echo of a
-    // crash-lost update push overrides the same way without one). A move
+    // edit that beat the delete, leaving the item in the inbox. A move
     // that merely never pushed cannot hide here: a surviving tombstone
     // would fail the all-clean assertion above.
     for (handle, link, voided) in &ledger.moves {
@@ -980,10 +971,9 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
 }
 
 proptest! {
-    /// Mutable-content interleavings (edits on both sides, revision-gated
-    /// pushes, real delta snapshots): after quiescence the only survivors
-    /// are content conflicts, and resolving each one with an edit brings
-    /// the replica to an exact mirror of the server.
+    /// Mutable-content interleavings: after quiescence the only survivors
+    /// are content conflicts, and resolving each with an edit brings the
+    /// replica to an exact mirror of the server.
     #[test]
     fn mutable_interleavings_converge_after_resolution(
         ops in proptest::collection::vec(arb_mut_op(), 0..25),
@@ -992,10 +982,10 @@ proptest! {
     }
 
     /// Same scenario with a crash injected at a random write batch: the
-    /// batch is lost after the pushes were serviced, so every push replays
-    /// at least once. Nothing may be lost or duplicated into divergence;
-    /// the worst allowed outcome is a spurious conflict (our own echo),
-    /// which resolution then clears.
+    /// batch is lost after the pushes were serviced, so every push
+    /// replays at least once. Nothing may be lost or duplicated into
+    /// divergence; the worst allowed outcome is a spurious conflict,
+    /// which resolution clears.
     #[test]
     fn a_crashed_write_never_loses_data(
         ops in proptest::collection::vec(arb_mut_op(), 0..20),
@@ -1040,7 +1030,7 @@ impl ReplicaRemote for SharedRemote {
 }
 
 /// One step of the two-replica scenario. Replica A edits locally and
-/// syncs full every time; replica B is a passive incremental mirror.
+/// syncs full every time, replica B is a passive incremental mirror.
 #[derive(Clone, Debug)]
 enum PairOp {
     LocalASetFlags(usize, ReplicaFlags),
@@ -1068,9 +1058,8 @@ fn arb_pair_op() -> impl Strategy<Value = PairOp> {
 
 proptest! {
     /// Two replicas of one server, one syncing full every time and one
-    /// syncing incrementally from its checkpoint, must end in the same
-    /// state: the delta path (changed items, vanished handles, unlisted
-    /// untouched) is equivalent to re-reading the whole collection.
+    /// incrementally from its checkpoint, must end in the same state: the
+    /// delta path is equivalent to re-reading the whole collection.
     #[test]
     fn full_and_delta_replicas_agree(ops in proptest::collection::vec(arb_pair_op(), 0..25)) {
         let mut server = MemRemote::default();
@@ -1272,11 +1261,11 @@ fn duo_resolve(client: &mut DuoClient, tag: &str) -> bool {
 }
 
 proptest! {
-    /// Two replicas actively editing the same server (the Neverest
-    /// full-sync shape): whatever the interleaving of edits, deletes and
-    /// syncs on both sides, quiescence plus per-replica conflict
-    /// resolution converges both replicas onto the same server state,
-    /// with nothing pending anywhere and idempotent final syncs.
+    /// Two replicas actively editing the same server, the Neverest
+    /// full-sync shape: whatever the interleaving of edits, deletes and
+    /// syncs, quiescence plus per-replica conflict resolution converges
+    /// both onto the same server state, with nothing pending anywhere and
+    /// idempotent final syncs.
     #[test]
     fn two_active_replicas_converge(ops in proptest::collection::vec(arb_duo_op(), 0..25)) {
         let mut server = MemRemote::default();
@@ -1327,8 +1316,8 @@ proptest! {
         }
 
         // quiesce both, then resolve conflicts per replica until neither
-        // holds one; a resolution can conflict with the other replica's
-        // resolution, so this ping-pongs at most once before settling
+        // holds one; one resolution can conflict with the other, so this
+        // ping-pongs at most once before settling
         for _ in 0..4 {
             a.sync("inbox", opts).unwrap();
             b.sync("inbox", opts).unwrap();

@@ -50,9 +50,9 @@ impl ReplicaCoroutine for ReplicaOpen {
             (State::PendingLoad, Some(ReplicaArg::Load(loaded))) => {
                 debug!("opened collection with {} items", loaded.placements.len());
                 trace!("loaded placements: {:?}", loaded.placements);
-                // NOTE: a completed coroutine stays completed, or resuming a
-                // finished run would hand back an empty success a caller
-                // cannot tell from a run that genuinely did nothing.
+                // NOTE: a completed coroutine stays completed, or a
+                // resumed run would hand back an empty success a caller
+                // cannot tell from one that did nothing.
                 self.state = State::Done;
                 ReplicaCoroutineState::Complete(Ok(loaded))
             }
@@ -123,7 +123,7 @@ mod tests {
         }
     }
 
-    /// An empty success is indistinguishable from a run that genuinely did
+    /// An empty success is indistinguishable from a run that did
     /// nothing, so a driver resuming a finished coroutine must be told.
     #[test]
     fn a_completed_open_does_not_resume() {

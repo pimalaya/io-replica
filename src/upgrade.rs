@@ -1,11 +1,11 @@
 //! I/O-free coroutine to raise placements to a higher detail level.
 //!
-//! A pure pull, never a merge. It loads the targeted placements, then for
-//! [`ReplicaTier::Full`] resolves their link ids against the object store
-//! first: a body already stored under another collection is linked without
-//! any network round-trip. This stores one body for an item that appears in
-//! several collections at once, and backs a unified across-collections
-//! view.
+//! A pure pull, never a merge. It loads the targeted placements, then
+//! for [`ReplicaTier::Full`] resolves their link ids against the object
+//! store first: a body already stored under another collection is linked
+//! with no network round-trip. One body is therefore stored for an item
+//! appearing in several collections, which is what backs the unified
+//! across-collections view.
 
 use core::mem;
 
@@ -74,13 +74,13 @@ impl ReplicaUpgrade {
         }
     }
 
-    /// Records each losing handle on the placement that holds its identity,
-    /// which is what freezes it: a placement carrying ambiguous handles reads
-    /// as [`ReplicaStatus::Ambiguous`] and the engine derives nothing for it.
+    /// Records each losing handle on the placement holding its identity,
+    /// which is what freezes it: a placement carrying ambiguous handles
+    /// reads as [`ReplicaStatus::Ambiguous`] and derives nothing.
     ///
-    /// The record is what makes the freeze sticky, and it has to be: the
-    /// second copy appears in exactly one enumeration, the one that discovers
-    /// it, and an incremental enumeration never mentions it again.
+    /// The record has to make the freeze sticky: the second copy appears
+    /// in exactly one enumeration, and an incremental one never mentions
+    /// it again.
     fn freeze(&mut self, ambiguous: Vec<(ReplicaHandle, ReplicaHandle)>) {
         let mut by_holder: BTreeMap<ReplicaHandle, Vec<ReplicaHandle>> = BTreeMap::new();
         for (holder, lost) in ambiguous {
@@ -88,8 +88,8 @@ impl ReplicaUpgrade {
         }
 
         for (holder, lost) in by_holder {
-            // NOTE: patch whatever this batch already staged for the holder,
-            // so a holder fetched in the same batch keeps its new body.
+            // NOTE: patch whatever this batch already staged, so a holder
+            // fetched in the same batch keeps its new body.
             let staged = self.ops.iter_mut().find_map(|op| match op {
                 ReplicaWriteOp::UpsertPlacement(p) if p.handle == holder => Some(p),
                 _ => None,
@@ -111,10 +111,9 @@ impl ReplicaUpgrade {
 
     /// Requested handles that still need work for the target tier.
     ///
-    /// The level is a claim and the payload is the fact, so a row that
-    /// reads as high enough while holding nothing is upgraded again: it
-    /// would otherwise be skipped forever, since nothing else revisits
-    /// what already reads as reached.
+    /// The level is a claim and the payload is the fact, so a row
+    /// reading as high enough while holding nothing is upgraded again;
+    /// nothing else revisits what already reads as reached.
     fn pending_handles(&self) -> Vec<ReplicaHandle> {
         self.handles
             .iter()
@@ -214,10 +213,11 @@ impl ReplicaCoroutine for ReplicaUpgrade {
                     match hit {
                         Some(hash) => {
                             let mut patched = placement.clone();
-                            // NOTE: the base moves with the body, as it does on
-                            // the fetch below. A body linked from the store is
-                            // the item's synced content, and a base left behind
-                            // reads as a local edit on every later sync.
+                            // NOTE: the base moves with the body, as on
+                            // the fetch below: a body linked from the
+                            // store is the item's synced content, and a
+                            // base left behind reads as a local edit on
+                            // every later sync.
                             if let Some(base) = &mut patched.base {
                                 base.object = Some(hash.clone());
                             }
@@ -254,12 +254,11 @@ impl ReplicaCoroutine for ReplicaUpgrade {
             (State::PendingFetch, Some(ReplicaArg::Fetch(items))) => {
                 trace!("fetched {} items", items.len());
 
-                // NOTE: an identity this fetch would newly establish has to be
-                // checked against every placement of the collection that could
-                // already hold it, not just the ones being upgraded: a batch
-                // hydrating only the second copy would otherwise link it and
-                // destroy the evidence. The check is one scoped read, asked
-                // only when the fetch actually resolves a new identity.
+                // NOTE: an identity this fetch would newly establish is
+                // checked against every placement that could already
+                // hold it, not just the ones being upgraded: a batch
+                // hydrating only the second copy would otherwise link it
+                // and destroy the evidence.
                 let fresh: Vec<ReplicaLinkId> = items
                     .iter()
                     .filter(|item| {
@@ -287,8 +286,8 @@ impl ReplicaCoroutine for ReplicaUpgrade {
             }
 
             (State::PendingLinkCheck, Some(ReplicaArg::Load(loaded))) => {
-                // NOTE: holders the upgrade batch never named; folded in by
-                // handle, so the identity check below sees the whole picture.
+                // NOTE: holders the upgrade batch never named, folded in
+                // so the identity check below sees the whole picture.
                 for placement in loaded.placements {
                     self.placements
                         .entry(placement.handle.clone())
@@ -302,8 +301,8 @@ impl ReplicaCoroutine for ReplicaUpgrade {
                     "upgraded {} items ({} fetched, {} linked from store)",
                     self.report.upgraded, self.report.fetched, self.report.deduped,
                 );
-                // NOTE: a completed coroutine stays completed; resuming one
-                // is a driver bug, not an empty success.
+                // NOTE: a completed coroutine stays completed: resuming
+                // one is a driver bug, not an empty success.
                 self.state = State::Done;
                 ReplicaCoroutineState::Complete(Ok(self.report))
             }
@@ -319,17 +318,15 @@ impl ReplicaUpgrade {
     fn write_fetched(
         &mut self,
     ) -> ReplicaCoroutineState<ReplicaYield, <Self as ReplicaCoroutine>::Return> {
-        // NOTE: (holder, losing handle) pairs this batch discovered:
-        // an identity the collection turns out to hold twice. Applied
-        // after the loop, so a holder that also appears in the batch
-        // is patched once, with every handle it lost.
+        // NOTE: (holder, losing handle) pairs, applied after the loop so
+        // a holder that also appears in the batch is patched once, with
+        // every handle it lost.
         let mut ambiguous: Vec<(ReplicaHandle, ReplicaHandle)> = Vec::new();
 
-        // NOTE: who holds each identity, seeded from what the collection
-        // already claims and extended as this batch resolves more. Both
-        // copies of a duplicate are commonly fetched together, and neither
-        // is linked yet, so a check against the stored rows alone would see
-        // nothing and link both.
+        // NOTE: who holds each identity, seeded from the collection and
+        // extended as this batch resolves more. Both copies of a
+        // duplicate are commonly fetched together and neither is linked
+        // yet, so a check against the stored rows alone would link both.
         let mut claimed: BTreeMap<ReplicaLinkId, ReplicaHandle> = self
             .placements
             .values()
@@ -341,22 +338,17 @@ impl ReplicaUpgrade {
                 continue;
             };
             let mut patched = placement.clone();
-            // NOTE: keep an already-resolved link id. A fetch establishes
-            // the link only for a not-yet-linked item (a `Meta` upgrade of
-            // a probed placement); a `Full` body fetch of a linked item
-            // must not re-identify it. Two tiers can otherwise disagree on
-            // the link (a server ENVELOPE reporting a `Message-ID` the body
-            // parser does not, or a differently formatted date in the
-            // fallback digest), which would strand the linked item and
-            // duplicate it under the body's link.
+            // NOTE: a fetch establishes the link only for a not-yet-
+            // linked item, never re-identifying a linked one. Two tiers
+            // can disagree on the link, an ENVELOPE reporting a
+            // `Message-ID` the body parser does not, which would strand
+            // the linked item and duplicate it under the body's link.
             if patched.link_id.is_none() {
-                // NOTE: nor does it establish a link another placement
-                // of the collection already holds. The second copy has
-                // nowhere to live, and linking it overwrites the first
-                // binding's handle: the fact that the source holds the
-                // identity twice would be destroyed at this write,
-                // before any later rule could act on it. The losing
-                // handle is recorded on the holder instead.
+                // NOTE: nor a link another placement already holds:
+                // linking the second copy overwrites the first binding's
+                // handle, destroying the evidence that the source holds
+                // the identity twice. The losing handle is recorded on
+                // the holder instead.
                 match claimed.get(&item.link_id) {
                     Some(holder) => ambiguous.push((holder.clone(), item.handle.clone())),
                     None => {
@@ -366,21 +358,15 @@ impl ReplicaUpgrade {
                 }
             }
             patched.meta = Some(item.meta);
-            // NOTE: unlike the link id, the key is refreshed on
-            // every tier. It is a projection of the content, not
-            // an identity, so the later and better-informed
-            // derivation should win: a `Full` body carries the
-            // real date where an envelope may have carried none.
-            // A connector whose kind defines no key sends an
-            // empty one, which reads as unknown either way.
+            // NOTE: unlike the link id, the key is refreshed on every
+            // tier: it is a projection of the content, not an identity,
+            // so the better-informed derivation wins.
             patched.sort_key = item.sort_key;
 
             match (self.tier, item.body) {
                 (ReplicaTier::Full, Some(body)) => {
-                    // NOTE: the body is either inline bytes to store, or
-                    // a reference to an object the consumer already
-                    // streamed into its blob store (bounded memory) —
-                    // then the store op carries no bytes.
+                    // NOTE: a body already streamed into the consumer's
+                    // blob store carries no bytes in the store op.
                     let (object, store_body) = match body {
                         ReplicaFetchedBody::Inline { hash, bytes } => {
                             let object = ReplicaObject {
@@ -399,9 +385,9 @@ impl ReplicaUpgrade {
                         body: store_body,
                     });
 
-                    // NOTE: the revision travels with the body: the
-                    // stored object is the remote content as of the
-                    // fetch, so the base records both.
+                    // NOTE: the stored object is the remote content as
+                    // of the fetch, so the base records both it and the
+                    // revision.
                     if let Some(base) = &mut patched.base {
                         base.revision = item.revision.clone();
                         base.object = Some(hash.clone());
@@ -430,9 +416,9 @@ impl ReplicaUpgrade {
     }
 }
 
-/// Freezes a placement on the identity axis: it holds an identity the source
-/// reports under `lost` too, so which copy any change refers to cannot be
-/// decided and the engine derives nothing for it.
+/// Freezes a placement on the identity axis: it holds an identity the
+/// source reports under `lost` too, so which copy a change refers to
+/// cannot be decided and the engine derives nothing for it.
 fn mark_ambiguous(placement: &mut ReplicaPlacement, lost: Vec<ReplicaHandle>) {
     for handle in lost {
         if !placement.ambiguous_handles.contains(&handle) {
@@ -442,13 +428,14 @@ fn mark_ambiguous(placement: &mut ReplicaPlacement, lost: Vec<ReplicaHandle>) {
     placement.status = ReplicaStatus::Ambiguous;
 }
 
-/// Whether the placement's content is mutable, which the last-synced revision
-/// is the mark of: only a source that rewrites a body in place has one.
+/// Whether the placement's content is mutable, which the last-synced
+/// revision is the mark of: only a source rewriting a body in place has
+/// one.
 ///
-/// Such a placement is fetched rather than linked from the store: the link id
-/// says two copies are the same item, not that they hold the same bytes, and a
-/// revision is what makes the difference observable. Linking one copy's body
-/// under another's revision would record a body no fetch ever confirmed.
+/// Such a placement is fetched rather than linked from the store: the
+/// link id says two copies are the same item, not that they hold the
+/// same bytes, so linking one copy's body under another's revision would
+/// record a body no fetch confirmed.
 fn is_mutable(placement: &ReplicaPlacement) -> bool {
     placement
         .base
@@ -581,8 +568,8 @@ mod tests {
 
     #[test]
     fn fetch_results_are_matched_by_handle_not_order() {
-        // A pooled or reordered fetch may return results in any order; each must
-        // land on its own handle, so a concurrent consumer is correct.
+        // a pooled or reordered fetch returns results in any order, and
+        // each must land on its own handle
         let loaded = ReplicaLoaded {
             placements: vec![
                 probed("1", Some("msg-a"), ReplicaLevel::Meta),
@@ -599,7 +586,7 @@ mod tests {
         let _ = up.resume(Some(ReplicaArg::Load(loaded)));
         let _ = up.resume(Some(ReplicaArg::LookupObject(BTreeMap::new())));
 
-        // Results returned in the reverse of the requested order.
+        // results returned in the reverse of the requested order
         let items = vec![
             ReplicaFetchedItem {
                 sort_key: Default::default(),
@@ -629,7 +616,7 @@ mod tests {
             state => panic!("expected WantsWrite, got {state:?}"),
         };
 
-        // Each handle's placement pins its own object, not the other's.
+        // each handle's placement pins its own object
         let object_for = |handle: &str| {
             ops.iter().find_map(|op| match op {
                 ReplicaWriteOp::UpsertPlacement(p) if p.handle.as_str() == handle => {
@@ -644,12 +631,9 @@ mod tests {
 
     #[test]
     fn a_full_fetch_keeps_an_already_resolved_link_id() {
-        // A Full body fetch must not re-identify an already-linked item. If the
-        // body parses to a different link than the Meta tier resolved (a server
-        // ENVELOPE reporting a Message-ID the body parser misses, say), the
-        // placement keeps its original link and simply rises to Full — it is not
-        // duplicated under the body's link (which stranded the Meta item and
-        // re-fetched it every sync).
+        // when the body parses to a different link than the Meta tier
+        // resolved, the placement keeps its original link and rises to
+        // Full rather than being duplicated under the body's link
         let loaded = ReplicaLoaded {
             placements: vec![probed("1", Some("mid:real"), ReplicaLevel::Meta)],
             checkpoint: None,
@@ -663,7 +647,7 @@ mod tests {
         let items = vec![ReplicaFetchedItem {
             sort_key: Default::default(),
             handle: ReplicaHandle::from("1"),
-            // The body parses to a *different* link than the Meta tier resolved.
+            // a different link than the Meta tier resolved
             link_id: ReplicaLinkId::from("alt:divergent"),
             meta: ReplicaMeta("hdr".into()),
             body: Some(ReplicaFetchedBody::Persisted {
@@ -693,8 +677,8 @@ mod tests {
 
     #[test]
     fn a_meta_fetch_still_sets_the_link_of_an_unlinked_item() {
-        // The complement: a not-yet-linked (probed) item DOES take the fetched
-        // link — that is how the Meta tier establishes identity.
+        // the complement: a probed item does take the fetched link,
+        // which is how the Meta tier establishes identity
         let loaded = ReplicaLoaded {
             placements: vec![probed("1", None, ReplicaLevel::Probed)],
             checkpoint: None,
@@ -713,8 +697,8 @@ mod tests {
             body: None,
             revision: None,
         }];
-        // NOTE: a fetch that establishes a fresh identity checks it against
-        // the collection first; nothing else holds it here.
+        // a fetch establishing a fresh identity checks it against the
+        // collection first, and nothing else holds it here
         match up.resume(Some(ReplicaArg::Fetch(items))) {
             ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad {
                 scope: ReplicaLoadScope::Links(links),
@@ -742,8 +726,8 @@ mod tests {
 
     #[test]
     fn a_persisted_body_stores_the_object_without_bytes() {
-        // A consumer that streamed the body straight into its blob store reports
-        // it by (hash, size); the engine records the object with no bytes.
+        // a consumer that streamed the body into its blob store reports
+        // it by (hash, size), and the object is recorded with no bytes
         let loaded = ReplicaLoaded {
             placements: vec![probed("1", Some("msg-b"), ReplicaLevel::Meta)],
             checkpoint: None,
@@ -777,7 +761,7 @@ mod tests {
             }
             other => panic!("expected StoreObject, got {other:?}"),
         }
-        // The placement still pins the object and rises to Full.
+        // the placement still pins the object and rises to Full
         assert!(matches!(
             &ops[1],
             ReplicaWriteOp::UpsertPlacement(p)
@@ -787,9 +771,8 @@ mod tests {
 
     #[test]
     fn full_fetch_stamps_the_base_revision_and_object() {
-        // A fetched body is the remote content as of the fetch: a based
-        // placement records the fetched revision and pins the stored body
-        // as its content base.
+        // a fetched body is the remote content as of the fetch, so the
+        // base records the revision and pins the stored body
         let mut placement = probed("1", Some("msg-b"), ReplicaLevel::Meta);
         placement.base = Some(ReplicaBase {
             flags: ReplicaFlags::default(),
@@ -874,9 +857,8 @@ mod tests {
 
     #[test]
     fn a_full_row_holding_no_body_is_upgraded_again() {
-        // The level is a claim, the object is the fact. A row recorded at
-        // Full with no body would otherwise be skipped forever, since
-        // nothing revisits what already reads as Full.
+        // the level is a claim, the object the fact: a row recorded at
+        // Full with no body would otherwise be skipped forever
         let loaded = ReplicaLoaded {
             placements: vec![probed("1", None, ReplicaLevel::Full)],
             checkpoint: None,
@@ -922,8 +904,8 @@ mod tests {
         }
     }
 
-    /// An empty report is indistinguishable from a run that genuinely did
-    /// nothing, so a driver resuming a finished coroutine must be told.
+    /// An empty report is indistinguishable from a run that did nothing,
+    /// so a driver resuming a finished coroutine must be told.
     #[test]
     fn a_completed_upgrade_does_not_resume() {
         let mut placement = probed("1", Some("x"), ReplicaLevel::Full);
@@ -956,8 +938,7 @@ mod tests {
 
     #[test]
     fn unknown_handle_completes_without_work() {
-        // A requested handle with no placement is not the upgrade's to
-        // invent: it is skipped, not fetched.
+        // a requested handle with no placement is skipped, not invented
         let loaded = ReplicaLoaded {
             placements: vec![probed("1", None, ReplicaLevel::Probed)],
             checkpoint: None,
@@ -977,8 +958,8 @@ mod tests {
 
     #[test]
     fn full_without_link_ids_fetches_directly() {
-        // Probed placements carry no link id yet, so there is nothing to
-        // look up in the object store: the full upgrade fetches directly.
+        // probed placements carry no link id yet, so there is nothing to
+        // look up and the full upgrade fetches directly
         let loaded = ReplicaLoaded {
             placements: vec![probed("1", None, ReplicaLevel::Probed)],
             checkpoint: None,
@@ -998,8 +979,8 @@ mod tests {
 
     #[test]
     fn fetched_unknown_handle_is_skipped() {
-        // A fetch reply naming a handle with no placement (a lagging or
-        // buggy consumer) is ignored rather than upserted or panicking.
+        // a fetch reply naming a handle with no placement is ignored
+        // rather than upserted
         let loaded = ReplicaLoaded {
             placements: vec![probed("1", None, ReplicaLevel::Probed)],
             checkpoint: None,
@@ -1032,8 +1013,8 @@ mod tests {
     #[test]
     fn full_mixes_dedup_hits_and_fetch_misses() {
         crate::testlog::init();
-        // Two placements at meta level: one link id resolves in the object
-        // store (linked without a fetch), the other misses and is fetched.
+        // one link id resolves in the object store and is linked without
+        // a fetch, the other misses and is fetched
         let loaded = ReplicaLoaded {
             placements: vec![
                 probed("1", Some("msg-a"), ReplicaLevel::Meta),
@@ -1084,8 +1065,8 @@ mod tests {
         assert_eq!(report.fetched, 1);
     }
 
-    /// A placement already reconciled once: based, summarised, and with the
-    /// revision its source reports (`None` for immutable content).
+    /// A placement already reconciled once: based, summarised, and
+    /// carrying the revision its source reports.
     fn based(handle: &str, link: &str, revision: Option<&str>) -> ReplicaPlacement {
         let mut placement = probed(handle, Some(link), ReplicaLevel::Meta);
         placement.base = Some(ReplicaBase {
@@ -1096,8 +1077,8 @@ mod tests {
         placement
     }
 
-    /// Runs a `Full` upgrade of one placement up to its first yield after the
-    /// link lookup, answering the lookup with `known`.
+    /// Runs a `Full` upgrade of one placement up to its first yield
+    /// after the link lookup, answering it with `known`.
     fn upgrade_with_lookup(
         placement: ReplicaPlacement,
         known: BTreeMap<ReplicaLinkId, ReplicaHash>,
@@ -1120,10 +1101,9 @@ mod tests {
 
     #[test]
     fn a_deduped_body_rebases_so_the_placement_reads_clean() {
-        // The same message in two collections: the second placement links the
-        // body the first one fetched. Leaving its base behind reads as a local
-        // edit, which a storage projects dirty and re-derives on every sync,
-        // for good.
+        // the second placement links the body the first one fetched;
+        // leaving its base behind would read as a local edit, which a
+        // storage projects dirty and re-derives on every sync
         let known = BTreeMap::from([(ReplicaLinkId::from("msg-a"), ReplicaHash::from("h-a"))]);
 
         let ops = match upgrade_with_lookup(based("2", "msg-a", None), known) {
@@ -1145,10 +1125,9 @@ mod tests {
 
     #[test]
     fn a_mutable_placement_is_fetched_rather_than_linked() {
-        // A link id says two copies are the same item, not that they hold the
-        // same bytes. Where a revision makes the difference observable, the
-        // body is fetched, so no copy's bytes are recorded under another's
-        // revision.
+        // a link id says two copies are the same item, not that they
+        // hold the same bytes, so where a revision makes the difference
+        // observable the body is fetched
         let known = BTreeMap::from([(ReplicaLinkId::from("uid:card-1"), ReplicaHash::from("h-a"))]);
 
         let state = upgrade_with_lookup(based("card-1.vcf", "uid:card-1", Some("etag-1")), known);

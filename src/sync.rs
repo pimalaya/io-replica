@@ -1,22 +1,19 @@
 //! I/O-free coroutine to reconcile a collection with its remote.
 //!
-//! The load-bearing verb. It loads local state, enumerates the remote
-//! delta, then runs a three-way merge of local, base and remote per
-//! placement: local-won changes are pushed, remote-won changes are
-//! pulled. Flags merge element-wise and never conflict (each flag is
-//! independent, so divergent sets fold into their union of changes);
-//! only divergent content edits are kept both as a conflict. The merge
-//! compares per-placement identities (flags and a content revision),
-//! never raw bytes: the complete probed spine plus the per-placement
-//! base, not a missing body, is what tells deleted from not-cached.
+//! Loads local state, enumerates the remote delta, then three-way
+//! merges local, base and remote per placement: local-won changes are
+//! pushed, remote-won ones pulled. Flags merge element-wise and never
+//! conflict; only divergent content edits are kept as a conflict. The
+//! merge compares per-placement identities (flags and a content
+//! revision), never raw bytes: the complete probed spine plus the
+//! per-placement base, not a missing body, is what tells deleted from
+//! not-cached.
 //!
-//! Backends where the content itself is mutable (an item can be edited in
-//! place) carry that mutation in the content revision; backends where it
-//! is immutable carry only flag and membership changes. Either way the
-//! merge shape is the same. An edit beats a delete in both directions: a
-//! remote update resurrects a local tombstone, and a local staged edit
-//! survives a remote delete as a pending create. Permission gating drops
-//! pushes a read-only source forbids.
+//! An edit beats a delete in both directions: a remote update
+//! resurrects a local tombstone, and a local staged edit survives a
+//! remote delete as a pending create. Mutable-content backends carry
+//! their edits in the content revision, immutable ones only flag and
+//! membership changes; the merge shape is the same either way.
 
 use core::{cmp::Ordering, iter::Peekable, mem};
 
@@ -42,11 +39,10 @@ use crate::{
 /// Which push kinds a writable source may derive, refining
 /// [`ReplicaSyncOptions::push`].
 ///
-/// Each kind is independent, so a source can, for example, accept flag
-/// changes but refuse deletes. All permitted by default, so the refinement is
-/// opt-in and leaves the all-or-nothing behaviour unchanged. Only consulted
-/// when [`ReplicaSyncOptions::push`] is true; a false `push` is fully
-/// read-only regardless of these.
+/// Each kind is independent, so a source can accept flag changes but
+/// refuse deletes. All permitted by default, and only consulted when
+/// [`ReplicaSyncOptions::push`] is true: a false `push` is read-only
+/// regardless.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplicaPushRights {
     /// May push a flag-set change.
@@ -87,15 +83,15 @@ impl Default for ReplicaPushRights {
     }
 }
 
-/// How a headless sync resolves a content conflict — content diverged on both
+/// How a sync resolves a content conflict, content diverged on both
 /// sides against a shared base.
 ///
-/// Only mutable-content backends can conflict (immutable content reports no
-/// revision, so the merge never sees a divergence). An interactive consumer
-/// leaves this `Manual` and resolves with an edit; an unattended sync picks one
-/// of the automatic policies. A base-less create-collision (both sides minted
-/// content for one handle with no shared ancestor) is always kept as a conflict
-/// regardless of this policy: there is no three-way merge to automate.
+/// Only mutable-content backends can conflict: immutable content
+/// reports no revision, so the merge never sees a divergence. An
+/// interactive consumer leaves this `Manual` and resolves with an edit.
+/// A base-less create-collision, where both sides minted content for
+/// one handle with no shared ancestor, is always kept as a conflict:
+/// there is no three-way merge to automate.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ReplicaConflictPolicy {
     /// Mark the placement conflicted and leave it for the consumer to resolve
@@ -113,58 +109,54 @@ pub enum ReplicaConflictPolicy {
 
 /// What becomes of a local delete the source will not take.
 ///
-/// Deletion is the one axis where the push switches are not orthogonal: a
-/// forbidden flag or content change simply stays dirty and re-derives, but a
-/// forbidden *delete* has to be either undone or held, and holding it hides a
-/// member the source still holds. Which one is right is the consumer's call,
-/// not something to read off `push` and [`ReplicaPushRights::remove`], which
-/// used to mean opposite things here.
+/// Deletion is the one axis where the push switches are not orthogonal:
+/// a forbidden flag or content change stays dirty and re-derives, but a
+/// forbidden delete has to be either undone or held, and holding it
+/// hides a member the source still holds. Which one is right is the
+/// consumer's call.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ReplicaDeletePolicy {
-    /// Undo it: the replica mirrors the source, so the member comes back
-    /// with whatever it had cached. The right reading for a source the
-    /// replica does not own, and the default: a held tombstone hides a
-    /// member the source still holds, for good, since an incremental
-    /// enumeration never lists an untouched member again.
+    /// Undo it: the replica mirrors the source, so the member comes
+    /// back with whatever it had cached. The default, and the right
+    /// reading for a source the replica does not own: an incremental
+    /// enumeration never lists an untouched member again, so a held
+    /// tombstone hides that member for good.
     #[default]
     Revert,
-    /// Hold it: the tombstone stays pending, so a later run that may push
-    /// still delivers it. The right reading when the refusal is a policy
-    /// that may lift (an archive that takes appends but no deletes today),
-    /// at the cost of a local view that hides the member meanwhile.
+    /// Hold it: the tombstone stays pending, so a later run that may
+    /// push still delivers it. The right reading when the refusal is a
+    /// policy that may lift, at the cost of a local view that hides the
+    /// member meanwhile.
     ///
-    /// **A source bound to a [hub](crate::hub) wants this one.** Reverting
-    /// says "this source still holds the member", which a hub reads as the
-    /// item being alive (add-beats-delete across sources): it clears the
-    /// deletion for every source, and mirrors the item back to the one it
-    /// was deleted on. Both readings are coherent, and only the consumer
-    /// knows which it means.
+    /// **A source bound to a [hub](crate::hub) wants this one.**
+    /// Reverting says the source still holds the member, which a hub
+    /// reads as the item being alive (add beats delete across sources):
+    /// it clears the deletion everywhere, then mirrors the item back to
+    /// the source it was deleted on.
     Keep,
 }
 
 /// Tuning for one sync run: the push direction and the enumerate depth.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplicaSyncOptions {
-    /// The master push switch. When false the source is treated read-only:
-    /// local flag and content changes are kept dirty and never pushed
-    /// (permission gating), and a local delete follows `delete`.
+    /// The master push switch. When false the source is read-only:
+    /// local flag and content changes stay dirty, and a local delete
+    /// follows `delete`.
     pub push: bool,
-    /// Per-kind refinement of `push`, consulted only when `push` is true. A
-    /// forbidden push kind is kept pending (never pushed), while other kinds
-    /// still propagate; a forbidden delete follows `delete`.
+    /// Per-kind refinement of `push`, consulted only when `push` is
+    /// true. A forbidden kind stays pending while the others still
+    /// propagate; a forbidden delete follows `delete`.
     pub rights: ReplicaPushRights,
-    /// What becomes of a local delete this source will not take, whether
-    /// because `push` is false or because `rights` forbids the remove. One
-    /// answer for both, so `ReplicaPushRights::none()` and `push = false`
-    /// agree on it.
+    /// What becomes of a local delete this source will not take,
+    /// whether because `push` is false or because `rights` forbids the
+    /// remove.
     pub delete: ReplicaDeletePolicy,
-    /// How a content conflict is resolved when the source is unattended.
-    /// Defaults to `Manual` (mark and wait for an edit).
+    /// How a content conflict is resolved. Defaults to `Manual`.
     pub conflict: ReplicaConflictPolicy,
     /// When true the checkpoint is ignored and the whole remote is
-    /// enumerated, so the merge reconciles the complete spine: it re-adds
-    /// any locally-missing message and drops any local phantom. The
-    /// recovery path for a replica that drifted out of sync.
+    /// enumerated, so the merge reconciles the complete spine: it
+    /// re-adds any locally-missing member and drops any local phantom.
+    /// The recovery path for a replica that drifted out of sync.
     pub full: bool,
 }
 
@@ -182,10 +174,9 @@ impl Default for ReplicaSyncOptions {
 
 /// A per-item outcome of a sync, for hooks and richer reporting.
 ///
-/// Emitted as the merge (and the push confirmation) touches each handle: what
-/// changed for that placement, in order. Watch/notify/log hooks ride these; the
-/// counters on [`ReplicaSyncReport`] summarise them. Events are data, spine
-/// level (a handle, no body), so emitting them enters no I/O.
+/// Emitted in order as the merge and the push confirmation touch each
+/// handle; the counters on [`ReplicaSyncReport`] summarise them. Events
+/// are spine level (a handle, no body), so emitting them enters no I/O.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReplicaEvent {
     /// A new member appeared locally, pulled from the remote.
@@ -232,35 +223,34 @@ pub struct ReplicaSync {
     /// candidate that exhausts it.
     merging: Option<Merge>,
     writes: Vec<ReplicaWriteOp>,
-    /// The changes the merge derived and no chunk has taken yet, in the
-    /// order they were derived.
+    /// The changes the merge derived and no chunk has taken yet, in
+    /// derivation order.
     pushes: Vec<ReplicaChange>,
     /// The handles of the chunk awaiting its outcome. Only these are
-    /// forgotten when the outcomes land: a later chunk's are still waiting
-    /// for their own.
+    /// forgotten when the outcomes land: a later chunk's are still
+    /// waiting for their own.
     in_flight: Vec<ReplicaHandle>,
     /// The checkpoint the enumerate reported, held out of every
-    /// intermediate write so it lands in the last one, once every chunk is
-    /// recorded.
+    /// intermediate write so it lands in the last one, once every chunk
+    /// is recorded.
     next_checkpoint: Option<ReplicaCheckpoint>,
-    /// Flag pushes awaiting their outcome: the local placement to rebase
-    /// once the remote confirms, keyed by handle. A rejected push leaves
-    /// the placement untouched (dirty) so the next sync retries it.
+    /// Flag pushes awaiting their outcome: the local placement to
+    /// rebase once the remote confirms. A rejected push leaves it dirty
+    /// so the next sync retries.
     pending_flag_pushes: BTreeMap<ReplicaHandle, ReplicaPlacement>,
     /// Content pushes awaiting their outcome: the local placement whose
-    /// base adopts the pushed body and reported revision once the remote
-    /// confirms. Kept apart from flag pushes so an accepted flag push on
-    /// a conflicted placement (whose body also differs from its base) is
-    /// never misread as a resolved content push.
+    /// base adopts the pushed body and reported revision. Kept apart
+    /// from flag pushes so an accepted flag push on a conflicted
+    /// placement is never misread as a resolved content push.
     pending_content_pushes: BTreeMap<ReplicaHandle, ReplicaPlacement>,
-    /// Tombstone deletes awaiting their outcome: the placement is dropped
-    /// only once the remote confirms the delete. A rejected push keeps the
-    /// tombstone so the next sync retries, rather than dropping a message
-    /// the server still has (a permanent desync under incremental sync).
+    /// Tombstone deletes awaiting their outcome: the placement is
+    /// dropped only once the remote confirms. A rejected push keeps the
+    /// tombstone, rather than dropping a member the server still has (a
+    /// permanent desync under incremental sync).
     pending_drops: BTreeSet<ReplicaHandle>,
-    /// Pending creates awaiting their outcome, keyed by provisional handle:
-    /// the staged placement to rekey to the server-assigned handle once the
-    /// add is accepted. A rejected push keeps the placeholder for a retry.
+    /// Pending creates awaiting their outcome, keyed by provisional
+    /// handle: the staged placement to rekey to the server-assigned
+    /// handle. A rejected push keeps the placeholder for a retry.
     pending_creates: BTreeMap<ReplicaHandle, ReplicaPlacement>,
     report: ReplicaSyncReport,
     state: State,
@@ -269,22 +259,20 @@ pub struct ReplicaSync {
 impl ReplicaSync {
     /// How many changes one push chunk holds.
     ///
-    /// A run pushes its changes in chunks this size, recording each chunk's
-    /// outcomes before the next is pushed, so an interrupted run replays at
-    /// most this many pushes instead of every push it derived. The bound is
-    /// the engine's rather than a consumer option: what it bounds is a crash
-    /// window, not throughput.
+    /// A run records each chunk's outcomes before the next is pushed, so
+    /// an interrupted run replays at most this many pushes. The bound is
+    /// the engine's rather than a consumer option: what it bounds is a
+    /// crash window, not throughput.
     pub const PUSH_CHUNK: usize = 64;
 
     /// How many storage writes one batch holds before the merge hands it
     /// over.
     ///
     /// A merge over a whole collection would otherwise hold a write per
-    /// member until the last one is resolved, so this bounds what the run
-    /// keeps in memory rather than a crash window: a lost batch costs a
-    /// re-merge, which is free, where a lost push costs a round trip. It is
-    /// a floor, not a ceiling, and never cuts through the writes of one
-    /// candidate.
+    /// member until the last is resolved, so this bounds memory rather
+    /// than a crash window: a lost batch costs a free re-merge, where a
+    /// lost push costs a round trip. It is a floor, not a ceiling, and
+    /// never cuts through the writes of one candidate.
     pub const WRITE_CHUNK: usize = 1024;
 
     /// Creates a coroutine that reconciles `collection`.
@@ -348,10 +336,10 @@ impl ReplicaSync {
     /// once every chunk has been serviced.
     ///
     /// The checkpoint lands in the last write of the run and stays the
-    /// pre-push one, so the next delta enumeration re-lists the engine's own
-    /// echo; an intermediate chunk's write must not carry it, or a crashed
-    /// run would resume from a cursor claiming its unrecorded pushes were
-    /// seen.
+    /// pre-push one, so the next delta enumeration re-lists the engine's
+    /// own echo. An intermediate chunk must not carry it, or a crashed
+    /// run would resume from a cursor claiming its unrecorded pushes
+    /// were seen.
     fn batch(&mut self) -> Vec<ReplicaWriteOp> {
         let mut batch = mem::take(&mut self.writes);
 
@@ -369,9 +357,9 @@ impl ReplicaSync {
 
     /// Opens the three-way merge over what the enumerate reported.
     ///
-    /// The local placements are taken out of the coroutine and handed to the
-    /// join: nothing else reads them, so the merge owns each one instead of
-    /// cloning it per candidate.
+    /// The local placements are moved into the join: nothing else reads
+    /// them, so the merge owns each one instead of cloning it per
+    /// candidate.
     fn open_merge(&mut self, snapshot: ReplicaRemoteSnapshot) {
         let ReplicaRemoteSnapshot {
             mut items,
@@ -380,12 +368,10 @@ impl ReplicaSync {
             checkpoint,
         } = snapshot;
 
-        // NOTE: the join walks both sides in handle order, so a snapshot
-        // that arrives unordered is ordered here rather than trusted; an
-        // already-ordered one (what the contract asks for) costs one pass.
-        // A handle listed twice is collapsed to its first item, which is
-        // what pairing it against a local placement that exists once can
-        // mean.
+        // NOTE: the join walks both sides in handle order, so an
+        // unordered snapshot is sorted rather than trusted. A handle
+        // listed twice collapses to its first item, which is all pairing
+        // it against a placement that exists once can mean.
         if !items.is_sorted_by(|a, b| a.handle <= b.handle) {
             debug!("enumeration is not ordered by handle, sorting it");
             items.sort_by(|a, b| a.handle.cmp(&b.handle));
@@ -395,9 +381,9 @@ impl ReplicaSync {
         let vanished: BTreeSet<ReplicaHandle> = vanished.into_iter().collect();
         let mut local = mem::take(&mut self.local);
 
-        // NOTE: before anything is merged, because a placement the source no
-        // longer holds twice has to reconcile in this same run rather than
-        // wait for an enumeration that may never list it again.
+        // NOTE: before anything is merged, so a placement the source no
+        // longer holds twice reconciles in this same run rather than
+        // waiting for an enumeration that may never list it again.
         self.thaw(&mut local, &items, &vanished, complete);
 
         self.merging = Some(Merge {
@@ -414,18 +400,12 @@ impl ReplicaSync {
         &mut self,
     ) -> ReplicaCoroutineState<ReplicaYield, Result<ReplicaSyncReport, ReplicaArgError>> {
         while let Some(candidate) = self.next_candidate() {
-            // NOTE: the merge derives what to do; keying it is the last
-            // thing that happens to it, in one place, so no change can exist
-            // without its key or with one that names something else.
             if let Some(kind) = self.merge(candidate) {
                 self.pushes.push(ReplicaChange::new(&self.collection, kind));
             }
 
-            // NOTE: between candidates and never inside one. The writes one
-            // candidate derives are consistent only together: a keep-both
-            // resolution stages the local body as a new member beside the
-            // pulled placement it forked from, and a batch cut between them
-            // would lose that body if the next one never landed.
+            // NOTE: cut between candidates, never inside one: the writes
+            // one candidate derives are consistent only together.
             if self.writes.len() >= Self::WRITE_CHUNK {
                 self.state = State::Merging;
                 let batch = self.batch();
@@ -447,10 +427,10 @@ impl ReplicaSync {
 
     /// The next handle to merge, or `None` once the join is exhausted.
     ///
-    /// A complete snapshot merges every handle either side holds. A delta
-    /// merges the ones it reported changed or vanished, plus every locally
-    /// non-clean handle, whose pending push it would otherwise never
-    /// revisit.
+    /// A complete snapshot merges every handle either side holds. A
+    /// delta merges the ones it reported changed or vanished, plus every
+    /// locally non-clean handle, whose pending push it would otherwise
+    /// never revisit.
     fn next_candidate(&mut self) -> Option<Candidate> {
         let merge = self.merging.as_mut()?;
 
@@ -469,15 +449,13 @@ impl ReplicaSync {
     /// Drops the ambiguous handles this snapshot shows the source no longer
     /// holds, and unfreezes a placement that has none left.
     ///
-    /// The engine never sees an identity in an enumeration, only handles, so
-    /// this is what "the source reports the identity once again" reduces to: a
-    /// complete snapshot that omits a recorded handle, or a delta that reports
-    /// it vanished, is the source saying that copy is gone. A delta that
-    /// merely does not mention it says nothing, and clears nothing.
+    /// The engine never sees an identity in an enumeration, only
+    /// handles: a complete snapshot that omits a recorded handle, or a
+    /// delta that reports it vanished, is the source saying that copy is
+    /// gone. A delta that merely does not mention it clears nothing.
     ///
-    /// Once the last one goes the placement lands `Clean` and reconciles in
-    /// this same run, so the changes it slept through are picked up rather
-    /// than waiting for an enumeration that may never list it again.
+    /// Once the last one goes the placement lands `Clean` and reconciles
+    /// in this same run, picking up the changes it slept through.
     fn thaw(
         &mut self,
         local: &mut BTreeMap<ReplicaHandle, ReplicaPlacement>,
@@ -526,12 +504,10 @@ impl ReplicaSync {
             remote: remote_item,
         } = candidate;
 
-        // NOTE: the source holds this identity more than once, so which copy
-        // any change refers to cannot be decided. Nothing is derived in
-        // either direction, and in particular the absence of this handle from
-        // a complete snapshot is not read as the item being gone: the source
-        // demonstrably still holds another copy of it, and deleting on that
-        // reading is what removed the only copy on a side nobody touched.
+        // NOTE: the source holds this identity more than once, so which
+        // copy a change refers to cannot be decided. In particular the
+        // absence of this handle from a complete snapshot is not read as
+        // the item being gone: the source still holds another copy.
         if local
             .as_ref()
             .is_some_and(|p| p.status == ReplicaStatus::Ambiguous)
@@ -553,14 +529,14 @@ impl ReplicaSync {
         let remote_present = remote_item.is_some();
 
         match (local_present, based, remote_present) {
-            // NOTE: local delete or move: both knew it, we removed it here
+            // NOTE: local delete or move, both sides knew it.
             (false, true, true) if local_tombstone => {
                 let local = local.expect("local present");
                 let item = remote_item.as_ref().expect("remote present");
 
-                // NOTE: the remote edited what was deleted locally: the
-                // update wins over the delete, so the tombstone is replaced
-                // by a fresh pull of the new revision (body on demand).
+                // NOTE: the remote edited what was deleted locally, and
+                // the update wins: the tombstone is replaced by a fresh
+                // pull of the new revision (body on demand).
                 let base_revision = local.base.as_ref().and_then(|b| b.revision.clone());
                 if item.revision.is_some() && item.revision != base_revision {
                     self.pull_add(item);
@@ -569,16 +545,15 @@ impl ReplicaSync {
                     return None;
                 }
 
-                // NOTE: a staged content edit rides ahead of a move: the
-                // update pushes first, so the relocated member carries the
-                // edited body; the move itself derives again on the next
-                // sync, once the base holds the pushed content. A plain
-                // delete supersedes the edit instead.
+                // NOTE: a staged content edit rides ahead of a move, so
+                // the relocated member carries the edited body; the move
+                // derives again next sync, once the base holds the
+                // pushed content. A plain delete supersedes the edit.
                 if local.staged_edit().is_some() && local.origin.is_some() {
                     if !(self.opts.push && self.opts.rights.content) {
-                        // NOTE: the edit cannot go, and the move must not go
-                        // without it, or the relocated member would carry the
-                        // body the edit replaced.
+                        // NOTE: the move must not go without the edit, or
+                        // the relocated member would carry the body the
+                        // edit replaced.
                         return self.refuse_delete(local);
                     }
                     self.pending_content_pushes
@@ -594,11 +569,8 @@ impl ReplicaSync {
                     return self.refuse_delete(local);
                 }
 
-                // NOTE: hold the drop until the remote confirms it (in
-                // PendingPush); a rejected push keeps the tombstone for the
-                // next retry. An origin on a tombstone is a move
-                // destination, which no mutation stages today: a move is
-                // the target copy plus this plain remove.
+                // NOTE: hold the drop until the remote confirms it; a
+                // rejected push keeps the tombstone for the next retry.
                 self.pending_drops.insert(handle.clone());
                 let to = local.origin.as_ref().map(|o| o.collection.clone());
                 Some(ReplicaChangeKind::Remove {
@@ -608,22 +580,20 @@ impl ReplicaSync {
                     if_match: base_revision,
                 })
             }
-            // NOTE: local delete of something already gone remote
+            // NOTE: local delete of something already gone remote.
             (false, _, false) if local_tombstone => {
                 self.drop(&handle, ReplicaDropReason::Deleted);
                 None
             }
-            // NOTE: remote delete: we had it in sync, it vanished upstream
+            // NOTE: remote delete, it was in sync and vanished upstream.
             (true, true, false) => {
                 let local = local.expect("local present");
 
-                // NOTE: the edit-beats-delete rule, push direction: a
-                // staged local edit survives the remote delete as a
-                // pending create that re-uploads the edited body, rather
-                // than being silently dropped with the placement. A
-                // conflicted placement holds such an edit too, and the
-                // remote deleting its side makes the conflict moot: the
-                // surviving local edit wins by default.
+                // NOTE: edit beats delete, push direction: a staged
+                // local edit survives as a pending create re-uploading
+                // the edited body. A conflicted placement holds such an
+                // edit too, and the remote deleting its side makes the
+                // conflict moot.
                 let edited = matches!(local.status, ReplicaStatus::Dirty | ReplicaStatus::Conflict)
                     && local.object.is_some()
                     && local
@@ -640,14 +610,9 @@ impl ReplicaSync {
                         .push(ReplicaWriteOp::UpsertPlacement(resurrected.clone()));
 
                     if !(self.opts.push && self.opts.rights.add) {
-                        // NOTE: read-only or add forbidden, keep the
-                        // resurrected create staged and pending, do not push.
                         return None;
                     }
 
-                    // NOTE: the resurrected copy carries the identity, the
-                    // markers and the body the add re-uploads, the three the
-                    // resurrection leaves alone.
                     let add = ReplicaChangeKind::Add {
                         handle: handle.clone(),
                         link_id: resurrected.link_id.clone(),
@@ -664,30 +629,25 @@ impl ReplicaSync {
                 self.emit(ReplicaEvent::Vanished(handle.clone()));
                 None
             }
-            // NOTE: remote add: brand new upstream
+            // NOTE: remote add, brand new upstream.
             (false, false, true) => {
                 self.pull_add(&remote_item.expect("remote present"));
                 self.report.pulled += 1;
                 self.emit(ReplicaEvent::Added(handle.clone()));
                 None
             }
-            // NOTE: present on both: reconcile content, then flags
+            // NOTE: present on both, reconcile content then flags. The
+            // content axis may have rewritten the placement, so flags
+            // reconcile on the rewritten copy and both changes land in
+            // one write chain. The flag merge always runs, even under a
+            // content conflict: a delta lists a flag change exactly
+            // once, so skipping it would lose it for good. A derived
+            // content push only withholds the flag *push*, since a push
+            // result is matched by handle.
             (true, _, true) => {
                 let local = local.expect("local present");
                 let item = remote_item.as_ref().expect("remote present");
 
-                // NOTE: the content axis may have rewritten the placement
-                // (a pull, a conflict mark, conflict tracking); flags
-                // reconcile on the rewritten copy so both changes land in
-                // one write chain. A remote flag change must survive even
-                // a content conflict: a delta lists it exactly once, so
-                // skipping the flag merge here would lose it for good.
-                //
-                // A derived content push does not skip it either, it only
-                // withholds the flag *push*: a push result is matched by
-                // handle, so one handle yields at most one change. The
-                // merged flags are still written, dirty on the old base,
-                // and their own push derives again next sync.
                 match self.reconcile_content(&local, item) {
                     ContentOutcome::Push(change) => {
                         self.reconcile_flags(&local, item, PushFlags::Withhold);
@@ -701,10 +661,9 @@ impl ReplicaSync {
                     }
                 }
             }
-            // NOTE: local create (no base, not upstream): a pending copy,
-            // move or append. Stage the add; the rekey to the server-assigned
-            // handle is held until the push reports it (in PendingPush). A
-            // plain base-less placement that is not Created is left untouched.
+            // NOTE: local create (no base, not upstream): a pending
+            // copy, move or append. The rekey to the server-assigned
+            // handle is held until the push reports it.
             (true, false, false) => {
                 let local = local.expect("local present");
                 if self.opts.push && self.opts.rights.add && local.status == ReplicaStatus::Created
@@ -725,31 +684,25 @@ impl ReplicaSync {
         }
     }
 
-    /// Reconciles the content of a placement present on both sides, ahead
-    /// of the flag reconciliation.
+    /// Reconciles the content of a placement present on both sides,
+    /// ahead of the flag reconciliation.
     ///
-    /// Both axes are read from positive signals only: the local side
-    /// changed when a dirty placement points at a body its base does not
-    /// hold (a staged edit), the remote side when the enumerate reported a
-    /// revision differing from the base. An immutable-content backend
-    /// produces neither, so it always falls through untouched to the
-    /// flags-only merge.
+    /// Both axes read positive signals only: the local side changed when
+    /// a dirty placement points at a body its base does not hold, the
+    /// remote side when the enumerate reported a revision differing from
+    /// the base. An immutable-content backend produces neither, so it
+    /// always falls through untouched to the flags-only merge.
     fn reconcile_content(
         &mut self,
         local: &ReplicaPlacement,
         item: &ReplicaRemoteItem,
     ) -> ContentOutcome {
         let Some(base) = &local.base else {
-            // NOTE: a base-less placement that carries a body the remote also
-            // holds is a create-collision: both sides minted content for
-            // this handle with no shared ancestor, so there is no
-            // three-way merge to run. Surface it as a conflict (the remote
-            // revision is what the consumer resolves against) instead of
-            // converging on flags alone, which would strand the two bodies
-            // apart and, once a spoke's base is lost this way, loop every
-            // sync without ever reconciling the content again. A body-less
-            // never-based placement carries no content signal, so it still
-            // falls through to the flag reconciliation.
+            // NOTE: a base-less placement carrying a body the remote also
+            // holds is a create-collision, with no shared ancestor to
+            // merge against. Surfacing it as a conflict beats converging
+            // on flags alone, which would strand the two bodies apart
+            // and loop every sync without reconciling the content.
             if local.object.is_some() && item.revision.is_some() {
                 let mut conflicted = local.clone();
                 conflicted.status = ReplicaStatus::Conflict;
@@ -764,9 +717,9 @@ impl ReplicaSync {
         };
 
         if local.status == ReplicaStatus::Conflict {
-            // NOTE: an unresolved conflict is left alone (the local edit
-            // must survive), but the observed remote revision is kept
-            // current so the consumer resolves against the latest remote.
+            // NOTE: an unresolved conflict is left alone so the local
+            // edit survives, but the observed remote revision is kept
+            // current for the consumer to resolve against.
             if item.revision.is_some() && item.revision != local.conflict_revision {
                 let mut updated = local.clone();
                 updated.conflict_revision = item.revision.clone();
@@ -787,8 +740,6 @@ impl ReplicaSync {
             (false, true) => ContentOutcome::Rewritten(self.pull_content(local, item)),
             (true, false) => {
                 if !(self.opts.push && self.opts.rights.content) {
-                    // NOTE: read-only source or content push forbidden, keep
-                    // dirty and do not push
                     return ContentOutcome::Untouched;
                 }
                 self.pending_content_pushes
@@ -816,9 +767,9 @@ impl ReplicaSync {
                 ContentOutcome::Rewritten(self.pull_content(local, item))
             }
             ReplicaConflictPolicy::PreferLocal => {
-                // NOTE: overwrite the remote's *current* version, so the
-                // precondition is the observed remote revision, not the stale
-                // base (which would be rejected on optimistic concurrency).
+                // NOTE: the precondition is the observed remote revision,
+                // not the stale base, which optimistic concurrency would
+                // reject.
                 if !(self.opts.push && self.opts.rights.content) {
                     return self.mark_conflict(local, item);
                 }
@@ -857,14 +808,11 @@ impl ReplicaSync {
     /// Stages the local body as a fresh `Created` member so a `KeepBoth`
     /// resolution loses neither version; the next sync appends it.
     ///
-    /// The duplicate is a new item rather than another copy of the one it
-    /// forked from: the two hold different bodies, and giving it the
-    /// original's link id would have a storage that shares items by link
-    /// treat them as one and collapse the fork back. Its identity is
-    /// therefore its content, which also makes both the handle and the
-    /// add's idempotency key unique per forked body: two resolutions
-    /// staged before either is pushed keep both versions, and a replayed
-    /// add is recognised rather than appended twice.
+    /// The duplicate is a new item, not another copy of the one it
+    /// forked from: giving it the original's link id would have a
+    /// storage that shares items by link collapse the fork back. Its
+    /// identity is therefore its content, which also makes the handle
+    /// and the add's idempotency key unique per forked body.
     fn stage_conflict_dup(&mut self, local: &ReplicaPlacement) {
         let object = local.object.clone().expect("a staged edited body");
 
@@ -897,9 +845,9 @@ impl ReplicaSync {
     /// returning a push when the local side won any flag.
     ///
     /// Flags merge element-wise ([`ReplicaFlags::merge`]) and never
-    /// conflict: divergent sets fold into one merged set that both sides
-    /// converge on, pulling the remote-won flags and pushing the local-won
-    /// ones.
+    /// conflict: divergent sets fold into one merged set both sides
+    /// converge on, pulling the remote-won flags and pushing the
+    /// local-won ones.
     fn reconcile_flags(
         &mut self,
         local: &ReplicaPlacement,
@@ -909,7 +857,7 @@ impl ReplicaSync {
         let base_flags = local.base.as_ref().map(|b| b.flags.clone());
 
         let Some(base_flags) = base_flags else {
-            // NOTE: never based but present on both: converge on remote
+            // NOTE: never based but present on both, converge on remote.
             self.pull_flags(local, &remote.flags);
             self.report.pulled += 1;
             self.emit(ReplicaEvent::FlagsChanged(local.handle.clone()));
@@ -922,11 +870,10 @@ impl ReplicaSync {
 
         match (pull, push) {
             // NOTE: in sync, or both sides moved to the same flags: no
-            // push, rebase when the shared move left the base behind, and
-            // clean a dirty placement whose edit turned out to be a no-op
-            // (a flag set put back to its base value would otherwise stay
-            // dirty forever). A staged content edit is not a no-op: it
-            // stays dirty (the read-only path lands here with one).
+            // push, rebase when the shared move left the base behind,
+            // and clean a dirty placement whose flag edit turned out to
+            // be a no-op. A staged content edit is not a no-op and stays
+            // dirty.
             (false, false) => {
                 let content_edit = local.object.is_some()
                     && local
@@ -940,17 +887,17 @@ impl ReplicaSync {
                 }
                 None
             }
-            // NOTE: the remote won every differing flag: pull the merged set
+            // NOTE: the remote won every differing flag.
             (true, false) => {
                 self.pull_flags(local, &merged);
                 self.report.pulled += 1;
                 self.emit(ReplicaEvent::FlagsChanged(local.handle.clone()));
                 None
             }
-            // NOTE: the local side won at least one flag: push the merged
-            // set. When the remote won some flags too, they are folded in
-            // locally right away, dirty on the old base, so a rejected or
-            // read-only push re-derives the same merge next sync.
+            // NOTE: the local side won at least one flag. Remote-won
+            // flags are folded in locally right away, dirty on the old
+            // base, so a rejected or read-only push re-derives the same
+            // merge next sync.
             (pull, true) => {
                 let mut updated = local.clone();
                 updated.flags = merged.clone();
@@ -962,15 +909,12 @@ impl ReplicaSync {
                 }
 
                 if allow == PushFlags::Withhold || !(self.opts.push && self.opts.rights.flags) {
-                    // NOTE: read-only source, flag push forbidden, or a
-                    // content push already claimed this handle: keep dirty
-                    // and do not push
                     return None;
                 }
                 // NOTE: hold the rebase until the push is confirmed: a
-                // rejected push must leave the placement dirty so the next
-                // sync retries it, not rebase it onto a state the remote
-                // never took (which QRESYNC would then never revisit).
+                // rejected push must stay dirty so the next sync retries
+                // it, not rebase onto a state the remote never took,
+                // which QRESYNC would never revisit.
                 self.pending_flag_pushes
                     .insert(local.handle.clone(), updated);
                 Some(ReplicaChangeKind::SetFlags {
@@ -991,8 +935,8 @@ impl ReplicaSync {
                 reverted.status = ReplicaStatus::Clean;
                 self.writes.push(ReplicaWriteOp::UpsertPlacement(reverted));
             }
-            // NOTE: the tombstone stays as it is, so the next run that may
-            // push derives the remove again.
+            // NOTE: the tombstone stays as it is, so the next run that
+            // may push derives the remove again.
             ReplicaDeletePolicy::Keep => {
                 trace!("holding a delete {} will not take", local.handle.as_str());
             }
@@ -1037,11 +981,11 @@ impl ReplicaSync {
         self.writes.push(ReplicaWriteOp::UpsertPlacement(placement));
     }
 
-    /// Pulls a remote content change: the stale local body is dropped and
-    /// the base adopts the new revision. The level falls back to probed
-    /// (the cached summary describes the old revision; it is kept as a
-    /// display fallback until a meta upgrade refetches it). Flags and
-    /// status are left for the flag reconciliation to settle.
+    /// Pulls a remote content change: the stale local body is dropped
+    /// and the base adopts the new revision. The level falls back to
+    /// probed, keeping the stale summary as a display fallback until a
+    /// meta upgrade refetches it. Flags and status are left for the flag
+    /// reconciliation to settle.
     fn pull_content(
         &mut self,
         local: &ReplicaPlacement,
@@ -1063,8 +1007,8 @@ impl ReplicaSync {
     }
 
     /// Adopts `flags` as both the current and the base flag set. An
-    /// unresolved content conflict keeps its status (only the flag axis
-    /// converged), everything else lands clean.
+    /// unresolved content conflict keeps its status, since only the flag
+    /// axis converged; everything else lands clean.
     fn pull_flags(&mut self, local: &ReplicaPlacement, flags: &ReplicaFlags) {
         let mut updated = local.clone();
         updated.flags = flags.clone();
@@ -1080,8 +1024,8 @@ impl ReplicaSync {
     }
 
     /// Rebases the flag axis onto `flags`, keeping the current flag set.
-    /// An unresolved content conflict keeps its status (its resolution
-    /// belongs to an edit), everything else lands clean.
+    /// An unresolved content conflict keeps its status, since resolving
+    /// it belongs to an edit; everything else lands clean.
     fn rebase(&mut self, local: &ReplicaPlacement, flags: &ReplicaFlags) {
         let mut updated = local.clone();
         if updated.status != ReplicaStatus::Conflict {
@@ -1095,10 +1039,10 @@ impl ReplicaSync {
         self.writes.push(ReplicaWriteOp::UpsertPlacement(updated));
     }
 
-    /// Rebases an accepted content push: the base pins the pushed body and
-    /// the revision the remote reported. The base flags are left as they
-    /// were, so a flag edit that rode along with the content edit stays
-    /// derivable and pushes on the next sync.
+    /// Rebases an accepted content push: the base pins the pushed body
+    /// and the revision the remote reported. The base flags are left as
+    /// they were, so a flag edit that rode along stays derivable and
+    /// pushes on the next sync.
     fn rebase_content(&mut self, local: &ReplicaPlacement, revision: Option<String>) {
         let base_flags = local
             .base
@@ -1125,10 +1069,9 @@ impl ReplicaSync {
     }
 
     /// Rekeys an accepted create: drops the provisional placeholder and
-    /// upserts the same placement under the server-assigned `handle`, clean
-    /// and based, so the next enumerate reconciles it as already in sync.
-    /// The base records the revision the push reported and pins the pushed
-    /// body: the remote now holds exactly that content.
+    /// upserts the same placement under the server-assigned `handle`,
+    /// clean and based, so the next enumerate reconciles it as already
+    /// in sync.
     fn rekey_create(
         &mut self,
         placeholder: ReplicaPlacement,
@@ -1173,9 +1116,9 @@ impl ReplicaCoroutine for ReplicaSync {
                     .into_iter()
                     .map(|p| (p.handle.clone(), p))
                     .collect();
-                // NOTE: a full sync ignores the checkpoint, so the enumerate
-                // yields the whole remote and the merge reconciles the
-                // entire spine.
+                // NOTE: a full sync ignores the checkpoint, so the
+                // enumerate yields the whole remote and the merge
+                // reconciles the entire spine.
                 self.checkpoint = if self.opts.full {
                     None
                 } else {
@@ -1207,16 +1150,11 @@ impl ReplicaCoroutine for ReplicaSync {
             (State::PendingPush, Some(ReplicaArg::Push(results))) => {
                 for result in &results {
                     match result.outcome {
-                        // NOTE: the remote took the change: rebase a flag or
-                        // content push clean, drop a confirmed delete, or
-                        // rekey a confirmed create to its server-assigned
-                        // handle, so the local state matches what the
-                        // remote now holds.
                         ReplicaPushOutcome::Accepted => {
                             // NOTE: counted per change this run actually
                             // derived, so a consumer reporting a handle
-                            // twice, or one nobody pushed, cannot inflate
-                            // it.
+                            // twice, or one nobody pushed, cannot
+                            // inflate it.
                             let mut matched = false;
                             if let Some(placement) = self.pending_flag_pushes.remove(&result.handle)
                             {
@@ -1239,26 +1177,21 @@ impl ReplicaCoroutine for ReplicaSync {
                             }
                             if let Some(placeholder) = self.pending_creates.remove(&result.handle) {
                                 matched = true;
-                                // NOTE: the created member's handle is the
-                                // assigned one when the remote reports it,
-                                // else the provisional.
                                 let created = result
                                     .assigned
                                     .clone()
                                     .unwrap_or_else(|| result.handle.clone());
                                 match result.assigned.clone() {
-                                    // NOTE: remote returned the new handle:
-                                    // rekey.
                                     Some(assigned) => self.rekey_create(
                                         placeholder,
                                         assigned,
                                         result.revision.clone(),
                                     ),
-                                    // NOTE: no assigned handle (no UIDPLUS):
-                                    // the copy landed, so drop the
-                                    // placeholder; the next enumerate re-adds
-                                    // it by its real handle and links the
-                                    // body by link id.
+                                    // NOTE: no assigned handle (no
+                                    // UIDPLUS): the copy landed, so the
+                                    // next enumerate re-adds it by its
+                                    // real handle and links the body by
+                                    // link id.
                                     None => self
                                         .drop(&placeholder.handle, ReplicaDropReason::Superseded),
                                 }
@@ -1266,9 +1199,9 @@ impl ReplicaCoroutine for ReplicaSync {
                             }
                             self.report.pushed += usize::from(matched);
                         }
-                        // NOTE: the remote refused it: leave the dirty
-                        // placement, tombstone or placeholder untouched so
-                        // the next sync retries the push.
+                        // NOTE: the remote refused it, so the dirty
+                        // placement, tombstone or placeholder is left
+                        // untouched and the next sync retries the push.
                         ReplicaPushOutcome::Rejected => self.report.rejected += 1,
                     }
                 }
@@ -1290,8 +1223,8 @@ impl ReplicaCoroutine for ReplicaSync {
             }
 
             (State::PendingWrite, Some(ReplicaArg::Write)) => {
-                // NOTE: the chunk this write recorded is safe from a replay;
-                // the next one goes out only now.
+                // NOTE: the chunk this write recorded is safe from a
+                // replay, so the next one goes out only now.
                 if !self.pushes.is_empty() {
                     return self.step();
                 }
@@ -1304,10 +1237,10 @@ impl ReplicaCoroutine for ReplicaSync {
                     self.report.conflicts,
                     self.report.rejected,
                 );
-                // NOTE: a completed coroutine stays completed. Without this
-                // the state would still read `PendingWrite`, so resuming a
-                // finished sync would hand back an empty report, which a
-                // caller cannot tell from a run that genuinely did nothing.
+                // NOTE: a completed coroutine stays completed, so
+                // resuming a finished sync errors rather than handing
+                // back an empty report a caller cannot tell from a run
+                // that did nothing.
                 self.state = State::Done;
                 ReplicaCoroutineState::Complete(Ok(mem::take(&mut self.report)))
             }
@@ -1321,8 +1254,8 @@ impl ReplicaCoroutine for ReplicaSync {
 /// Whether the flag axis may derive a push of its own.
 ///
 /// A push result is matched by handle, so one handle yields at most one
-/// change: when the content axis already claimed it, the flag axis still
-/// merges and writes, it just leaves its own push for the next sync.
+/// change: when the content axis claimed it, the flag axis still merges
+/// and writes, it just leaves its own push for the next sync.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PushFlags {
     Derive,
@@ -1330,16 +1263,16 @@ enum PushFlags {
 }
 
 /// What the content axis decided for a placement present on both sides.
-// NOTE: one of these is produced per candidate on the merge's hot path and
-// consumed immediately, so boxing the placement to even the variants out
-// would trade a move for an allocation per item.
+// NOTE: one of these is produced per candidate on the merge's hot path
+// and consumed immediately, so boxing to even the variants out would
+// trade a move for an allocation per item.
 #[allow(clippy::large_enum_variant)]
 enum ContentOutcome {
     /// No content signal on either side: the flag merge runs on the
     /// placement as loaded.
     Untouched,
-    /// The placement was rewritten (a remote content pull, a fresh
-    /// conflict mark, or conflict tracking): the flag merge runs on the
+    /// The placement was rewritten by a remote content pull, a fresh
+    /// conflict mark or conflict tracking: the flag merge runs on the
     /// rewritten copy, never on the stale loaded one.
     Rewritten(ReplicaPlacement),
     /// The local content won: the change to push.
@@ -1359,8 +1292,8 @@ enum State {
 /// The merge in progress: what the enumerate reported, and how far the join
 /// has walked it.
 ///
-/// Held across yields, because the merge is bounded like the pushes are: it
-/// stops at a full write batch and picks up where it left off.
+/// Held across yields, because the merge is bounded like the pushes are:
+/// it stops at a full write batch and picks up where it left off.
 struct Merge {
     join: Join,
     /// The handles the delta reported gone, as a set: the delta rule asks
@@ -1379,10 +1312,10 @@ impl Merge {
     /// or drops it as untouched.
     ///
     /// A handle the delta reported vanished is merged against no remote
-    /// state; one it listed is merged against what it listed; a locally
-    /// non-clean one it never mentioned is unchanged upstream, so its own
-    /// base stands in as the remote state and its pending push derives. A
-    /// clean handle the delta never mentioned has nothing to reconcile.
+    /// state, one it listed against what it listed. A locally non-clean
+    /// one it never mentioned is unchanged upstream, so its own base
+    /// stands in and its pending push derives; a clean one has nothing
+    /// to reconcile.
     fn narrow(&self, candidate: Candidate) -> Option<Candidate> {
         if self.vanished.contains(&candidate.handle) {
             return Some(Candidate {
@@ -1400,14 +1333,14 @@ impl Merge {
         }
 
         // NOTE: a never-based placement (a staged create) has no remote
-        // state to stand in for, and is still a candidate: it is exactly the
-        // one whose add the delta will never mention until it lands.
+        // state to stand in for, and is still a candidate: its add is
+        // exactly what the delta never mentions until it lands.
         let remote = local.base.as_ref().map(|base| ReplicaRemoteItem {
             handle: candidate.handle.clone(),
             flags: base.flags.clone(),
-            // NOTE: the best-known remote state: a conflicted placement has
-            // observed a remote revision past its base, and synthesizing the
-            // base one would regress its conflict tracking
+            // NOTE: the best-known remote state: a conflicted placement
+            // has observed a revision past its base, and synthesizing
+            // the base one would regress its conflict tracking.
             revision: local
                 .conflict_revision
                 .clone()
@@ -1433,10 +1366,10 @@ struct Candidate {
 /// them as it goes.
 ///
 /// Both sides are ordered already, the local one because it is a
-/// `BTreeMap` and the remote one because the snapshot contract asks for it,
-/// so their union is a two-pointer walk rather than a set to build. It also
-/// owns both sides, which is what lets the merge take a placement rather
-/// than copy one per candidate.
+/// `BTreeMap` and the remote one because the snapshot contract asks for
+/// it, so their union is a two-pointer walk rather than a set to build.
+/// Owning both sides is what lets the merge take a placement rather than
+/// copy one per candidate.
 struct Join {
     local: Peekable<IntoIter<ReplicaHandle, ReplicaPlacement>>,
     remote: Peekable<VecIntoIter<ReplicaRemoteItem>>,
@@ -1609,7 +1542,6 @@ mod tests {
         let mut pushes = None;
         let writes = match sync.resume(Some(ReplicaArg::Enumerate(snapshot))) {
             ReplicaCoroutineState::Yielded(ReplicaYield::WantsPush { changes, .. }) => {
-                // the fake remote accepts everything, assigning nothing
                 let results = changes
                     .iter()
                     .map(|change| ReplicaPushResult {
@@ -1654,9 +1586,9 @@ mod tests {
 
     #[test]
     fn an_unknown_local_set_adopts_the_remote_one_and_pushes_nothing() {
-        // A placement whose markers nobody has read yet holds no opinion, so
-        // the sync pulls what the source reports rather than pushing an
-        // absence over it (spec §13: `NULL` flags are unknown, not empty).
+        // NOTE: unknown markers hold no opinion, so the sync pulls what
+        // the source reports rather than pushing an absence over it
+        // (spec §13: `NULL` flags are unknown, not empty).
         let mut local = synced("1", &[]);
         local.flags = ReplicaFlags::Unknown;
 
@@ -1685,8 +1617,8 @@ mod tests {
         assert_eq!(report.pushed, 1);
     }
 
-    /// Drives a sync through its push, feeding back the given push results,
-    /// and returns the storage writes the engine then stages and the report.
+    /// Drives a sync through its push with the given results, and
+    /// returns the writes the engine then stages plus the report.
     fn drive_push(
         sync: &mut ReplicaSync,
         local: Vec<ReplicaPlacement>,
@@ -1739,10 +1671,10 @@ mod tests {
         }
     }
 
-    /// Drives a sync to completion against a remote that accepts every push
-    /// and assigns nothing, collecting every yield.
+    /// Drives a sync to completion against a remote accepting every
+    /// push, collecting every yield.
     ///
-    /// Unlike [`run`] it makes no assumption about how many pushes and
+    /// Unlike [`run`] it assumes nothing about how many pushes and
     /// writes a run takes, which is what the chunked paths are about.
     fn run_batches(
         sync: &mut ReplicaSync,
@@ -1868,9 +1800,9 @@ mod tests {
         }
     }
 
-    /// A consumer that reports on fewer changes than it was handed leaves
-    /// the rest exactly as they were. The rule the chunked drain rests on:
-    /// a handle nobody reported is retried, never assumed.
+    /// A consumer reporting on fewer changes than it was handed leaves
+    /// the rest as they were: a handle nobody reported is retried, never
+    /// assumed.
     #[test]
     fn an_unreported_push_stays_pending() {
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
@@ -1896,8 +1828,8 @@ mod tests {
     }
 
     /// Results are matched by handle, so their order does not matter, a
-    /// handle nobody pushed changes nothing, and one reported twice counts
-    /// once.
+    /// handle nobody pushed changes nothing, and one reported twice
+    /// counts once.
     #[test]
     fn a_result_set_is_matched_by_handle_not_by_shape() {
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
@@ -1962,8 +1894,8 @@ mod tests {
             results,
         );
 
-        // The accepted handle rebases clean; the rejected one is left dirty
-        // (no write), so the next sync retries it.
+        // the rejected handle is left dirty, with no write, so the next
+        // sync retries it
         assert_eq!(
             upserted(&writes, "1").expect("accepted rebases").status,
             ReplicaStatus::Clean,
@@ -1982,8 +1914,7 @@ mod tests {
         local.flags = ReplicaFlags::from_iter(["flagged"]);
         local.status = ReplicaStatus::Dirty;
 
-        // First sync: the remote rejects the push, so nothing is rebased and
-        // the placement stays dirty in storage.
+        // first sync: the push is rejected, so the placement stays dirty
         let mut first = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
         let results = vec![ReplicaPushResult {
             handle: ReplicaHandle::from("1"),
@@ -1999,9 +1930,8 @@ mod tests {
         );
         assert!(upserted(&writes, "1").is_none(), "rejected push left dirty");
 
-        // Second sync over the still-dirty placement (the remote never took
-        // it, so its flags are unchanged upstream): the push is attempted
-        // again, proving a rejection is not silently dropped.
+        // second sync: the remote never took it, so its flags are
+        // unchanged upstream and the push is attempted again
         let mut second = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
         let (pushes, _writes, report) = run(&mut second, vec![local], vec![remote("1", &[])]);
         let pushes = pushes.expect("the dirty change is pushed again");
@@ -2009,16 +1939,17 @@ mod tests {
         assert_eq!(report.pushed, 1);
     }
 
-    /// The crash window is one chunk: a run deriving more changes than one
-    /// chunk holds records each chunk before pushing the next, so an
-    /// interrupted run replays only the chunk whose write never landed.
+    /// The crash window is one chunk: each chunk is recorded before the
+    /// next is pushed, so an interrupted run replays only the chunk
+    /// whose write never landed.
     #[test]
     fn a_chunk_is_recorded_before_the_next_one_is_pushed() {
         let extra = 3;
         let count = ReplicaSync::PUSH_CHUNK + extra;
 
         // every member carries a local flag edit, so every one derives a
-        // push; the handles are padded so the merge orders them as numbered
+        // push; the handles are padded so the merge orders them as
+        // numbered
         let mut local = Vec::new();
         let mut items = Vec::new();
         for index in 0..count {
@@ -2037,8 +1968,8 @@ mod tests {
         assert_eq!(run.chunks[0].len(), ReplicaSync::PUSH_CHUNK);
         assert_eq!(run.chunks[1].len(), extra);
 
-        // each chunk is rebased by the write that follows it, and by no
-        // other: nothing of the second chunk rides the first batch.
+        // each chunk is rebased by the write that follows it and by no
+        // other
         for change in &run.chunks[0] {
             let rebased = upserted(&run.batches[0], change.handle().as_str());
             assert!(rebased.is_some_and(|p| p.status == ReplicaStatus::Clean));
@@ -2059,15 +1990,13 @@ mod tests {
         assert_eq!(run.report.pushed, count);
     }
 
-    /// The join walks both sides in handle order, so an enumeration that
-    /// arrives out of order is ordered rather than trusted: it must derive
-    /// exactly what the same snapshot sorted derives.
+    /// The join walks both sides in handle order, so an unordered
+    /// enumeration must derive exactly what the same snapshot sorted
+    /// derives.
     #[test]
     fn an_unordered_enumeration_merges_like_an_ordered_one() {
-        // every combination the join walks: a member both sides hold whose
-        // flags the remote changed, one both hold unchanged, one only the
-        // replica holds (removed upstream), one only the remote holds (new),
-        // and a locally dirty one (a push).
+        // every combination the join walks: changed on both, unchanged
+        // on both, local only, remote only, and locally dirty
         let local = || {
             let mut dirty = synced("5", &[]);
             dirty.flags = ReplicaFlags::from_iter(["flagged"]);
@@ -2102,8 +2031,8 @@ mod tests {
     }
 
     /// A handle the enumeration lists twice pairs with the one placement
-    /// holding it, rather than merging a second time against nothing and
-    /// pulling a phantom member.
+    /// holding it, rather than merging again against nothing and pulling
+    /// a phantom member.
     #[test]
     fn a_handle_listed_twice_is_merged_once() {
         let snapshot = full(vec![remote("1", &["seen"]), remote("1", &["seen"])]);
@@ -2119,8 +2048,8 @@ mod tests {
         );
     }
 
-    /// The merge hands a full write batch over rather than holding one write
-    /// per member until the last one is resolved.
+    /// The merge hands a full write batch over rather than holding one
+    /// write per member until the last is resolved.
     #[test]
     fn a_full_write_batch_is_handed_over_mid_merge() {
         let extra = 76;
@@ -2147,8 +2076,8 @@ mod tests {
     }
 
     /// A batch boundary falls between candidates and never inside one: a
-    /// keep-both resolution writes the pulled placement and the local body
-    /// staged beside it, and losing either would lose a version.
+    /// keep-both resolution writes the pulled placement and the local
+    /// body staged beside it, and losing either would lose a version.
     #[test]
     fn a_batch_never_cuts_through_one_candidate() {
         // fillers enough to leave the boundary exactly on the resolution
@@ -2198,9 +2127,8 @@ mod tests {
 
     #[test]
     fn divergent_flags_merge_element_wise() {
-        // Local added "flagged", remote added "seen", from an empty base:
-        // each side wins its own flag; the merged union is pushed and the
-        // remote-won flag folded in locally, with no conflict.
+        // each side wins its own flag: the union is pushed and the
+        // remote-won flag folded in locally, with no conflict
         let mut local = synced("1", &[]);
         local.flags = ReplicaFlags::from_iter(["flagged"]);
         local.status = ReplicaStatus::Dirty;
@@ -2217,7 +2145,7 @@ mod tests {
         assert_eq!(report.conflicts, 0);
         assert_eq!(report.pulled, 1, "the remote-won flag is folded in");
 
-        // last write chain entry: the accepted push rebased the merge clean
+        // the accepted push rebased the merge clean
         let rebased = writes
             .iter()
             .rev()
@@ -2234,8 +2162,7 @@ mod tests {
 
     #[test]
     fn flag_removal_merges_against_concurrent_addition() {
-        // Local removed the base flag "seen" while the remote added
-        // "important": the local removal and the remote addition both win.
+        // the local removal and the remote addition both win
         let mut local = synced("1", &["seen"]);
         local.flags = ReplicaFlags::default();
         local.status = ReplicaStatus::Dirty;
@@ -2313,7 +2240,7 @@ mod tests {
         let one = synced("1", &[]);
         let two = synced("2", &[]);
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
-        // only "2" changed upstream; "1" is unlisted and must not be touched
+        // only "2" changed upstream, "1" is unlisted
         let snapshot = delta(vec![remote("2", &["seen"])], vec![]);
         let (pushes, writes, report) = run_snapshot(&mut sync, vec![one, two], snapshot);
 
@@ -2334,8 +2261,8 @@ mod tests {
         local.status = ReplicaStatus::Dirty;
 
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
-        // the dirty handle is not in the delta, but its pending push must
-        // still be derived against its own base
+        // the dirty handle is not in the delta, so its pending push
+        // derives against its own base
         let snapshot = delta(vec![], vec![]);
         let (pushes, _writes, report) = run_snapshot(&mut sync, vec![local], snapshot);
 
@@ -2346,7 +2273,6 @@ mod tests {
 
     #[test]
     fn unchanged_flags_is_noop() {
-        // local == base == remote: nothing to pull or push, no placement write.
         let local = synced("1", &["seen"]);
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
         let (pushes, writes, report) = run(&mut sync, vec![local], vec![remote("1", &["seen"])]);
@@ -2361,8 +2287,6 @@ mod tests {
 
     #[test]
     fn concurrent_same_flags_rebases_without_push() {
-        // Both sides moved to the same flags from a shared base: converge
-        // clean, no push and no conflict.
         let mut local = synced("1", &[]);
         local.flags = ReplicaFlags::from_iter(["flagged"]);
         local.status = ReplicaStatus::Dirty;
@@ -2386,8 +2310,7 @@ mod tests {
 
     #[test]
     fn no_base_present_converges_on_remote() {
-        // Present on both but never based (no base to diff against): the
-        // remote wins and the placement is rebased onto it.
+        // with no base to diff against, the remote wins
         let mut local = synced("1", &["flagged"]);
         local.base = None;
 
@@ -2404,10 +2327,9 @@ mod tests {
 
     #[test]
     fn flag_pull_on_a_conflicted_placement_keeps_the_conflict() {
-        // A remote flag change on a content-conflicted placement pulls the
-        // flags but must not launder the conflict away: the status stays
-        // Conflict and the staged local edit survives, so the next sync
-        // never mistakes the placement for clean and drops the edit.
+        // the flags are pulled without laundering the conflict away, so
+        // a later sync cannot mistake the placement for clean and drop
+        // the staged edit
         let mut placement = edited("1");
         placement.status = ReplicaStatus::Conflict;
         placement.conflict_revision = Some("r2".into());
@@ -2435,8 +2357,6 @@ mod tests {
 
     #[test]
     fn read_only_still_pulls_remote_changes() {
-        // push=false blocks the push direction only; remote-won changes are
-        // still pulled.
         let local = synced("1", &[]);
         let opts = ReplicaSyncOptions {
             push: false,
@@ -2460,8 +2380,6 @@ mod tests {
 
     #[test]
     fn accepted_delete_drops_tombstone() {
-        // A tombstone present on both sides pushes a Remove; once the remote
-        // accepts it, the placement is dropped.
         let mut local = synced("1", &["seen"]);
         local.status = ReplicaStatus::Tombstone;
 
@@ -2490,8 +2408,8 @@ mod tests {
 
     #[test]
     fn rejected_delete_keeps_tombstone() {
-        // A delete the remote refuses (e.g. no trash to move into) must keep
-        // the tombstone, not drop a message the server still has.
+        // a refused delete keeps the tombstone rather than dropping a
+        // member the server still has
         let mut local = synced("1", &["seen"]);
         local.status = ReplicaStatus::Tombstone;
 
@@ -2520,7 +2438,6 @@ mod tests {
 
     #[test]
     fn local_delete_gone_remote_just_drops() {
-        // A tombstone whose message already vanished upstream needs no push.
         let mut local = synced("1", &["seen"]);
         local.status = ReplicaStatus::Tombstone;
 
@@ -2539,8 +2456,6 @@ mod tests {
 
     #[test]
     fn remote_delete_in_full_drops() {
-        // A based placement absent from a complete snapshot was deleted
-        // upstream: drop it and count a pull.
         let local = synced("1", &["seen"]);
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
         let (pushes, writes, report) = run(&mut sync, vec![local], vec![]);
@@ -2557,8 +2472,8 @@ mod tests {
 
     #[test]
     fn offline_created_item_left_for_create_path() {
-        // Present locally, never based, not upstream: an offline-created item
-        // the sync leaves untouched (its upload belongs to the create path).
+        // present locally, never based, not upstream: its upload belongs
+        // to the create path
         let mut local = synced("1", &["flagged"]);
         local.base = None;
         local.status = ReplicaStatus::Dirty;
@@ -2579,9 +2494,9 @@ mod tests {
 
     #[test]
     fn created_placement_pushes_add() {
-        // A Created placement (no base, not upstream) pushes an Add carrying
-        // its origin, so the remote can copy rather than re-upload, and its
-        // flag set, so an append creates the member with the right flags.
+        // the Add carries the origin, so the remote can copy rather than
+        // re-upload, and the flag set, so an append creates the member
+        // with the right flags
         let mut local = created("tmp-1");
         local.flags = ReplicaFlags::from_iter(["seen"]);
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
@@ -2599,10 +2514,9 @@ mod tests {
 
     #[test]
     fn accepted_create_rekeys_to_assigned() {
-        // Once the add is accepted, the provisional placeholder is dropped
-        // and the placement is rekeyed clean and based under the assigned
-        // handle the server returned; the base records the pushed revision
-        // and pins the pushed body.
+        // the placeholder is dropped and the placement rekeyed clean and
+        // based under the assigned handle, its base pinning the pushed
+        // body and revision
         let mut local = created("tmp-1");
         local.object = Some(ReplicaHash::from("h-1"));
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
@@ -2631,8 +2545,6 @@ mod tests {
 
     #[test]
     fn rejected_create_keeps_placeholder() {
-        // A refused add keeps the placeholder for the next retry: no drop and
-        // no rekey.
         let local = created("tmp-1");
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
         let results = vec![ReplicaPushResult {
@@ -2655,8 +2567,8 @@ mod tests {
 
     #[test]
     fn move_pushes_remove_with_target() {
-        // A tombstone carrying an origin is a move: it pushes a Remove naming
-        // the destination, so the consumer issues a UID MOVE.
+        // a tombstone carrying an origin is a move: the Remove names the
+        // destination, so the consumer issues a UID MOVE
         let mut local = synced("1", &["seen"]);
         local.status = ReplicaStatus::Tombstone;
         local.origin = Some(ReplicaOrigin {
@@ -2676,8 +2588,8 @@ mod tests {
 
     #[test]
     fn accepted_create_without_assigned_drops_placeholder() {
-        // A copy whose push is accepted with no assigned handle (no UIDPLUS)
-        // drops the placeholder: the next enumerate re-adds the real handle.
+        // with no assigned handle (no UIDPLUS) the placeholder is
+        // dropped, and the next enumerate re-adds the real one
         let local = created("tmp-1");
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
         let results = vec![ReplicaPushResult {
@@ -2699,8 +2611,8 @@ mod tests {
 
     #[test]
     fn full_sync_ignores_checkpoint() {
-        // A full sync drops the stored checkpoint, so the enumerate is asked
-        // for the whole remote (cursor None) rather than a delta.
+        // the stored checkpoint is dropped, so the enumerate is asked
+        // for the whole remote rather than a delta
         let mut sync = ReplicaSync::new(
             "inbox",
             ReplicaSyncOptions {
@@ -2724,8 +2636,8 @@ mod tests {
         }
     }
 
-    /// A synced placement carrying a staged content edit: the body points
-    /// at "h2" while the base pins "h1" at revision "r1".
+    /// A synced placement carrying a staged content edit: the body
+    /// points at "h2" while the base pins "h1" at revision "r1".
     fn edited(handle: &str) -> ReplicaPlacement {
         let mut placement = synced(handle, &[]);
         placement.status = ReplicaStatus::Dirty;
@@ -2746,9 +2658,9 @@ mod tests {
 
     #[test]
     fn a_content_push_still_pulls_a_remote_flag_change() {
-        // The two axes are independent, and a delta lists the item exactly
-        // once: a remote flag change dropped here is invisible until some
-        // later run happens to list the item again.
+        // the two axes are independent, and a delta lists the item
+        // exactly once: a flag change dropped here stays invisible until
+        // some later run happens to list the item again
         let mut local = edited("1");
         let mut item = remote_rev("1", "r1");
         item.flags = ReplicaFlags::from_iter(["seen"]);
@@ -2770,9 +2682,8 @@ mod tests {
 
     #[test]
     fn local_content_edit_pushes_update_and_rebases() {
-        // A staged edit against an unchanged remote pushes an Update gated
-        // on the base revision; once accepted, the base pins the pushed
-        // body and the revision the remote reported.
+        // the Update is gated on the base revision; once accepted, the
+        // base pins the pushed body and the reported revision
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
         let _ = sync.resume(None);
         let _ = sync.resume(Some(ReplicaArg::Load(ReplicaLoaded {
@@ -2819,10 +2730,9 @@ mod tests {
 
     #[test]
     fn content_rebase_defers_a_riding_flag_edit() {
-        // A placement both content-dirty and flag-dirty pushes the content;
-        // the rebase keeps the base flags as they were and the placement
-        // dirty, so the flag push derives on the next sync instead of
-        // being silently marked synced.
+        // the content wins the push, and the rebase keeps the base flags
+        // as they were, so the flag push derives on the next sync
+        // instead of being silently marked synced
         let mut placement = edited("1");
         placement.flags = ReplicaFlags::from_iter(["seen"]);
 
@@ -2853,8 +2763,8 @@ mod tests {
 
     #[test]
     fn remote_content_change_refreshes_the_stale_body() {
-        // A remote edit of a clean placement drops the stale body and
-        // rebases the revision; the next upgrade refetches on demand.
+        // the stale body is dropped and the revision rebased; the next
+        // upgrade refetches on demand
         let mut placement = synced("1", &[]);
         placement.object = Some(ReplicaHash::from("h1"));
         placement.level = ReplicaLevel::Full;
@@ -2881,9 +2791,8 @@ mod tests {
 
     #[test]
     fn divergent_content_edits_conflict() {
-        // Both sides edited: the placement is marked conflicted carrying
-        // the observed remote revision, the local body survives, and
-        // nothing is pushed or refreshed.
+        // the conflict mark carries the observed remote revision, the
+        // local body survives, and nothing is pushed or refreshed
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
         let (pushes, writes, report) =
             run(&mut sync, vec![edited("1")], vec![remote_rev("1", "r2")]);
@@ -2903,13 +2812,11 @@ mod tests {
 
     #[test]
     fn base_less_body_present_on_both_conflicts() {
-        // A create-collision, or a spoke whose content base was orphaned:
-        // the placement carries a body but has no base, yet the remote
-        // holds the same handle. With no shared ancestor there is nothing
-        // to merge, so it is surfaced as a conflict carrying the remote
-        // revision instead of converging on flags alone, which would
-        // strand the two bodies apart and loop every sync. The consumer's
-        // resolution then re-establishes a base, so the state self-heals.
+        // a create-collision, or a spoke whose content base was
+        // orphaned: with no shared ancestor there is nothing to merge,
+        // so it surfaces as a conflict instead of converging on flags
+        // alone, which would strand the two bodies apart and loop every
+        // sync. The consumer's resolution re-establishes a base.
         let mut placement = synced("1", &[]);
         placement.base = None;
         placement.object = Some(ReplicaHash::from("h1"));
@@ -2932,9 +2839,8 @@ mod tests {
 
     #[test]
     fn base_less_body_less_present_on_both_stays_flag_only() {
-        // A never-based placement with no body carries no content signal,
-        // so it must still converge on flags alone (the create-collision
-        // rule only fires when a body is actually present on both sides).
+        // no body means no content signal, so the create-collision rule
+        // does not fire and the flag merge still converges
         let mut placement = synced("1", &["seen"]);
         placement.base = None;
 
@@ -2951,9 +2857,8 @@ mod tests {
 
     #[test]
     fn an_unresolved_conflict_tracks_the_latest_remote_revision() {
-        // A conflicted placement is left alone, but the observed remote
-        // revision follows the remote so the consumer resolves against the
-        // latest content.
+        // the observed remote revision follows the remote, so the
+        // consumer resolves against the latest content
         let mut placement = edited("1");
         placement.status = ReplicaStatus::Conflict;
         placement.conflict_revision = Some("r2".into());
@@ -2975,10 +2880,9 @@ mod tests {
 
     #[test]
     fn a_content_conflict_still_pulls_the_remote_flag_change() {
-        // Content diverged AND the remote changed flags in the same delta
-        // row: the conflict mark must not eat the flag change, because a
-        // delta lists it exactly once and skipping the flag merge would
-        // diverge the replica for good.
+        // the conflict mark must not eat the flag change: a delta lists
+        // it exactly once, so skipping the flag merge would diverge the
+        // replica for good
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
         let mut item = remote_rev("1", "r2");
         item.flags = ReplicaFlags::from_iter(["seen"]);
@@ -3006,11 +2910,10 @@ mod tests {
 
     #[test]
     fn unlisted_conflict_keeps_its_observed_remote_revision() {
-        // A conflicted placement unlisted by a delta is unchanged upstream
-        // since the cursor: the synthesized remote state must carry the
-        // observed conflict revision, not the stale base one, or the
-        // conflict tracking would regress and the resolution would push
-        // against the wrong precondition.
+        // unlisted means unchanged upstream since the cursor, so the
+        // synthesized remote state carries the observed conflict
+        // revision rather than the stale base one, which would regress
+        // the tracking and push against the wrong precondition
         let mut placement = edited("1");
         placement.status = ReplicaStatus::Conflict;
         placement.conflict_revision = Some("r2".into());
@@ -3029,9 +2932,8 @@ mod tests {
 
     #[test]
     fn remote_content_change_beats_a_local_delete() {
-        // The remote edited what was deleted locally: the update wins, so
-        // no Remove is pushed and the placement is re-pulled fresh on the
-        // new revision.
+        // the update wins, so no Remove is pushed and the placement is
+        // re-pulled fresh on the new revision
         let mut placement = edited("1");
         placement.status = ReplicaStatus::Tombstone;
 
@@ -3048,10 +2950,9 @@ mod tests {
 
     #[test]
     fn a_tombstone_carrying_a_staged_edit_still_removes() {
-        // The edit rides into the target's create, which `Move` stages
-        // origin-less so the staged body is uploaded. The source is being
-        // removed, so its own edit has nowhere to go: pushing an Update
-        // against a member about to be deleted would only race it.
+        // the edit rides into the target's create, which `Move` stages
+        // origin-less so the staged body is uploaded; pushing an Update
+        // against a member about to be deleted would only race it
         let mut placement = edited("1");
         placement.status = ReplicaStatus::Tombstone;
 
@@ -3070,9 +2971,9 @@ mod tests {
 
     #[test]
     fn a_tombstone_origin_derives_a_move_remove() {
-        // No mutation stages a tombstone origin today, but a storage that
-        // plumbs one through (an atomic server-side move) still derives
-        // the destination: the seam is live, not dead.
+        // no mutation stages a tombstone origin today, but a storage
+        // that plumbs one through (an atomic server-side move) still
+        // derives the destination
         let mut placement = synced("1", &[]);
         placement.status = ReplicaStatus::Tombstone;
         placement.origin = Some(ReplicaOrigin {
@@ -3091,8 +2992,8 @@ mod tests {
 
     #[test]
     fn remove_carries_the_base_revision_as_precondition() {
-        // A pushed delete is gated on the last-synced revision, so a
-        // remote edit racing the delete is rejected server-side.
+        // the delete is gated on the last-synced revision, so a remote
+        // edit racing it is rejected server-side
         let mut placement = edited("1");
         placement.status = ReplicaStatus::Tombstone;
 
@@ -3110,10 +3011,9 @@ mod tests {
 
     #[test]
     fn remote_delete_with_staged_edit_resurrects_as_create() {
-        // The remote deleted what was edited locally: the edit wins over
-        // the delete (the mirror of remote-update-beats-local-delete), so
-        // the placement converts to a pending create that re-uploads the
-        // edited body instead of being silently dropped.
+        // the mirror of remote-update-beats-local-delete: the placement
+        // converts to a pending create that re-uploads the edited body
+        // instead of being silently dropped
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
         let (pushes, writes, _report) = run(&mut sync, vec![edited("1")], vec![]);
 
@@ -3132,10 +3032,8 @@ mod tests {
 
     #[test]
     fn remote_delete_of_a_conflicted_placement_resurrects_the_edit() {
-        // The remote deleted the item while a content conflict was
-        // pending: the conflict is moot (the remote side is gone), and
-        // the surviving local edit wins by resurrecting as a pending
-        // create rather than being dropped with the placement.
+        // the remote side is gone, so the conflict is moot and the
+        // surviving local edit wins by resurrecting as a pending create
         let mut placement = edited("1");
         placement.status = ReplicaStatus::Conflict;
         placement.conflict_revision = Some("r2".into());
@@ -3159,9 +3057,8 @@ mod tests {
 
     #[test]
     fn read_only_remote_delete_with_staged_edit_keeps_the_edit() {
-        // Same rescue on a read-only source: no push, but the placement
-        // still converts to a pending create so the edit survives for a
-        // later writable sync instead of being dropped.
+        // same rescue on a read-only source: no push, but the pending
+        // create keeps the edit alive for a later writable sync
         let opts = ReplicaSyncOptions {
             push: false,
             rights: ReplicaPushRights::all(),
@@ -3180,8 +3077,7 @@ mod tests {
 
     #[test]
     fn read_only_keeps_a_content_edit_dirty() {
-        // A read-only source never pushes: the staged edit stays dirty for
-        // a later writable sync.
+        // the staged edit stays dirty for a later writable sync
         let mut sync = ReplicaSync::new(
             "inbox",
             ReplicaSyncOptions {
@@ -3204,10 +3100,9 @@ mod tests {
 
     #[test]
     fn read_only_delete_is_reverted_rather_than_applied() {
-        // A local delete on a read-only source can never propagate, and
-        // the replica mirrors the source: the tombstone is reverted, so
-        // the member stays with its cached body rather than being dropped
-        // and refetched by a later full enumerate.
+        // the delete can never propagate and the replica mirrors the
+        // source, so the member stays with its cached body rather than
+        // being dropped and refetched by a later full enumerate
         let mut local = synced("1", &["seen"]);
         local.status = ReplicaStatus::Tombstone;
 
@@ -3235,10 +3130,9 @@ mod tests {
 
     #[test]
     fn a_read_only_delete_survives_a_delta_enumerate() {
-        // The revert has to happen here, not by waiting for a re-add: an
-        // incremental enumerate never lists an untouched member again, so
-        // a dropped row would leave the replica permanently short of one
-        // item the source still holds.
+        // the revert cannot wait for a re-add: an incremental enumerate
+        // never lists an untouched member again, so a dropped row would
+        // leave the replica permanently short of one item
         let mut local = synced("1", &["seen"]);
         local.status = ReplicaStatus::Tombstone;
 
@@ -3247,7 +3141,7 @@ mod tests {
             ..Default::default()
         };
         let mut sync = ReplicaSync::new("inbox", opts);
-        // the handle is unchanged upstream, so a delta lists nothing at all
+        // the handle is unchanged upstream, so the delta lists nothing
         let (_pushes, writes, _report) =
             run_snapshot(&mut sync, vec![local], delta(vec![], vec![]));
 
@@ -3257,9 +3151,8 @@ mod tests {
 
     #[test]
     fn unknown_vanished_handle_is_ignored() {
-        // A delta may report a vanished handle the replica never knew
-        // (removed before it was ever enumerated locally): nothing to
-        // merge, nothing to write, no panic.
+        // a delta may report a handle the replica never knew, removed
+        // before it was ever enumerated locally
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
         let snapshot = delta(vec![], vec![ReplicaHandle::from("ghost")]);
         let (pushes, writes, report) = run_snapshot(&mut sync, vec![], snapshot);
@@ -3272,9 +3165,8 @@ mod tests {
 
     #[test]
     fn noop_flag_edit_rebases_clean() {
-        // A flag set put back to its base value is a no-op edit: nothing
-        // to push, but the placement must come out clean rather than stay
-        // dirty forever.
+        // nothing to push, but the placement must come out clean rather
+        // than stay dirty forever
         let mut local = synced("1", &["seen"]);
         local.status = ReplicaStatus::Dirty;
 
@@ -3299,8 +3191,8 @@ mod tests {
 
     #[test]
     fn a_completed_sync_does_not_resume() {
-        // An empty report is indistinguishable from a run that genuinely did
-        // nothing, so a driver resuming a finished sync must be told.
+        // an empty report is indistinguishable from a run that did
+        // nothing, so a driver resuming a finished sync must be told
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
         let _ = run(&mut sync, vec![], vec![]);
         match sync.resume(Some(ReplicaArg::Write)) {
@@ -3371,8 +3263,8 @@ mod tests {
         assert_eq!(report.pushed, 0);
     }
 
-    /// The two ways a source can refuse a delete now answer to one policy,
-    /// so `ReplicaPushRights::none()` and `push = false` agree on it.
+    /// Both ways a source can refuse a delete answer to one policy, so
+    /// `ReplicaPushRights::none()` and `push = false` agree on it.
     #[test]
     fn keeping_a_refused_delete_holds_the_tombstone_either_way() {
         let mut local = synced("1", &["seen"]);
@@ -3608,9 +3500,9 @@ mod tests {
 
     #[test]
     fn two_keep_both_duplicates_of_one_handle_do_not_collide() {
-        // Both are staged before either is pushed, so a handle derived
+        // both are staged before either is pushed, so a handle derived
         // from the placement alone would have the second overwrite the
-        // first: exactly the version keep-both exists to preserve.
+        // first
         let mut first = edited("1");
         first.object = Some(ReplicaHash::from("h2"));
         let mut second = edited("1");

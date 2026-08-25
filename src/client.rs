@@ -1,17 +1,16 @@
 //! # Blocking reference driver
 //!
-//! A driver that runs any standard-shape coroutine to completion by
-//! servicing each [`ReplicaYield`] through two consumer-supplied traits:
-//! [`ReplicaStorage`] for the index and blob store, [`ReplicaRemote`] for the
-//! protocol seam. These traits live on the consumer side, not inside the
-//! engine, so the I/O-free contract holds: the coroutines still only emit
-//! `Wants`. The driver itself performs no I/O either, so it needs no std
-//! and no feature gate: blocking happens inside the trait impls.
+//! Runs any standard-shape coroutine to completion by servicing each
+//! [`ReplicaYield`] through two consumer-supplied traits:
+//! [`ReplicaStorage`] for the index and blob store, [`ReplicaRemote`] for
+//! the protocol seam. They live on the consumer side, not inside the
+//! engine, so the I/O-free contract holds and the driver itself needs
+//! neither std nor a feature gate: blocking happens inside the impls.
 //!
 //! A desktop or Neverest consumer backs [`ReplicaRemote`] with a blocking
-//! protocol client (io-imap, io-jmap, io-webdav) and [`ReplicaStorage`] with
-//! sqlite plus a blob dir; an Android consumer backs [`ReplicaRemote`] with
-//! io-imap over JNI.
+//! protocol client (io-imap, io-jmap, io-webdav) and [`ReplicaStorage`]
+//! with sqlite plus a blob dir; an Android consumer backs
+//! [`ReplicaRemote`] with io-imap over JNI.
 
 use core::{error, fmt};
 
@@ -39,10 +38,10 @@ pub trait ReplicaStorage {
 
     /// Loads a collection's placements and checkpoint.
     ///
-    /// `scope` is a floor: the reply SHALL hold at least the placements it
-    /// names and MAY hold more, so a storage that ignores it and returns
-    /// the whole collection stays correct. Honouring it is what keeps a
-    /// one-row edit from reading a whole mailbox.
+    /// `scope` is a floor: the reply SHALL hold at least the placements
+    /// it names and MAY hold more, so a storage returning the whole
+    /// collection stays correct. Honouring it keeps a one-row edit from
+    /// reading a whole mailbox.
     fn load(
         &self,
         collection: &ReplicaCollectionId,
@@ -55,20 +54,18 @@ pub trait ReplicaStorage {
         links: &[ReplicaLinkId],
     ) -> Result<BTreeMap<ReplicaLinkId, ReplicaHash>, Self::Error>;
 
-    /// Applies a batch of writes atomically and **in order**, maintaining
-    /// the pointer-derived object references [`ReplicaWriteOp`] documents.
+    /// Applies a batch of writes atomically and in order, maintaining the
+    /// pointer-derived object references [`ReplicaWriteOp`] documents.
     ///
-    /// Order matters because a batch may name one handle twice: a sync that
-    /// clears an ambiguity and then reads the same handle as vanished writes
-    /// the cleared placement and then drops it, and the drop is the answer.
-    /// A storage may not group the batch by op kind, or otherwise reorder
-    /// it.
+    /// Order matters because a batch may name one handle twice: a sync
+    /// clearing an ambiguity then reading the same handle as vanished
+    /// writes the cleared placement and drops it, and the drop is the
+    /// answer. A storage may not group the batch by op kind.
     ///
     /// The engine assumes a single writer per collection between a load
     /// and the write derived from it: a batch applied over state another
-    /// actor changed in between clobbers that change. How the guarantee
-    /// is provided is the storage's business (a sqlite transaction, a
-    /// lock file, process-level serialization).
+    /// actor changed in between clobbers that change. How that is
+    /// provided is the storage's business.
     fn write(&mut self, ops: Vec<ReplicaWriteOp>) -> Result<(), Self::Error>;
 }
 
@@ -96,7 +93,7 @@ pub trait ReplicaRemote {
     ///
     /// Pushes are at-least-once: a crash between a serviced push and its
     /// recording write replays the change on the next sync, so the
-    /// consumer keeps retries harmless (see [`ReplicaChange`]).
+    /// consumer keeps retries harmless. See [`ReplicaChange`].
     fn push(
         &mut self,
         collection: &ReplicaCollectionId,
@@ -282,8 +279,8 @@ where
         self.run(ReplicaSync::new(collection, opts))
     }
 
-    /// Rebuilds a collection after a handle-space change (an IMAP
-    /// UIDVALIDITY bump), carrying local state over by link id.
+    /// Rebuilds a collection after a handle-space change, an IMAP
+    /// UIDVALIDITY bump, carrying local state over by link id.
     pub fn rekey(
         &mut self,
         collection: impl Into<ReplicaCollectionId>,

@@ -1,9 +1,8 @@
 //! Outbound remote changes and inbound storage writes.
 //!
 //! [`ReplicaChange`] is what the engine asks the consumer to push to the
-//! remote; [`ReplicaWriteOp`] is what it asks the consumer to persist
-//! locally. The engine itself performs neither: both travel as coroutine
-//! yields.
+//! remote, [`ReplicaWriteOp`] what it asks the consumer to persist
+//! locally. The engine performs neither: both travel as coroutine yields.
 
 use alloc::{format, string::String, vec::Vec};
 
@@ -16,15 +15,14 @@ use crate::{
 /// A change to push to the remote: what to do, and the key naming it.
 ///
 /// Pushes are at-least-once: a crash between a serviced push and the
-/// storage write that records it makes the next sync push the same change
+/// storage write recording it makes the next sync push the same change
 /// again. The window is one chunk rather than one run (see
-/// [`ReplicaSync::PUSH_CHUNK`](crate::sync::ReplicaSync::PUSH_CHUNK)), and
-/// every change names itself through `key`, so a consumer that records the
-/// keys it applied recognises a replay of any kind. Flag and content
-/// pushes also re-apply harmlessly on their own; the other two are kept
-/// harmless by treating a remove of an already-missing member as accepted,
-/// and by using an add's `link_id` to detect that it already landed
-/// instead of duplicating it.
+/// [`ReplicaSync::PUSH_CHUNK`](crate::sync::ReplicaSync::PUSH_CHUNK)),
+/// and every change names itself through `key`, so a consumer recording
+/// the keys it applied recognises a replay. Flag and content pushes
+/// re-apply harmlessly on their own; the other two are kept harmless by
+/// treating a remove of an already-missing member as accepted, and by
+/// using an add's `link_id` to detect that it already landed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplicaChange {
     /// What the remote is asked to do.
@@ -37,9 +35,8 @@ pub struct ReplicaChange {
 impl ReplicaChange {
     /// Keys `kind` in `collection`.
     ///
-    /// The only way a change is made, so it cannot exist without its key,
-    /// and the key cannot disagree with what it names: the engine derives
-    /// the kind, and keying it is the last thing that happens to it.
+    /// The only way a change is made, so it cannot exist without its key
+    /// or with one that names something else.
     pub fn new(collection: &ReplicaCollectionId, kind: ReplicaChangeKind) -> Self {
         let key = kind.key(collection);
 
@@ -68,21 +65,20 @@ impl ReplicaChange {
 /// A move is staged as a create in the target plus a remove of the source
 /// (see [`ReplicaMutation::Move`](crate::mutate::ReplicaMutation::Move)),
 /// each derived by its own collection's sync, in whichever order the
-/// consumer runs them. Both halves can deliver the item on their own: the
-/// create by copying from its origin, the remove by relocating the member
-/// into `to`. So a [`Remove`](Self::Remove) carries the `link_id` its `to`
-/// would receive, and a consumer SHALL relocate only while the
-/// destination does not already hold it; otherwise the create already
-/// delivered, and the remove is a plain delete of the source.
+/// consumer runs them. Both halves can deliver the item on their own, so
+/// a [`Remove`](Self::Remove) carries the `link_id` its `to` would
+/// receive and a consumer SHALL relocate only while the destination does
+/// not already hold it; otherwise the create delivered and the remove is
+/// a plain delete of the source.
 ///
-/// Neither half may be dropped in favour of the other. The remove is what
-/// keeps a move safe when the target syncs last (the source is relocated
-/// rather than deleted out from under a copy that never ran), and the
-/// create is what keeps it working through a [hub](crate::hub), whose
-/// bindings carry no origin. When the target syncs last its create finds
-/// its origin already relocated: the push is rejected and the placeholder
-/// stays visibly pending, since an add carries no key that separates a
-/// second copy the user asked for from one the remove already served.
+/// Neither half may be dropped in favour of the other. The remove keeps a
+/// move safe when the target syncs last, the source being relocated
+/// rather than deleted out from under a copy that never ran, and the
+/// create keeps it working through a [hub](crate::hub), whose bindings
+/// carry no origin. A create whose origin is already relocated is
+/// rejected and stays visibly pending, since an add carries no key
+/// separating a second copy the user asked for from one the remove
+/// already served.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReplicaChangeKind {
     /// Add a member. The push reconciles the provisional `handle` to the
@@ -95,17 +91,17 @@ pub enum ReplicaChangeKind {
         /// idempotency key for a retried add.
         link_id: Option<ReplicaLinkId>,
         /// The flag set to create the member with (an IMAP APPEND flag
-        /// list). A server-side copy may ignore it (the copy inherits the
-        /// source flags; any skew reconciles on the next sync).
+        /// list). A server-side copy may ignore it and inherit the source
+        /// flags, any skew reconciling on the next sync.
         flags: ReplicaFlags,
         /// Where the body already lives, for a server-side copy or move;
         /// `None` for an append that uploads `object`. When the server
-        /// refuses the copy because the origin is gone (expunged), a
-        /// consumer holding `object` may fall back to uploading it;
-        /// without a body, rejecting keeps the pending create visible.
+        /// refuses the copy because the origin is gone, a consumer
+        /// holding `object` may fall back to uploading it; without a
+        /// body, rejecting keeps the pending create visible.
         origin: Option<ReplicaOrigin>,
-        /// The stored body to upload when there is no `origin` (an
-        /// append); the consumer resolves the bytes from its object store.
+        /// The stored body to upload when there is no `origin`; the
+        /// consumer resolves the bytes from its object store.
         object: Option<ReplicaHash>,
     },
     /// Remove a member. `to` is the collection to move it into (an offline
@@ -116,10 +112,9 @@ pub enum ReplicaChangeKind {
         handle: ReplicaHandle,
         /// The move destination, or `None` for a delete.
         to: Option<ReplicaCollectionId>,
-        /// The logical-item identity, when already resolved: the delivery
-        /// key of a move. A `to` that already holds this link id was
-        /// served by the move's other half, so the remove is a plain
-        /// delete rather than a second relocation.
+        /// The logical-item identity, when resolved: the delivery key of
+        /// a move. A `to` already holding it was served by the move's
+        /// other half, so the remove is a plain delete.
         link_id: Option<ReplicaLinkId>,
         /// The last-synced content revision, as an optimistic-concurrency
         /// precondition (a WebDAV If-Match); `None` where content is
@@ -151,15 +146,14 @@ impl ReplicaChangeKind {
     ///
     /// The key covers the collection, the handle, the kind and the target
     /// state the change makes true: the flag set of a
-    /// [`SetFlags`](Self::SetFlags), the body of an [`Update`](Self::Update),
-    /// the destination of a [`Remove`](Self::Remove), and the identity,
-    /// markers, origin and body of an [`Add`](Self::Add). The same derived
-    /// change keys the same on every run, and changes differing in any of
-    /// those key differently.
+    /// [`SetFlags`](Self::SetFlags), the body of an
+    /// [`Update`](Self::Update), the destination of a
+    /// [`Remove`](Self::Remove), and the identity, markers, origin and
+    /// body of an [`Add`](Self::Add).
     ///
-    /// A precondition is deliberately not part of it: `if_match` states what
-    /// the change was attempted against, not what it makes true, and a retry
-    /// of one operation is one operation.
+    /// A precondition is deliberately not part of it: `if_match` states
+    /// what the change was attempted against, not what it makes true, and
+    /// a retry of one operation is one operation.
     fn key(&self, collection: &ReplicaCollectionId) -> ReplicaChangeKey {
         let handle = match self {
             Self::Add { handle, .. } => handle,
@@ -216,18 +210,17 @@ crate::replica_id! {
     /// The idempotency key naming a derived change, as
     /// [`ReplicaChange::new`] derives it.
     ///
-    /// Sixteen lowercase hexadecimal characters; opaque to the engine, which
-    /// never reads one back. A consumer records the keys it has applied and
-    /// recognises a replay by looking one up.
+    /// Sixteen lowercase hexadecimal characters, opaque to the engine,
+    /// which never reads one back. A consumer records the keys it applied
+    /// and recognises a replay by looking one up.
     ReplicaChangeKey, Ord, PartialOrd, Hash,
 }
 
 /// The digest a [`ReplicaChangeKind`] is folded into to key it.
 ///
 /// FNV-1a, sixty-four bits, computed here rather than pulled in as a
-/// dependency: the crate has none beyond `log` and `thiserror`, and what an
-/// idempotency key needs is determinism, not resistance to a forged
-/// collision.
+/// dependency: an idempotency key needs determinism, not resistance to a
+/// forged collision.
 struct ReplicaChangeDigest(u64);
 
 impl ReplicaChangeDigest {
@@ -280,8 +273,8 @@ impl ReplicaChangeDigest {
 
 /// Why a placement is being dropped.
 ///
-/// The engine drops a row for two unrelated reasons, and a storage that
-/// shares one item across sources (a [hub](crate::hub)) has to tell them
+/// The engine drops a row for two unrelated reasons, and a storage
+/// sharing one item across sources (a [hub](crate::hub)) has to tell them
 /// apart: propagating a delete the engine never meant is how a
 /// housekeeping drop becomes data loss on another source.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -297,15 +290,15 @@ pub enum ReplicaDropReason {
 
 /// A write to persist in local storage.
 ///
-/// The set the four verbs emit; the consumer applies them atomically
-/// against its index and blob store.
+/// The set the verbs emit; the consumer applies them atomically against
+/// its index and blob store.
 ///
 /// Object references derive from placement pointers: a stored placement
-/// references an object once per pointing field (`ReplicaPlacement::object` and
-/// `ReplicaBase::object`). The consumer maintains the counts incrementally, by
-/// diffing an upsert against the stored row it replaces and by releasing
-/// both pointers of a dropped row; an object no other placement points at
-/// may be garbage-collected.
+/// references an object once per pointing field
+/// (`ReplicaPlacement::object` and `ReplicaBase::object`). The consumer
+/// maintains the counts incrementally, by diffing an upsert against the
+/// row it replaces and releasing both pointers of a dropped row; an
+/// object no placement points at may be garbage-collected.
 // NOTE: upserts dominate every write batch, so boxing the placement to
 // shrink the enum would only add indirection on the hot variant.
 #[allow(clippy::large_enum_variant)]
@@ -322,19 +315,18 @@ pub enum ReplicaWriteOp {
         /// Whether the item itself is gone, or only this row of it.
         reason: ReplicaDropReason,
     },
-    /// Store an object body. Storing takes no reference of its own:
-    /// references come from placement pointers only, so a stored object is
-    /// unreferenced until an [`ReplicaWriteOp::UpsertPlacement`] points at its
-    /// hash. That upsert usually rides in the same batch, but it need not: a
-    /// consumer streaming bodies ahead of their metadata stores them in one
-    /// batch and attaches them in a later one, and a storage backend must keep
-    /// an unreferenced object rather than collect it at the commit.
+    /// Store an object body. Storing takes no reference of its own, so a
+    /// stored object is unreferenced until an
+    /// [`ReplicaWriteOp::UpsertPlacement`] points at its hash. That
+    /// upsert need not ride in the same batch: a consumer streaming
+    /// bodies ahead of their metadata attaches them in a later one, so a
+    /// storage backend must keep an unreferenced object rather than
+    /// collect it at the commit.
     StoreObject {
         /// The object metadata.
         object: ReplicaObject,
-        /// The body bytes, or `None` when the consumer already persisted the
-        /// object into its blob store during a streaming fetch — the engine
-        /// then only records the object (`object`), writing no bytes.
+        /// The body bytes, or `None` when the consumer already persisted
+        /// the object into its blob store during a streaming fetch.
         body: Option<Vec<u8>>,
     },
     /// Set a collection's sync checkpoint.

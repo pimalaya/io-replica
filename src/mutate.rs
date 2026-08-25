@@ -1,9 +1,9 @@
 //! I/O-free coroutine to mutate a collection locally, with no network.
 //!
 //! Loads the target placement, applies the change in memory, marks it
-//! dirty or tombstone (the base is left untouched so the next sync can
-//! derive the pending push), and writes it back. The remote is never
-//! touched here; reconciliation is [`crate::sync`]'s job.
+//! dirty or tombstone, and writes it back. The base is left untouched so
+//! the next sync derives the pending push; reconciliation is
+//! [`crate::sync`]'s job.
 
 use alloc::{string::String, vec, vec::Vec};
 
@@ -24,10 +24,10 @@ use crate::{
 
 /// A local edit applied offline.
 ///
-/// Each mutation reads one source placement in the coroutine's collection
-/// and stages the resulting writes; the remote is reconciled on the next
-/// sync. A copy stages a [`ReplicaStatus::Created`] placement in another
-/// collection.
+/// Each mutation reads one source placement in the coroutine's
+/// collection and stages the resulting writes, to be reconciled on the
+/// next sync. A copy stages a [`ReplicaStatus::Created`] placement in
+/// another collection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReplicaMutation {
     /// Replace a placement's flag set.
@@ -40,13 +40,12 @@ pub enum ReplicaMutation {
     /// Mark a placement deleted, keeping it as a tombstone until synced.
     Remove(ReplicaHandle),
     /// Replace a placement's body with locally edited content: the new
-    /// object is stored, the placement repointed at it and marked dirty;
-    /// the base keeps the previously synced body, so the next sync derives
-    /// the pending push and a content three-way merge keeps its base
-    /// bytes. Editing a conflicted placement resolves it: the remote
-    /// revision observed at conflict time becomes the new base revision,
-    /// so the resolving push is conditioned on the remote state the
-    /// resolution was merged against.
+    /// object is stored and the placement repointed at it and marked
+    /// dirty, its base keeping the previously synced body so the next
+    /// sync derives the push. Editing a conflicted placement resolves
+    /// it: the remote revision observed at conflict time becomes the new
+    /// base revision, conditioning the resolving push on the remote
+    /// state it was merged against.
     Edit {
         /// The placement to update.
         handle: ReplicaHandle,
@@ -57,10 +56,9 @@ pub enum ReplicaMutation {
         /// The refreshed summary, when the consumer projects one; `None`
         /// keeps the cached summary.
         meta: Option<ReplicaMeta>,
-        /// The refreshed sort key, on the same terms as `meta`: `None`
-        /// keeps the stored one. An edit that changes what a key is
-        /// derived from (a card's name, an event's start) has to say so,
-        /// or the item stays where it was in the list.
+        /// The refreshed sort key, on the same terms as `meta`. An edit
+        /// changing what a key is derived from has to say so, or the
+        /// item stays where it was in the list.
         sort_key: Option<ReplicaSortKey>,
     },
     /// Copy a placement into `target` as a pending create that the next
@@ -74,17 +72,17 @@ pub enum ReplicaMutation {
         /// The provisional handle the copy is staged under in `target`.
         placeholder: ReplicaHandle,
     },
-    /// Move a placement into `target`: stage a `Created` placement in
-    /// `target` under `placeholder` (carrying the source origin), and
-    /// tombstone the source carrying `target` as its destination. Each
-    /// collection's next sync derives one half, a copy into the target and
-    /// a relocation of the source, and whichever runs first delivers the
-    /// item; the link id keeps the other from delivering a second copy
-    /// (see [`ReplicaChange`](crate::change::ReplicaChange)).
+    /// Move a placement into `target`: stage a `Created` placement there
+    /// under `placeholder`, carrying the source origin, and tombstone
+    /// the source carrying `target` as its destination. Each
+    /// collection's next sync derives one half and whichever runs first
+    /// delivers the item, the link id keeping the other from delivering
+    /// a second copy (see
+    /// [`ReplicaChange`](crate::change::ReplicaChange)).
     ///
-    /// An item whose link id is not resolved yet has no such key, so only
-    /// the source half is staged: the relocation delivers it alone, and
-    /// the target picks it up on its next enumerate.
+    /// An item whose link id is not resolved yet has no such key, so
+    /// only the source half is staged: the relocation delivers it alone,
+    /// and the target picks it up on its next enumerate.
     Move {
         /// The source placement to move.
         handle: ReplicaHandle,
@@ -93,12 +91,14 @@ pub enum ReplicaMutation {
         /// The provisional handle the move is staged under in `target`.
         placeholder: ReplicaHandle,
     },
-    /// Create a brand-new, locally-authored item with no remote origin (compose,
-    /// import). Stages a pending create the next sync pushes as an append (the
-    /// body is uploaded), not a server-side copy. Reads no existing source.
+    /// Create a brand-new, locally-authored item with no remote origin
+    /// (compose, import). Stages a pending create the next sync pushes
+    /// as an append, uploading the body, rather than a server-side copy.
+    /// Reads no existing source.
     Add {
-        /// The provisional local handle the create is staged under, rekeyed to
-        /// the server-assigned handle when the push reports it.
+        /// The provisional local handle the create is staged under,
+        /// rekeyed to the server-assigned handle when the push reports
+        /// it.
         handle: ReplicaHandle,
         /// The item's cross-source link id (its `Message-ID`, …).
         link_id: ReplicaLinkId,
@@ -116,9 +116,9 @@ pub enum ReplicaMutation {
 }
 
 impl ReplicaMutation {
-    /// The source handle the mutation reads in the coroutine's collection, or
-    /// `None` for [`Add`](Self::Add), which creates a placement rather than
-    /// reading one.
+    /// The source handle the mutation reads, or `None` for
+    /// [`Add`](Self::Add), which creates a placement rather than reading
+    /// one.
     fn handle(&self) -> Option<&ReplicaHandle> {
         match self {
             Self::SetFlags { handle, .. } => Some(handle),
@@ -153,9 +153,9 @@ pub enum ReplicaMutateError {
     /// An `Add` names a link id a live placement already holds.
     #[error("Replica MUTATE failed: link id already present: {0}")]
     LinkExists(String),
-    /// The targeted placement holds an identity its source holds twice, so
-    /// which copy the edit belongs to cannot be decided. Nothing is staged:
-    /// the source has to hold the identity once again first.
+    /// The targeted placement holds an identity its source holds twice,
+    /// so which copy the edit belongs to cannot be decided. Nothing is
+    /// staged until the source holds the identity once again.
     #[error("Replica MUTATE failed: ambiguous identity at handle {0}")]
     Ambiguous(String),
     /// The driver broke the coroutine contract.
@@ -183,16 +183,17 @@ impl ReplicaMutate {
         }
     }
 
-    /// Stages the writes for the mutation given its loaded source placement.
-    /// Flag sets and removes rewrite the source in place; a copy leaves the
-    /// source untouched and stages a pending create in the target.
+    /// Stages the writes for the mutation given its loaded source
+    /// placement. Flag sets and removes rewrite the source in place; a
+    /// copy leaves it untouched and stages a pending create in the
+    /// target.
     fn writes(&self, mut source: ReplicaPlacement) -> Vec<ReplicaWriteOp> {
         match &self.mutation {
             ReplicaMutation::SetFlags { flags, .. } => {
                 source.flags = flags.clone();
-                // NOTE: a pending create stays a create and an unresolved
-                // content conflict stays a conflict (its resolution is an
-                // edit); the flag change rides along either way.
+                // NOTE: a pending create stays a create and an
+                // unresolved conflict stays a conflict, its resolution
+                // being an edit; the flag change rides along either way.
                 if source.status == ReplicaStatus::Clean {
                     source.status = ReplicaStatus::Dirty;
                 }
@@ -253,21 +254,17 @@ impl ReplicaMutate {
                 placeholder,
                 ..
             } => {
-                // NOTE: a move is staged twice over, and whichever half
-                // reaches the server first is the one that delivers: the
-                // target's create (a server-side copy, or an upload when
-                // the origin is gone) and the source's remove (a
-                // server-side move, since the tombstone carries the
-                // destination). Both carry the link id, so the second half
-                // recognises what the first already did instead of
-                // delivering a second copy — the same at-least-once
+                // NOTE: a move is staged twice over and whichever half
+                // reaches the server first delivers: the target's create
+                // and the source's remove. Both carry the link id, so
+                // the second half recognises what the first did instead
+                // of delivering a second copy, the same at-least-once
                 // discipline `ReplicaChange` states for a retried add.
                 //
-                // An item whose link id is not resolved yet has no such
-                // key, and no create is staged for it: the relocation
-                // delivers it alone, and the target picks it up on its
-                // next enumerate. Staging both halves blind is what
-                // delivers two copies.
+                // An item whose link id is unresolved has no such key,
+                // so no create is staged: the relocation delivers it
+                // alone and the target picks it up on its next
+                // enumerate.
                 let create = source
                     .link_id
                     .is_some()
@@ -285,7 +282,6 @@ impl ReplicaMutate {
                     .chain([ReplicaWriteOp::UpsertPlacement(source)])
                     .collect()
             }
-            // NOTE: Add reads no source; it is staged via `create_writes`.
             ReplicaMutation::Add { .. } => self.create_writes(),
         }
     }
@@ -320,9 +316,10 @@ impl ReplicaMutate {
         }
     }
 
-    /// Stages the writes for an [`Add`](ReplicaMutation::Add): a locally-authored
-    /// `Created` placement with no base and no origin (so the next sync appends
-    /// it, uploading the body, rather than server-copying), plus its object.
+    /// Stages the writes for an [`Add`](ReplicaMutation::Add): a
+    /// locally-authored `Created` placement with no base and no origin,
+    /// so the next sync appends it rather than server-copying, plus its
+    /// object.
     fn create_writes(&self) -> Vec<ReplicaWriteOp> {
         let ReplicaMutation::Add {
             handle,
@@ -381,8 +378,8 @@ impl ReplicaCoroutine for ReplicaMutate {
             }
             (State::PendingLoad, Some(ReplicaArg::Load(loaded))) => {
                 let ops = if let ReplicaMutation::Add { link_id, .. } = &self.mutation {
-                    // NOTE: no source to read; guard against re-creating a
-                    // live item.
+                    // NOTE: no source to read, so guard against
+                    // re-creating a live item.
                     let collides = loaded.placements.iter().any(|p| {
                         p.status != ReplicaStatus::Tombstone && p.link_id.as_ref() == Some(link_id)
                     });
@@ -402,11 +399,10 @@ impl ReplicaCoroutine for ReplicaMutate {
                         let err = ReplicaMutateError::UnknownHandle(handle.as_str().into());
                         return ReplicaCoroutineState::Complete(Err(err));
                     };
-                    // NOTE: the source holds this identity more than once, so
-                    // which copy the edit belongs to cannot be decided.
-                    // Staging it anyway would attach the change to whichever
-                    // copy happens to be bound, and the sync would then push
-                    // it as if it were the only one.
+                    // NOTE: the source holds this identity more than
+                    // once, so staging the edit would attach it to
+                    // whichever copy happens to be bound and the sync
+                    // would push it as if it were the only one.
                     if placement.status == ReplicaStatus::Ambiguous {
                         let err = ReplicaMutateError::Ambiguous(handle.as_str().into());
                         return ReplicaCoroutineState::Complete(Err(err));
@@ -422,8 +418,8 @@ impl ReplicaCoroutine for ReplicaMutate {
             }
             (State::PendingWrite, Some(ReplicaArg::Write)) => {
                 debug!("local change written");
-                // NOTE: a completed coroutine stays completed; resuming one
-                // is a driver bug, not an empty success.
+                // NOTE: a completed coroutine stays completed: resuming
+                // one is a driver bug, not an empty success.
                 self.state = State::Done;
                 ReplicaCoroutineState::Complete(Ok(()))
             }
@@ -502,9 +498,8 @@ mod tests {
 
     #[test]
     fn set_flags_on_a_conflicted_placement_keeps_the_conflict() {
-        // The flag edit rides along; the content conflict stays unresolved
-        // (its resolution is an edit), so the sync never mistakes the
-        // placement for a plain dirty one.
+        // the flag edit rides along while the conflict stays unresolved,
+        // so the sync never mistakes the placement for a plain dirty one
         let mutation = ReplicaMutation::SetFlags {
             handle: ReplicaHandle::from("1"),
             flags: ReplicaFlags::from_iter(["seen"]),
@@ -530,8 +525,8 @@ mod tests {
 
     #[test]
     fn set_flags_on_a_created_placement_stays_created() {
-        // A pending create keeps its status, else the sync would never
-        // push the add.
+        // a pending create keeps its status, else the sync would never
+        // push the add
         let mutation = ReplicaMutation::SetFlags {
             handle: ReplicaHandle::from("1"),
             flags: ReplicaFlags::from_iter(["seen"]),
@@ -586,9 +581,8 @@ mod tests {
 
     #[test]
     fn add_stages_an_append_create() {
-        // A locally-authored item stages a Created placement with no base and
-        // no origin, plus its body — the shape the sync pushes as an append
-        // (uploading the body), not a server-side copy.
+        // no base and no origin, which is the shape the sync pushes as
+        // an append rather than a server-side copy
         use crate::object::{ReplicaHash, ReplicaObject};
 
         let mutation = ReplicaMutation::Add {
@@ -606,8 +600,8 @@ mod tests {
         let mut mutate = ReplicaMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
 
-        // Add reads no source, but still loads to guard collisions; the loaded
-        // item is unrelated (no link id), so no collision.
+        // Add reads no source but still loads to guard collisions, and
+        // the loaded item carries no link id
         let ops = match mutate.resume(Some(ReplicaArg::Load(loaded("other")))) {
             ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
             state => panic!("expected WantsWrite, got {state:?}"),
@@ -649,7 +643,7 @@ mod tests {
         let mut mutate = ReplicaMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
 
-        // A live placement already holds mid:dup.
+        // a live placement already holds mid:dup
         let mut loaded = loaded("existing");
         loaded.placements[0].link_id = Some(ReplicaLinkId("mid:dup".into()));
 
@@ -663,8 +657,8 @@ mod tests {
 
     #[test]
     fn add_over_a_tombstone_link_id_is_allowed() {
-        // A tombstoned item with the same link id does not block a re-create
-        // (the delete is in flight; the new item supersedes it).
+        // the delete is in flight and the new item supersedes it, so a
+        // tombstone does not block a re-create
         use crate::object::{ReplicaHash, ReplicaObject};
 
         let mutation = ReplicaMutation::Add {
@@ -719,7 +713,7 @@ mod tests {
         }
     }
 
-    /// An empty success is indistinguishable from a run that genuinely did
+    /// An empty success is indistinguishable from a run that did
     /// nothing, so a driver resuming a finished coroutine must be told.
     #[test]
     fn a_completed_mutate_does_not_resume() {
@@ -753,9 +747,8 @@ mod tests {
 
     #[test]
     fn edit_stages_a_dirty_body() {
-        // An edit stores the new object, repoints the placement at it at
-        // full level and marks it dirty; the base keeps the synced state so
-        // the next sync derives the push.
+        // the base keeps the synced state, so the next sync derives the
+        // push
         use crate::object::{ReplicaHash, ReplicaObject};
 
         let mutation = ReplicaMutation::Edit {
@@ -790,8 +783,8 @@ mod tests {
 
     #[test]
     fn edit_refreshes_the_projected_meta() {
-        // A consumer that projects a fresh summary from the edited body
-        // passes it along; the cached one is replaced.
+        // a consumer projecting a fresh summary from the edited body
+        // replaces the cached one
         use crate::object::{ReplicaHash, ReplicaObject};
 
         let mutation = ReplicaMutation::Edit {
@@ -819,9 +812,8 @@ mod tests {
 
     #[test]
     fn edit_resolves_a_conflict() {
-        // Editing a conflicted placement is its resolution: the base adopts
-        // the remote revision observed at conflict time, so the resolving
-        // push is gated on the remote state the merge was made against.
+        // the base adopts the remote revision observed at conflict time,
+        // gating the resolving push on the state it was merged against
         use crate::object::{ReplicaHash, ReplicaObject};
 
         let mutation = ReplicaMutation::Edit {
@@ -857,8 +849,8 @@ mod tests {
 
     #[test]
     fn copy_stages_created_placement_in_target() {
-        // A copy leaves the source untouched and stages a Created placement
-        // in the target under the placeholder, carrying its origin.
+        // the staged create carries the origin, so the push is a
+        // server-side copy
         let mutation = ReplicaMutation::Copy {
             handle: ReplicaHandle::from("1"),
             target: "archive".into(),
@@ -885,9 +877,7 @@ mod tests {
 
     #[test]
     fn move_stages_target_create_and_source_tombstone() {
-        // A move stages a Created placement in the target (carrying the source
-        // origin) and tombstones the source, so the sync copies into the target
-        // and removes from the source.
+        // the target's half copies and the source's half removes
         let mutation = ReplicaMutation::Move {
             handle: ReplicaHandle::from("1"),
             target: "archive".into(),
@@ -940,9 +930,9 @@ mod tests {
 
     #[test]
     fn a_mutation_reads_only_what_it_edits() {
-        // The collection is not the unit of a local edit: a mutation
-        // touches one row, and an Add only has to see the rows that could
-        // collide with its link id.
+        // the collection is not the unit of a local edit: a mutation
+        // touches one row, and an Add only sees the rows that could
+        // collide with its link id
         let mut mutate = ReplicaMutate::new("inbox", ReplicaMutation::Remove("7".into()));
         match mutate.resume(None) {
             ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad { scope, .. }) => {
@@ -980,9 +970,8 @@ mod tests {
 
     #[test]
     fn a_move_of_an_unlinked_item_stages_the_relocation_alone() {
-        // With no link id there is no key for either half to recognise
-        // what the other did, so only the source-side relocation is
-        // staged; staging both blind is what delivers two copies.
+        // with no link id neither half can recognise what the other did,
+        // so only the source-side relocation is staged
         let mut source = loaded("1");
         source.placements[0].link_id = None;
 

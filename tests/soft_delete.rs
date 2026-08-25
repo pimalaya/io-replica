@@ -1,12 +1,13 @@
 //! Reference: soft-delete retention at the storage seam.
 //!
-//! A remote delete reaches the consumer as a [`ReplicaWriteOp::DropPlacement`].
-//! A backup storage MAY treat that drop as a soft-delete — retain the row,
-//! marked removed-upstream, and hide it from `load` — instead of a hard delete.
-//! Because the merge only ever sees what `load` returns, hiding the row keeps
-//! the engine from re-deriving against it, so the retained copy survives every
-//! later sync (delta or full). This proves the retention decision lives in the
-//! storage, with no merge-core change.
+//! A remote delete reaches the consumer as a
+//! [`ReplicaWriteOp::DropPlacement`]. A backup storage MAY treat that
+//! drop as a soft-delete, retaining the row marked removed-upstream and
+//! hiding it from `load`, rather than a hard delete. The merge only sees
+//! what `load` returns, so hiding the row keeps the engine from
+//! re-deriving against it and the retained copy survives every later
+//! sync: the retention decision lives in the storage, with no merge-core
+//! change.
 
 // NOTE: shared across test targets; this one uses only the remote helpers
 #[allow(dead_code)]
@@ -29,8 +30,8 @@ use io_replica::{
 
 use crate::common::MemRemote;
 
-/// A storage whose `DropPlacement` soft-deletes: the row is retained and marked
-/// hidden, and `load` skips hidden rows.
+/// A storage whose `DropPlacement` soft-deletes: the row is retained and
+/// marked hidden, and `load` skips hidden rows.
 #[derive(Default)]
 struct SoftDeleteStorage {
     placements: BTreeMap<(ReplicaCollectionId, ReplicaHandle), ReplicaPlacement>,
@@ -95,7 +96,8 @@ impl ReplicaStorage for SoftDeleteStorage {
                 ReplicaWriteOp::DropPlacement {
                     collection, handle, ..
                 } => {
-                    // NOTE: retain the row and hide it, rather than remove it.
+                    // NOTE: retain the row and hide it rather than remove
+                    // it.
                     self.hidden.insert((collection, handle));
                 }
                 ReplicaWriteOp::StoreObject { object, body } => {
@@ -127,12 +129,12 @@ fn soft_delete_retains_and_hides_a_remote_expunge() {
         .unwrap();
     assert_eq!(loaded.placements.len(), 1, "the item is pulled");
 
-    // The source expunges the item.
+    // the source expunges the item
     client.remote_mut().remove("inbox", "1");
     let report = client.sync("inbox", ReplicaSyncOptions::default()).unwrap();
     assert_eq!(report.pulled, 1, "the vanish is observed");
 
-    // The row is retained for restore, but hidden from the offline view.
+    // the row is retained for restore, but hidden from the offline view
     let loaded = client
         .storage()
         .load(&"inbox".into(), &ReplicaLoadScope::All)
@@ -143,7 +145,7 @@ fn soft_delete_retains_and_hides_a_remote_expunge() {
         "the copy is kept for restore",
     );
 
-    // A later sync (delta or full) must not re-derive against the hidden row.
+    // a later sync must not re-derive against the hidden row
     let delta = client.sync("inbox", ReplicaSyncOptions::default()).unwrap();
     assert_eq!(delta, ReplicaSyncReport::default(), "quiescent delta sync");
     let full = client

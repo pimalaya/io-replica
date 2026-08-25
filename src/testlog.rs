@@ -1,5 +1,5 @@
-//! Test-only logger, so debug! and trace! arguments are evaluated and
-//! formatted (and counted by coverage) while the tests run.
+//! Test-only logger, so debug! and trace! arguments are evaluated,
+//! formatted and counted by coverage while the tests run.
 
 use alloc::string::ToString;
 
@@ -13,7 +13,6 @@ impl Log for SinkLogger {
     }
 
     fn log(&self, record: &Record) {
-        // format the record (running every Display impl) and discard it
         let _ = record.args().to_string();
     }
 

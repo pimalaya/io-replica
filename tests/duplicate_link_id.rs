@@ -1,10 +1,10 @@
 //! An identity one collection holds twice is frozen, never guessed.
 //!
-//! A placement is identified by its collection and link id, and a source binds
-//! it with one handle, so a second copy of one identity has nowhere to live.
-//! The reproduction these tests encode: the engine paired one copy, the other
-//! stayed invisible, and deleting the bound one propagated a delete that
-//! removed the only copy on a side the user never touched.
+//! A placement is identified by its collection and link id, and a source
+//! binds it with one handle, so a second copy of one identity has nowhere
+//! to live. Pairing one copy and leaving the other invisible makes a
+//! delete of the bound one propagate and remove the only copy on a side
+//! the user never touched.
 
 // NOTE: shared across test targets; not every target uses every helper
 #[allow(dead_code)]
@@ -83,8 +83,8 @@ fn a_second_copy_is_recorded_rather_than_linked() {
 
 #[test]
 fn an_ambiguous_placement_is_never_deleted_by_a_vanish() {
-    // The reproduction's step 2: deleting the bound copy propagated a delete
-    // and removed the only copy on a side the user never touched.
+    // deleting the bound copy must not propagate a delete that removes
+    // the only copy on the other side
     let mut client = twin_client();
     let opts = ReplicaSyncOptions::default();
     client.sync("inbox", opts).unwrap();
@@ -131,7 +131,8 @@ fn resolving_the_duplicate_resumes_the_sync() {
     hydrate(&mut client);
     assert_eq!(ambiguous(&client), ["u1"]);
 
-    // the user deletes the duplicate: the source now holds the identity once
+    // the user deletes the duplicate, so the source holds the identity
+    // once again
     client.remote_mut().remove("inbox", "u2");
     client.sync("inbox", opts).unwrap();
 
@@ -169,9 +170,9 @@ fn a_mutation_against_an_ambiguous_placement_is_refused() {
 
 #[test]
 fn the_freeze_survives_a_run_that_never_mentions_the_twin() {
-    // The reproduction's step 3: with an incremental enumeration the twin
-    // appears exactly once, in the run that discovers it. A freeze that is
-    // not persisted forgets, and the item goes back to being deletable.
+    // an incremental enumeration mentions the twin exactly once, in the
+    // run that discovers it, so an unpersisted freeze forgets and the
+    // item goes back to being deletable
     let mut client = twin_client();
     let opts = ReplicaSyncOptions::default();
     client.sync("inbox", opts).unwrap();
@@ -199,13 +200,11 @@ fn the_freeze_survives_a_run_that_never_mentions_the_twin() {
 ///
 /// Refusing to guess costs the frozen item its sync and must cost nothing
 /// else: the run carries on over the rest of the collection, in both
-/// directions, and the duplicate is a warning the user acts on rather than a
-/// halt they have to clear before anything else moves.
+/// directions, and the duplicate is a warning rather than a halt.
 ///
-/// This is what makes the freeze an acceptable answer at all. A rule that
-/// derives nothing is only safe while the "nothing" is scoped; the same rule
-/// applied a batch or a collection wide would strand a mailbox on one double
-/// delivery, which is a worse outcome than the mispairing it exists to prevent.
+/// A rule that derives nothing is only safe while the nothing is scoped:
+/// applied a batch or a collection wide it would strand a mailbox on one
+/// double delivery, a worse outcome than the mispairing it prevents.
 #[test]
 fn a_frozen_item_does_not_stop_the_collection() {
     let mut client = twin_client();
@@ -224,8 +223,8 @@ fn a_frozen_item_does_not_stop_the_collection() {
     hydrate(&mut client);
     assert_eq!(ambiguous(&client), ["u1"], "the twins froze");
 
-    // remote changes on both axes, one touching the frozen identity and one
-    // the neighbour
+    // remote changes on both axes, one touching the frozen identity and
+    // one the neighbour
     client.remote_mut().set_flags("inbox", "u1", &["seen"]);
     client.remote_mut().set_flags("inbox", "u3", &["seen"]);
     let report = client.sync("inbox", opts).unwrap();

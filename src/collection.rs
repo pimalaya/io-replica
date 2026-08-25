@@ -10,8 +10,8 @@ crate::replica_id! {
 
 /// An opaque per-collection sync token.
 ///
-/// A QRESYNC pack, a JMAP state string, or a WebDAV sync-token; the engine
-/// never inspects it, it only round-trips it between storage and remote.
+/// A QRESYNC pack, a JMAP state string or a WebDAV sync-token, never
+/// inspected by the engine, only round-tripped between the two seams.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ReplicaCheckpoint(pub Vec<u8>);
 

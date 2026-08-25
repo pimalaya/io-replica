@@ -2,12 +2,12 @@
 //!
 //! `ReplicaHub::project` and `absorb` are covered in the crate over
 //! hand-built writes, so what has never run is the loop they exist for:
-//! project a source's view, let a real sync merge and push it, absorb what
-//! that sync wrote, project again. Convergence lives in that loop, not in
+//! project a source's view, let a real sync merge and push it, absorb
+//! what it wrote, project again. Convergence lives in that loop, not in
 //! either half.
 //!
 //! One `HubStore` stands for the shared storage; each source gets a
-//! `SourceStore` view of it and its own remote, which is exactly how a
+//! `SourceStore` view of it and its own remote, which is how a
 //! multi-source consumer wires it.
 
 // NOTE: shared across test targets; not every target uses every helper
@@ -33,11 +33,11 @@ use crate::common::{MemRemote, MemStorage};
 /// The shared store behind every source: one hub, one object store, and a
 /// checkpoint per source.
 ///
-/// `residual` is not decoration. The hub keys items by link id and
-/// `absorb` drops a placement that has none, which every row a sync pulls
-/// is: an enumeration yields handles, and the link id lands on the first
-/// meta fetch. A hub-backed store therefore has to hold those rows itself
-/// until they are hubbed, which is what io-pimdir's residual list is.
+/// The hub keys items by link id and `absorb` drops a placement with
+/// none, which every row a sync pulls is: an enumeration yields handles,
+/// and the link id lands on the first meta fetch. A hub-backed store has
+/// to hold those rows itself until they are hubbed, which is what
+/// `residual` and io-pimdir's residual list are.
 #[derive(Default)]
 struct HubStore {
     hub: ReplicaHub,
@@ -48,8 +48,8 @@ struct HubStore {
 }
 
 /// One source's view of the shared store, which is what the engine syncs
-/// against: a load projects the hub for this source, a write absorbs back
-/// into it.
+/// against: a load projects the hub for this source, a write absorbs
+/// back into it.
 struct SourceStore {
     source: ReplicaSourceId,
     shared: Rc<RefCell<HubStore>>,
@@ -117,8 +117,8 @@ impl ReplicaStorage for SourceStore {
                     let key = (self.source.clone(), collection.clone());
                     shared.checkpoints.insert(key, checkpoint.clone());
                 }
-                // NOTE: a row the hub cannot key is held here until a link
-                // id hubs it; one it can is the hub's, so it leaves.
+                // NOTE: a row the hub cannot key is held here until a
+                // link id hubs it; one it can is the hub's.
                 ReplicaWriteOp::UpsertPlacement(placement) => {
                     let key = (self.source.clone(), placement.handle.clone());
                     match placement.link_id.is_some() {
@@ -161,13 +161,12 @@ impl Mirror {
         }
     }
 
-    /// Syncs and hydrates both sources until the hub stops changing, which
-    /// is what a mirroring consumer's scheduler does and where convergence
-    /// has to show up.
+    /// Syncs and hydrates both sources until the hub stops changing,
+    /// which is what a mirroring consumer's scheduler does.
     ///
-    /// Hydration is not optional here: a pulled row carries no link id, so
-    /// the hub cannot key it, and a body the hub does not hold is a member
-    /// it cannot offer another source. A mirror is a sync plus an upgrade.
+    /// Hydration is not optional: a pulled row carries no link id, so the
+    /// hub cannot key it, and a body the hub does not hold is a member it
+    /// cannot offer another source. A mirror is a sync plus an upgrade.
     fn quiesce(&mut self, opts: ReplicaSyncOptions) {
         for round in 0..8 {
             let before = self.shared.borrow().hub.clone();
@@ -244,8 +243,8 @@ impl Mirror {
     }
 }
 
-/// The loop the hub exists for: a member only one source holds is offered to
-/// the other, appended there, and absorbed back as one shared item.
+/// The loop the hub exists for: a member only one source holds is offered
+/// to the other, appended there, and absorbed back as one shared item.
 #[test]
 fn a_member_one_source_holds_is_mirrored_to_the_other() {
     let mut mirror = Mirror::new();
@@ -317,7 +316,7 @@ fn a_delete_propagates_across_sources() {
 }
 
 /// A source refusing removes holds its copy, and under `Keep` that is all
-/// it does: the deletion stands for every source that did take it.
+/// it does: the deletion stands for every source that took it.
 #[test]
 fn a_source_refusing_removes_holds_its_copy_under_keep() {
     let mut mirror = Mirror::new();
@@ -360,13 +359,13 @@ fn a_source_refusing_removes_holds_its_copy_under_keep() {
 }
 
 /// The same scenario under the default `Revert` policy, which is not the
-/// same answer: b's revert reads as add-beats-delete across sources, so the
-/// item is alive again and the hub mirrors it back to the source that
+/// same answer: b's revert reads as add-beats-delete across sources, so
+/// the item is alive again and the hub mirrors it back to the source that
 /// deleted it.
 ///
 /// A hub-bound source wants `Keep`. This is pinned rather than fixed
-/// because both readings are coherent: reverting says "this source still
-/// holds it", and through a hub that *is* a statement about the item.
+/// because both readings are coherent: reverting says the source still
+/// holds it, and through a hub that is a statement about the item.
 #[test]
 fn a_reverted_delete_resurrects_the_item_across_the_hub() {
     let mut mirror = Mirror::new();
@@ -432,8 +431,8 @@ fn a_read_only_source_receives_nothing_it_cannot_push() {
     );
 }
 
-/// A pending create the hub offers is staged, not silently taken as
-/// present: until a source's own sync pushes it, its projection says so.
+/// A pending create the hub offers is staged, not taken as present: until
+/// a source's own sync pushes it, its projection says so.
 #[test]
 fn an_offered_member_reads_as_a_pending_create_until_pushed() {
     let mut mirror = Mirror::new();
@@ -468,7 +467,7 @@ fn an_offered_member_reads_as_a_pending_create_until_pushed() {
     );
 }
 
-/// The storage the other tests lean on behaves like the plain one for a
+/// The storage the other tests lean on behaves like a plain one for a
 /// single source, so a difference in the hub tests is the hub's.
 #[test]
 fn one_source_over_the_hub_matches_the_plain_store() {

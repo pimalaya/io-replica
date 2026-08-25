@@ -21,8 +21,8 @@ use io_replica::{
 use crate::common::{MemRemote, MemStorage};
 
 /// A storage that counts the write batches it is handed and drops the one
-/// at `crash_at`, which is what a crash between a serviced push and its
-/// recording write looks like from inside a run.
+/// at `crash_at`: what a crash between a serviced push and its recording
+/// write looks like from inside a run.
 struct CrashyStorage {
     inner: MemStorage,
     batches: usize,
@@ -59,8 +59,8 @@ impl ReplicaStorage for CrashyStorage {
     }
 }
 
-/// One more member than a chunk and a half holds, so a run over them
-/// derives a full chunk plus a partial one.
+/// One more member than a chunk and a half, so a run over them derives a
+/// full chunk plus a partial one.
 const EXTRA: usize = 3;
 const MEMBERS: usize = ReplicaSync::PUSH_CHUNK + EXTRA;
 
@@ -147,7 +147,7 @@ fn a_lost_write_costs_its_own_chunk_only() {
         .expect_err("the second chunk's write is lost");
 
     // the first chunk was recorded before the second was pushed, so only
-    // the second is still pending: the crash window is one chunk.
+    // the second is still pending
     for index in 0..ReplicaSync::PUSH_CHUNK {
         assert_eq!(status(&client, index), ReplicaStatus::Clean, "chunk 1 lost");
     }
@@ -155,7 +155,7 @@ fn a_lost_write_costs_its_own_chunk_only() {
         assert_eq!(status(&client, index), ReplicaStatus::Dirty, "chunk 2 kept");
     }
 
-    // and the replica still converges: nothing was lost on either side.
+    // and the replica still converges
     client.storage_mut().crash_at = None;
     client.sync("inbox", ReplicaSyncOptions::default()).unwrap();
     for index in 0..MEMBERS {

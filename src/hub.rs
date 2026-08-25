@@ -1,15 +1,15 @@
 //! Multi-source hub: shared content with a base per source.
 //!
 //! One logical item can live on several sources (a `left` and a `right`
-//! server, a server and a phone). The hub holds that item's current content
-//! once, plus a last-synced base per source, so a storage that wraps it can
-//! [`project`] a per-source placement and [`absorb`] the engine's writes
-//! back. Because a projected placement carries the shared content against the
-//! source's own base, a change another source folded into the hub reads as
-//! locally dirty for this source and the engine's ordinary reconcile pushes
-//! it: propagation falls out of the per-source merge, with no cross-merge and
-//! no merge-core change. The hub propagates adds, flags, deletes, and resolves
-//! cross-source content conflicts by policy.
+//! server, a server and a phone). The hub holds that item's current
+//! content once, plus a last-synced base per source, so a storage
+//! wrapping it can [`project`] a per-source placement and [`absorb`] the
+//! engine's writes back. A projected placement carries the shared
+//! content against the source's own base, so a change another source
+//! folded in reads as locally dirty here and the ordinary reconcile
+//! pushes it: propagation falls out of the per-source merge, with no
+//! cross-merge. Adds, flags and deletes propagate the same way;
+//! cross-source content conflicts resolve by policy.
 //!
 //! [`project`]: ReplicaHub::project
 //! [`absorb`]: ReplicaHub::absorb
@@ -40,39 +40,39 @@ pub struct ReplicaSourceBinding {
     pub handle: ReplicaHandle,
     /// The last state synced with this source; `None` until first reconciled.
     pub base: Option<ReplicaBase>,
-    /// Set when *this source* and its own remote diverged and the merge left
-    /// the placement [`ReplicaStatus::Conflict`].
+    /// Set when this source and its own remote diverged and the merge
+    /// left the placement [`ReplicaStatus::Conflict`].
     ///
-    /// Distinct from [`ReplicaHubItem::conflicted`], the **cross-source**
-    /// conflict (two sources edited the shared body differently). A two-source
-    /// store needs both, independently: one says "left and its server
-    /// disagree", the other "left and right disagree". Cleared by an upsert of
-    /// any other status, so a consumer resolving the conflict with an edit
-    /// needs no explicit resolution call.
+    /// Distinct from [`ReplicaHubItem::conflicted`], the cross-source
+    /// conflict: one says left and its server disagree, the other left
+    /// and right disagree, and a two-source store needs both. Cleared by
+    /// an upsert of any other status, so a consumer resolving with an
+    /// edit needs no explicit resolution call.
     pub conflicted: bool,
-    /// The remote revision observed when this binding was marked conflicted —
-    /// what a resolver fetches and merges against. `None` when not conflicted,
-    /// or when the remote reports no revision.
+    /// The remote revision observed when this binding was marked
+    /// conflicted, what a resolver fetches and merges against. `None`
+    /// when not conflicted, or when the remote reports no revision.
     pub conflict_revision: Option<String>,
-    /// The other handles *this source* holds the item's identity under, empty
-    /// in the ordinary case.
+    /// The other handles this source holds the item's identity under,
+    /// empty in the ordinary case.
     ///
-    /// The identity-axis twin of [`conflicted`](Self::conflicted), and per
-    /// source for the same reason: in a two-sided store one side may hold the
-    /// duplicate and the other not. A binding carrying any projects
-    /// [`ReplicaStatus::Ambiguous`], which the engine derives nothing for.
+    /// The identity-axis twin of [`conflicted`](Self::conflicted), and
+    /// per source for the same reason: one side may hold the duplicate
+    /// and the other not. A binding carrying any projects
+    /// [`ReplicaStatus::Ambiguous`], which the engine derives nothing
+    /// for.
     pub ambiguous_handles: Vec<ReplicaHandle>,
 }
 
-/// How the hub resolves a cross-source content conflict — both sources edited
-/// the same item's body to different values since they last agreed.
+/// How the hub resolves a cross-source content conflict, both sources
+/// having edited the same body since they last agreed.
 ///
 /// Flags never reach this: they merge element-wise. Only mutable-content
 /// backends conflict; immutable ones mint a new link id per body.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ReplicaHubConflict {
-    /// Flag the item conflicted and record the diverging body for the consumer
-    /// to resolve; keep the already-shared body, so nothing is lost.
+    /// Flag the item conflicted and record the diverging body for the
+    /// consumer to resolve, keeping the shared body so nothing is lost.
     #[default]
     Manual,
     /// Last-writer-wins: adopt the incoming body, overwriting the shared one.
@@ -93,12 +93,14 @@ pub struct ReplicaHubItem {
     pub meta: Option<ReplicaMeta>,
     /// The current sort key, shared by every source; empty until derived.
     pub sort_key: ReplicaSortKey,
-    /// The highest detail level any source has reached, which is the item's
-    /// own only while it holds a body ([`stored_level`](Self::stored_level)).
+    /// The highest detail level any source has reached, which is the
+    /// item's own only while it holds a body
+    /// ([`stored_level`](Self::stored_level)).
     pub level: ReplicaLevel,
-    /// Set once a source removed the item: the delete propagates to every
-    /// source still holding it, and it is never copied to one that lacks it. A
-    /// later live upsert clears it (edit- and add-beats-delete across sources).
+    /// Set once a source removed the item: the delete propagates to
+    /// every source still holding it, and it is never copied to one that
+    /// lacks it. A later live upsert clears it, edit and add beating
+    /// delete across sources.
     pub deleted: bool,
     /// Set when a cross-source content conflict was left unresolved (the
     /// `Manual` policy); the diverging body is in `conflict_object`.
@@ -111,14 +113,14 @@ pub struct ReplicaHubItem {
 }
 
 impl ReplicaHubItem {
-    /// The detail level the item can honestly claim: [`Full`] means a stored
-    /// body, so an item holding none reads one rung down however far a source
-    /// got.
+    /// The detail level the item can honestly claim: [`Full`] means a
+    /// stored body, so an item holding none reads one rung down however
+    /// far a source got.
     ///
-    /// [`level`](Self::level) is the high-water mark across sources, and only
-    /// [`object`](Self::object) says whether the body is there. Reading the
-    /// mark as the fact strands an item a content change refreshed, an upgrade
-    /// skipping whatever already reads as [`Full`].
+    /// [`level`](Self::level) is the high-water mark across sources, and
+    /// only [`object`](Self::object) says whether the body is there.
+    /// Reading the mark as the fact strands an item a content change
+    /// refreshed, an upgrade skipping whatever reads as [`Full`].
     ///
     /// [`Full`]: ReplicaLevel::Full
     pub fn stored_level(&self) -> ReplicaLevel {
@@ -130,12 +132,10 @@ impl ReplicaHubItem {
 
     /// The placement this item projects into `collection` under `handle`.
     ///
-    /// The shared half of a projection, which is the same for every source:
-    /// the content the hub holds, at the level it can honestly claim. What a
-    /// source's binding decides (the status it reads as, its base, its
-    /// conflict revision, the handles it cannot resolve) is settled by the
-    /// caller, so the three projections state their differences and nothing
-    /// else.
+    /// The shared half of a projection, the same for every source: the
+    /// content the hub holds, at the level it can honestly claim. What a
+    /// binding decides (status, base, conflict revision, unresolved
+    /// handles) is settled by the caller.
     fn project(
         &self,
         collection: &ReplicaCollectionId,
@@ -161,10 +161,10 @@ impl ReplicaHubItem {
 
     /// Whether any source holds this identity under more than one handle.
     ///
-    /// Per-source state read across the item, because the two rules it gates
-    /// are cross-source: an identity one source cannot resolve is neither
-    /// offered to a source that lacks it, nor deleted everywhere on the word
-    /// of the source that cannot resolve it.
+    /// Per-source state read across the item, because the two rules it
+    /// gates are cross-source: an identity one source cannot resolve is
+    /// neither offered to a source that lacks it, nor deleted everywhere
+    /// on that source's word.
     pub fn is_ambiguous(&self) -> bool {
         self.sources
             .values()
@@ -184,14 +184,14 @@ pub struct ReplicaHub {
 impl ReplicaHub {
     /// Projects the per-source placements a source's `load` should return.
     ///
-    /// Each item bound to `source` yields a placement at the hub's shared
-    /// content but the source's own base, so a hub change the source has not
-    /// seen reads as dirty and the engine pushes it. Each item the source
-    /// lacks, whose body the hub already holds, yields a `Created` append
-    /// (membership propagation). Never raises the level, so a two-source sync
-    /// of in-agreement items fetches zero bodies, and projects the
-    /// [`stored_level`](ReplicaHubItem::stored_level), so an item whose body a
-    /// content change dropped is fetched again.
+    /// Each item bound to `source` yields a placement at the hub's
+    /// shared content but the source's own base, so a hub change the
+    /// source has not seen reads as dirty and the engine pushes it. Each
+    /// item the source lacks, whose body the hub already holds, yields a
+    /// `Created` append. The level is never raised, so a two-source sync
+    /// of in-agreement items fetches zero bodies, and the projected
+    /// [`stored_level`](ReplicaHubItem::stored_level) makes an item whose
+    /// body a content change dropped fetch again.
     pub fn project(
         &self,
         collection: &ReplicaCollectionId,
@@ -201,9 +201,8 @@ impl ReplicaHub {
 
         for (link, item) in &self.items {
             match (item.deleted, item.sources.get(source)) {
-                // NOTE: deleted upstream, still held here — push the delete
-                // to this source. Held nowhere here, or deleted: nothing to
-                // project.
+                // NOTE: deleted elsewhere but still held here, so this
+                // source gets the delete pushed to it.
                 (true, Some(binding)) => {
                     out.push(self.tombstone_placement(collection, link, item, binding));
                 }
@@ -211,10 +210,10 @@ impl ReplicaHub {
                 (false, Some(binding)) => {
                     out.push(self.bound_placement(collection, link, item, binding));
                 }
-                // NOTE: an identity some source holds twice is not offered to
-                // one that lacks it: the engine cannot say which copy the
-                // append would be, and appending a copy it cannot account for
-                // is how a duplicate spreads.
+                // NOTE: an identity some source holds twice is not
+                // offered to one that lacks it: the engine cannot say
+                // which copy the append would be, and that is how a
+                // duplicate spreads.
                 (false, None) if item.is_ambiguous() => {}
                 (false, None) => {
                     if let Some(created) = self.created_placement(collection, link, item) {
@@ -240,21 +239,20 @@ impl ReplicaHub {
             .as_ref()
             .is_some_and(|b| b.flags == item.flags && b.object == item.object);
         let status = if !binding.ambiguous_handles.is_empty() {
-            // NOTE: this source holds the identity more than once, so which
-            // copy any change refers to cannot be decided. It outranks every
-            // other reading, including a conflict: the engine derives nothing
-            // for it until the source reports the identity once again.
+            // NOTE: this source holds the identity more than once, so
+            // which copy a change refers to cannot be decided. It
+            // outranks every other reading, conflict included, until the
+            // source reports the identity once again.
             ReplicaStatus::Ambiguous
         } else if binding.conflicted {
-            // NOTE: an unresolved conflict outranks the base comparison. The
-            // merge leaves a conflicted placement alone; downgrading it to
-            // Dirty here would re-derive the push it already rejected, so the
-            // same conflict would be re-marked on every run and never converge.
+            // NOTE: an unresolved conflict outranks the base comparison.
+            // Downgrading it to Dirty would re-derive the push the merge
+            // already rejected, re-marking the same conflict every run
+            // without ever converging.
             ReplicaStatus::Conflict
         } else if in_sync {
             ReplicaStatus::Clean
         } else {
-            // NOTE: the hub diverged from this source's base, so push it.
             ReplicaStatus::Dirty
         };
 
@@ -266,9 +264,9 @@ impl ReplicaHub {
         placement
     }
 
-    /// A `Tombstone` for an item deleted elsewhere but still held here, so the
-    /// source's next sync pushes a `Remove`. The content is kept so the
-    /// engine's edit-beats-delete rule can still resurrect it if the source's
+    /// A `Tombstone` for an item deleted elsewhere but still held here,
+    /// so the source's next sync pushes a `Remove`. The content is kept
+    /// so edit-beats-delete can still resurrect it if the source's
     /// server changed it meanwhile.
     fn tombstone_placement(
         &self,
@@ -283,8 +281,9 @@ impl ReplicaHub {
         placement
     }
 
-    /// A `Created` append for an item missing on this source, staged only when
-    /// the body is already hydrated so it never triggers a fetch.
+    /// A `Created` append for an item missing on this source, staged
+    /// only when the body is already hydrated so it never triggers a
+    /// fetch.
     fn created_placement(
         &self,
         collection: &ReplicaCollectionId,
@@ -298,16 +297,16 @@ impl ReplicaHub {
 
         let mut placement = item.project(collection, link, ReplicaHandle(handle));
         placement.status = ReplicaStatus::Created;
-        // NOTE: the body is there (checked above), so the staged copy claims
-        // it whatever high-water mark the item carries.
+        // NOTE: the body is there, checked above, so the staged copy
+        // claims it whatever high-water mark the item carries.
         placement.level = ReplicaLevel::Full;
         Some(placement)
     }
 
-    /// Folds a source's sync writes back into the hub: an upsert adopts the
-    /// source's reconciled content as the shared content and refreshes that
-    /// source's binding; a drop removes the binding. `StoreObject` and
-    /// `SetCheckpoint` are the wrapping storage's concern and ignored here.
+    /// Folds a source's sync writes back into the hub: an upsert adopts
+    /// the reconciled content as the shared content and refreshes that
+    /// source's binding, a drop removes the binding. `StoreObject` and
+    /// `SetCheckpoint` are the wrapping storage's concern.
     pub fn absorb(&mut self, source: &ReplicaSourceId, writes: &[ReplicaWriteOp]) {
         for op in writes {
             match op {
@@ -319,13 +318,12 @@ impl ReplicaHub {
             }
         }
 
-        // NOTE: prune items no source holds any more.
         self.items.retain(|_, item| !item.sources.is_empty());
     }
 
     fn absorb_upsert(&mut self, source: &ReplicaSourceId, placement: &ReplicaPlacement) {
-        // NOTE: an unlinked placement cannot be shared across sources yet; it
-        // is hubbed once a Meta fetch resolves its link id.
+        // NOTE: an unlinked placement cannot be shared across sources
+        // yet; it is hubbed once a Meta fetch resolves its link id.
         let Some(link) = placement.link_id.clone() else {
             return;
         };
@@ -343,12 +341,11 @@ impl ReplicaHub {
             sources: BTreeMap::new(),
         });
 
-        // NOTE: a `Tombstone`-status upsert is a client-staged delete (a
-        // `Remove`, or a `Move`'s source side): mark the item deleted and keep
-        // this source's binding — its handle and base — so the projection knows
-        // the remote handle to push the remove against. Do not adopt the
-        // tombstone's content or clear the delete; the kept content lets
-        // edit-beats-delete still resurrect it if the source's server changed it.
+        // NOTE: a `Tombstone` upsert is a client-staged delete, so the
+        // binding is kept for the handle the projection pushes the
+        // remove against. Its content is not adopted and the delete not
+        // cleared: the kept content lets edit-beats-delete resurrect it
+        // if the source's server changed it.
         if placement.status == ReplicaStatus::Tombstone {
             item.deleted = true;
             item.sources
@@ -356,25 +353,22 @@ impl ReplicaHub {
             return;
         }
 
-        // NOTE: a live upsert resurrects a cross-source delete in flight
-        // (edit/add beats delete): the item comes back on every source.
+        // NOTE: a live upsert resurrects a cross-source delete in
+        // flight: the item comes back on every source.
         item.deleted = false;
 
-        // NOTE: flags merge element-wise and never conflict; meta and level
-        // adopt unconditionally. An unknown set does not erase a known one,
-        // on the same terms as an absent meta below: a source that has only
-        // probed an item holds no opinion about its markers, and reading that
-        // as "no markers" would clear what another source read.
+        // NOTE: an unknown flag set does not erase a known one: a source
+        // that has only probed an item holds no opinion about its
+        // markers, and reading that as "no markers" would clear what
+        // another source read.
         if !placement.flags.is_unknown() {
             item.flags = placement.flags.clone();
         }
         if placement.meta.is_some() {
             item.meta = placement.meta.clone();
         }
-        // NOTE: an unknown key does not overwrite a known one, on the same
-        // terms as an absent meta. A source that has not derived a key yet
-        // (probed only, or a kind that defines none) must not un-sort an item
-        // another source already placed.
+        // NOTE: same for the sort key: a source that has not derived one
+        // must not un-sort an item another source already placed.
         if !placement.sort_key.is_unknown() {
             item.sort_key = placement.sort_key.clone();
         }
@@ -388,26 +382,24 @@ impl ReplicaHub {
             .insert(source.clone(), Self::binding_of(placement));
     }
 
-    /// The binding an upsert leaves for its source: its handle and base, plus
-    /// whether this source's own sync is stuck on a conflict with its remote.
+    /// The binding an upsert leaves for its source: its handle and base,
+    /// plus whether this source's own sync is stuck on a conflict.
     ///
-    /// Recording the conflict is what makes the round trip faithful: the merge
-    /// leaves an unresolved conflict alone, so a projection that reported it as
-    /// `Dirty` would re-derive the rejected push every run. Any status other
-    /// than `Conflict` clears it, which is how a consumer's resolving edit
-    /// (absorbed as `Dirty`) ends the conflict without a dedicated call.
+    /// Recording the conflict is what makes the round trip faithful: the
+    /// merge leaves an unresolved conflict alone, so a projection
+    /// reporting it as `Dirty` would re-derive the rejected push every
+    /// run. Any other status clears it, which is how a resolving edit
+    /// ends the conflict without a dedicated call.
     fn binding_of(placement: &ReplicaPlacement) -> ReplicaSourceBinding {
         let conflicted = placement.status == ReplicaStatus::Conflict;
         ReplicaSourceBinding {
             handle: placement.handle.clone(),
             base: placement.base.clone(),
             conflicted,
-            // The identity axis travels as data rather than as a status:
-            // a projection reads them back into `Ambiguous`, and an upsert
-            // carrying none is what clears the freeze.
+            // NOTE: the identity axis travels as data rather than as a
+            // status: a projection reads these back into `Ambiguous`,
+            // and an upsert carrying none clears the freeze.
             ambiguous_handles: placement.ambiguous_handles.clone(),
-            // Only meaningful while conflicted; dropping it otherwise keeps a
-            // resolved binding from carrying a stale revision forward.
             conflict_revision: conflicted
                 .then(|| placement.conflict_revision.clone())
                 .flatten(),
@@ -415,8 +407,7 @@ impl ReplicaHub {
     }
 
     /// Reconciles the shared body against an incoming upsert. A clean
-    /// fast-forward (only the source changed since it last agreed) adopts the
-    /// body; a divergence (both moved to different bodies) resolves by policy.
+    /// fast-forward adopts the body; a divergence resolves by policy.
     fn reconcile_content(
         item: &mut ReplicaHubItem,
         source: &ReplicaSourceId,
@@ -460,8 +451,8 @@ impl ReplicaHub {
             item.conflicted = false;
             item.conflict_object = None;
         }
-        // NOTE: else the source is unchanged or behind the hub: keep the shared
-        // body, which the next projection pushes to the lagging source.
+        // NOTE: else the source is unchanged or behind the hub, so the
+        // shared body stays and the next projection pushes it.
     }
 
     fn absorb_drop(
@@ -476,14 +467,12 @@ impl ReplicaHub {
                 .get(source)
                 .is_some_and(|binding| &binding.handle == handle);
             if bound_here {
-                // NOTE: only a genuine delete propagates to the sources
-                // that still hold the item. A superseded row is a handle
-                // the same batch replaces, and reading it as a delete
-                // would push a Remove nobody asked for. Nor does a drop
-                // from a source that holds the identity twice: the copy
-                // that vanished says nothing about the one that did not,
-                // and propagating on that reading removes the only copy on
-                // a source nobody touched.
+                // NOTE: only a genuine delete propagates. A superseded
+                // row is a handle the same batch replaces, and reading
+                // it as a delete would push a Remove nobody asked for;
+                // nor does a drop from a source holding the identity
+                // twice, where the copy that vanished says nothing about
+                // the one that did not.
                 let genuine = reason == ReplicaDropReason::Deleted && !item.is_ambiguous();
                 item.deleted |= genuine;
                 item.sources.remove(source);
@@ -568,9 +557,8 @@ mod tests {
 
     #[test]
     fn in_agreement_items_project_clean_without_a_body() {
-        // NOTE: the zero-bodies guardrail — an item both sides agree on
-        // projects Clean, at its current level, with no object, so the engine
-        // fetches nothing.
+        // the zero-bodies guardrail: an item both sides agree on
+        // projects Clean, at its current level, with no object
         let mut hub = hub_with_left(&["seen"]);
         hub.items
             .get_mut(&ReplicaLinkId::from("m1"))
@@ -598,9 +586,8 @@ mod tests {
 
     #[test]
     fn a_flag_change_absorbed_from_one_source_projects_dirty_on_the_other() {
-        // NOTE: left and right both hold the item, agreeing on []. left's
-        // server adds "seen": absorbing left's write makes the hub dirty
-        // against right's base, so right's projection pushes it.
+        // left's server adds "seen", so absorbing left's write makes the
+        // hub dirty against right's base and right's projection pushes it
         let mut hub = hub_with_left(&[]);
         hub.items
             .get_mut(&ReplicaLinkId::from("m1"))
@@ -617,8 +604,7 @@ mod tests {
                 },
             );
 
-        // NOTE: left pulled "seen" from its server, a clean placement
-        // carrying it.
+        // left pulled "seen" from its server
         let mut pulled = placements(&hub, "left").pop().unwrap();
         pulled.flags = ReplicaFlags::from_iter(["seen"]);
         pulled.status = ReplicaStatus::Clean;
@@ -641,7 +627,7 @@ mod tests {
     #[test]
     fn an_item_missing_on_a_source_projects_a_created_append_once_hydrated() {
         let mut hub = hub_with_left(&["seen"]);
-        // NOTE: give the item a body (hydrated), still only on left.
+        // hydrate the body, still only on left
         hub.items
             .get_mut(&ReplicaLinkId::from("m1"))
             .unwrap()
@@ -657,8 +643,8 @@ mod tests {
 
     #[test]
     fn a_missing_item_without_a_body_is_not_projected_no_fetch() {
-        // NOTE: no body yet, so the append is not staged and nothing forces
-        // a fetch.
+        // no body yet, so the append is not staged and nothing forces a
+        // fetch
         let hub = hub_with_left(&["seen"]);
         assert!(placements(&hub, "right").is_empty());
     }
@@ -697,14 +683,13 @@ mod tests {
 
     #[test]
     fn an_ambiguous_binding_projects_ambiguous_and_propagates_nothing() {
-        // One source holds the identity twice, the other does not. The
-        // ambiguity is per source, so right keeps syncing; left is frozen,
-        // and the item is not offered to a source that lacks it.
+        // the ambiguity is per source, so right keeps syncing while left
+        // is frozen, and the item is not offered to a source lacking it
         let mut hub = hub_with_left(&["seen"]);
         bind_right(&mut hub, &["seen"]);
         let item = hub.items.get_mut(&ReplicaLinkId::from("m1")).unwrap();
-        // NOTE: a body both sources agree on, so the only thing that can make
-        // either of them read as anything but Clean is the ambiguity itself.
+        // a body both sources agree on, so only the ambiguity can make
+        // either read as anything but Clean
         item.object = Some(ReplicaHash::from("body"));
         for binding in item.sources.values_mut() {
             if let Some(base) = &mut binding.base {
@@ -737,9 +722,8 @@ mod tests {
 
     #[test]
     fn an_ambiguous_binding_blocks_a_cross_source_delete() {
-        // The reproduction: left's bound copy vanishes while left still holds
-        // the identity, and the delete reaches right and removes the only
-        // copy there.
+        // left's bound copy vanishes while left still holds the identity,
+        // which must not remove the only copy on right
         let mut hub = hub_with_left(&["seen"]);
         bind_right(&mut hub, &["seen"]);
         hub.items
@@ -769,10 +753,9 @@ mod tests {
 
     #[test]
     fn a_superseded_row_does_not_delete_the_shared_item() {
-        // A placeholder reconciled to its server-assigned handle, or a
-        // spine rebuilt onto a new handle space, drops a row without the
-        // item going anywhere. Reading that as a delete would push a
-        // Remove to every other source: housekeeping turned into loss.
+        // a placeholder reconciled to its assigned handle, or a spine
+        // rebuilt onto a new handle space, drops a row without the item
+        // going anywhere
         let mut hub = hub_with_left(&["seen"]);
         bind_right(&mut hub, &["seen"]);
 
@@ -796,7 +779,7 @@ mod tests {
         let mut hub = hub_with_left(&["seen"]);
         bind_right(&mut hub, &["seen"]);
 
-        // NOTE: left's server expunged the item: the engine drops it on left.
+        // left's server expunged the item, so the engine drops it there
         hub.absorb(
             &ReplicaSourceId::from("left"),
             &[ReplicaWriteOp::DropPlacement {
@@ -810,8 +793,7 @@ mod tests {
         assert!(item.deleted, "the delete is recorded");
         assert!(!item.sources.contains_key(&ReplicaSourceId::from("left")));
 
-        // NOTE: right still holds it, so it projects a Tombstone to push a
-        // Remove.
+        // right still holds it, so it projects a Tombstone
         let right = placements(&hub, "right");
         assert_eq!(right.len(), 1);
         assert_eq!(right[0].status, ReplicaStatus::Tombstone);
@@ -820,17 +802,16 @@ mod tests {
             right[0].base.is_some(),
             "based, so the engine pushes a remove"
         );
-        // NOTE: left no longer holds it, so it projects nothing (not a
-        // re-copy).
+        // left no longer holds it, so it projects nothing rather than a
+        // re-copy
         assert!(placements(&hub, "left").is_empty());
     }
 
     #[test]
     fn a_client_staged_tombstone_upsert_marks_deleted_and_keeps_the_binding() {
-        // NOTE: a Remove (or a Move's source side) stages a Tombstone-status
-        // upsert, not a drop. Absorbing it must mark the item deleted while
-        // keeping the binding, so the projection pushes the remove — unlike a
-        // live upsert, which would resurrect it.
+        // a Remove, or a Move's source side, stages a Tombstone upsert
+        // rather than a drop: absorbing it marks the item deleted while
+        // keeping the binding, so the projection pushes the remove
         let mut hub = hub_with_left(&["seen"]);
 
         let mut tombstone = placements(&hub, "left").pop().unwrap();
@@ -881,7 +862,7 @@ mod tests {
         let mut hub = hub_with_left(&["seen"]);
         bind_right(&mut hub, &["seen"]);
 
-        // NOTE: right deletes it.
+        // right deletes it
         hub.absorb(
             &ReplicaSourceId::from("right"),
             &[ReplicaWriteOp::DropPlacement {
@@ -892,8 +873,8 @@ mod tests {
         );
         assert!(hub.items.get(&ReplicaLinkId::from("m1")).unwrap().deleted);
 
-        // NOTE: left's server had edited it (edit-beats-delete), so left's sync
-        // resurrects it as a live upsert rather than pushing the delete.
+        // left's server had edited it, so edit-beats-delete resurrects it
+        // as a live upsert rather than pushing the delete
         let mut pulled = ReplicaPlacement {
             sort_key: Default::default(),
             collection: "inbox".into(),
@@ -920,8 +901,7 @@ mod tests {
             .expect("resurrected");
         assert!(!item.deleted, "a live upsert clears the delete");
         assert!(item.flags.contains("flagged"));
-        // NOTE: right lacks it now, so it projects a Created copy (resurrected
-        // there).
+        // right lacks it now, so it projects a Created copy
         pulled.object = Some(ReplicaHash::from("h1"));
         hub.items
             .get_mut(&ReplicaLinkId::from("m1"))
@@ -934,8 +914,8 @@ mod tests {
         );
     }
 
-    /// A hub with one mutable item (body `o0`) held by left and right, both
-    /// last-synced against `o0`, with the given cross-source conflict policy.
+    /// A hub with one mutable item, body `o0`, held by left and right
+    /// and last-synced against it.
     fn content_hub(policy: ReplicaHubConflict) -> ReplicaHub {
         let based = |handle: &str| ReplicaSourceBinding {
             handle: ReplicaHandle::from(handle),
@@ -1001,8 +981,8 @@ mod tests {
 
     #[test]
     fn a_clean_fast_forward_adopts_the_new_body() {
-        // NOTE: only left edited since both agreed on o0, so no conflict —
-        // adopt it.
+        // only left edited since both agreed on o0, so the body is
+        // adopted with no conflict
         let mut hub = content_hub(ReplicaHubConflict::Manual);
         hub.absorb(
             &ReplicaSourceId::from("left"),
@@ -1019,9 +999,8 @@ mod tests {
 
     #[test]
     fn divergent_content_conflicts_and_preserves_both_manual() {
-        // NOTE: left edited to oa (adopted), then right edited to ob against
-        // the old o0 base: both moved, so Manual flags it and records ob,
-        // keeping oa.
+        // left edited to oa, then right to ob against the old o0 base:
+        // both moved, so Manual flags it and records ob, keeping oa
         let mut hub = content_hub(ReplicaHubConflict::Manual);
         hub.absorb(
             &ReplicaSourceId::from("left"),
@@ -1088,8 +1067,8 @@ mod tests {
         );
     }
 
-    /// A conflicted upsert for the shared item from `handle`: the local body is
-    /// `object`, and `revision` is the remote revision the merge observed.
+    /// A conflicted upsert for the shared item from `handle`, carrying
+    /// the local body and the remote revision the merge observed.
     fn conflicted_upsert(handle: &str, object: &str, revision: &str) -> ReplicaWriteOp {
         ReplicaWriteOp::UpsertPlacement(ReplicaPlacement {
             sort_key: Default::default(),
@@ -1114,10 +1093,10 @@ mod tests {
 
     #[test]
     fn a_conflicted_placement_round_trips_with_its_revision() {
-        // The bug this change fixes: the merge marks a placement Conflict and
-        // records the remote revision it saw, and both must come back out. Read
-        // back as Dirty, the engine re-derives the push it already had rejected
-        // and re-conflicts on every run, never converging.
+        // the merge marks a placement Conflict and records the remote
+        // revision it saw, and both must come back out: read back as
+        // Dirty, the engine would re-derive the rejected push and
+        // re-conflict on every run without converging
         let mut hub = content_hub(ReplicaHubConflict::Manual);
         hub.absorb(
             &ReplicaSourceId::from("left"),
@@ -1136,10 +1115,9 @@ mod tests {
 
     #[test]
     fn a_conflict_outranks_the_base_comparison() {
-        // A conflicted binding whose base still matches the shared content would
-        // otherwise project Clean, silently losing the conflict; and one that
-        // diverges would project Dirty, re-deriving the rejected push. Neither
-        // may happen.
+        // a matching base would otherwise project Clean, silently losing
+        // the conflict, and a diverging one Dirty, re-deriving the
+        // rejected push
         let mut hub = content_hub(ReplicaHubConflict::Manual);
         hub.absorb(
             &ReplicaSourceId::from("left"),
@@ -1149,8 +1127,8 @@ mod tests {
         let binding =
             hub.items[&ReplicaLinkId::from("m1")].sources[&ReplicaSourceId::from("left")].clone();
         assert!(binding.conflicted);
-        // The base equals the shared content, so the Clean branch would win
-        // without the conflict check.
+        // the base equals the shared content, so the Clean branch would
+        // win without the conflict check
         assert_eq!(
             binding.base.as_ref().and_then(|b| b.object.clone()),
             hub.items[&ReplicaLinkId::from("m1")].object
@@ -1160,8 +1138,8 @@ mod tests {
 
     #[test]
     fn resolving_the_conflict_with_an_edit_clears_it() {
-        // Resolution needs no dedicated call: the consumer's edit arrives as an
-        // ordinary upsert, and any status but Conflict clears the binding.
+        // the consumer's edit arrives as an ordinary upsert, and any
+        // status but Conflict clears the binding
         let mut hub = content_hub(ReplicaHubConflict::Manual);
         let left = ReplicaSourceId::from("left");
         hub.absorb(&left, &[conflicted_upsert("l1", "o-local", "r-remote")]);
@@ -1180,14 +1158,13 @@ mod tests {
 
     #[test]
     fn the_two_conflict_axes_stay_independent() {
-        // A source-vs-its-own-remote conflict and a cross-source conflict are
-        // different facts; conflating them would make a two-source store report
-        // one as the other. Neither may leak into the other's flag.
+        // a source-vs-its-own-remote conflict and a cross-source one are
+        // different facts, and neither may leak into the other's flag
         let mut hub = content_hub(ReplicaHubConflict::Manual);
         let link = ReplicaLinkId::from("m1");
 
-        // Left conflicts with its own server: the binding is marked, the shared
-        // item's cross-source flag is not.
+        // left conflicts with its own server: the binding is marked, the
+        // item's cross-source flag is not
         hub.absorb(
             &ReplicaSourceId::from("left"),
             &[conflicted_upsert("l1", "o-local", "r-remote")],
@@ -1198,12 +1175,12 @@ mod tests {
             "a per-source conflict is not a cross-source one"
         );
 
-        // Right's binding is untouched by left's conflict.
+        // right's binding is untouched by left's conflict
         assert!(!hub.items[&link].sources[&ReplicaSourceId::from("right")].conflicted);
         assert_eq!(placements(&hub, "right")[0].status, ReplicaStatus::Dirty);
 
-        // Now a genuine cross-source divergence (both moved to different
-        // bodies): the item is flagged, and right's own binding is not.
+        // a genuine cross-source divergence: the item is flagged, and
+        // right's own binding is not
         let mut hub = content_hub(ReplicaHubConflict::Manual);
         hub.absorb(
             &ReplicaSourceId::from("left"),
@@ -1226,8 +1203,8 @@ mod tests {
 
     #[test]
     fn a_tombstone_is_never_conflicted() {
-        // The tombstone path takes the same binding constructor; a staged
-        // delete carries no conflict, and must not inherit a stale one.
+        // the tombstone path takes the same binding constructor, and a
+        // staged delete must not inherit a stale conflict
         let mut hub = content_hub(ReplicaHubConflict::Manual);
         let left = ReplicaSourceId::from("left");
         hub.absorb(&left, &[conflicted_upsert("l1", "o-local", "r-remote")]);
@@ -1275,9 +1252,9 @@ mod sort_key_tests {
 
     #[test]
     fn a_sort_key_round_trips_through_the_hub() {
-        // The whole point of carrying it: a key absorbed from one source
-        // has to come back out when that source is projected, or the
-        // storage below reads it as unknown on every load.
+        // a key absorbed from one source has to come back out when that
+        // source is projected, or the storage below reads it as unknown
+        // on every load
         let mut hub = ReplicaHub::default();
         let left = ReplicaSourceId::from("left");
 
@@ -1290,10 +1267,9 @@ mod sort_key_tests {
 
     #[test]
     fn an_unknown_key_does_not_erase_a_known_one() {
-        // A second source that has only probed the item carries no key.
-        // Adopting it unconditionally would un-sort an item the first
-        // source had already placed, which is the same reasoning that
-        // makes an absent meta leave the cached summary alone.
+        // a second source that has only probed the item carries no key,
+        // and adopting it would un-sort an item the first source had
+        // already placed
         let mut hub = ReplicaHub::default();
         let left = ReplicaSourceId::from("left");
         let right = ReplicaSourceId::from("right");
@@ -1307,8 +1283,8 @@ mod sort_key_tests {
 
     #[test]
     fn a_later_derivation_replaces_an_earlier_one() {
-        // A `Full` fetch knows more than an envelope did, so a real key
-        // must be allowed to correct a real key; only unknown is inert.
+        // a `Full` fetch knows more than an envelope did, so a real key
+        // corrects a real key; only unknown is inert
         let mut hub = ReplicaHub::default();
         let left = ReplicaSourceId::from("left");
 
@@ -1320,9 +1296,9 @@ mod sort_key_tests {
     }
 }
 
-/// Flags carry the same unknown state a sort key does (spec §13: the store's
-/// `flags` column is `NULL` until something reads them, distinct from a
-/// known-empty `'[]'`), and the hub owes it the same rule.
+/// Flags carry the same unknown state a sort key does (spec §13: the
+/// store's `flags` column is `NULL` until something reads them, distinct
+/// from a known-empty `'[]'`), and the hub owes it the same rule.
 #[cfg(test)]
 mod flags_tests {
 
@@ -1352,8 +1328,8 @@ mod flags_tests {
 
     #[test]
     fn an_unknown_set_does_not_erase_a_known_one() {
-        // A second source that has only probed the item must not clear the
-        // markers the first one read.
+        // a second source that has only probed the item must not clear
+        // the markers the first one read
         let mut hub = ReplicaHub::default();
         let left = ReplicaSourceId::from("left");
         let right = ReplicaSourceId::from("right");
@@ -1367,8 +1343,8 @@ mod flags_tests {
 
     #[test]
     fn a_known_set_replaces_an_unknown_one() {
-        // Only unknown is inert: a real set always corrects another, and a
-        // deliberate clearing (known-empty) is a real set.
+        // only unknown is inert: a deliberate clearing is a real set and
+        // corrects another
         let mut hub = ReplicaHub::default();
         let left = ReplicaSourceId::from("left");
 
@@ -1418,8 +1394,8 @@ mod stored_level_tests {
 
     #[test]
     fn a_refreshed_item_stops_claiming_the_body_it_lost() {
-        // A remote content change through the hub: the merge dropped the
-        // stale body, so the item is summarised but no longer stored.
+        // the merge dropped the stale body, so the item is summarised
+        // but no longer stored
         let mut hub = ReplicaHub::default();
         let left = ReplicaSourceId::from("left");
 
@@ -1443,8 +1419,8 @@ mod stored_level_tests {
 
     #[test]
     fn a_body_less_item_stored_as_full_projects_below_it() {
-        // The shape a store written before this rule holds. An upgrade reads
-        // the projection, so this is what heals it.
+        // an upgrade reads the projection, so this is what heals a store
+        // written before the rule
         let mut hub = ReplicaHub::default();
         let left = ReplicaSourceId::from("left");
 
@@ -1462,7 +1438,7 @@ mod stored_level_tests {
 
     #[test]
     fn a_stored_body_keeps_the_level_it_reached() {
-        // The rule is the body's absence and nothing else.
+        // the rule is the body's absence and nothing else
         let mut hub = ReplicaHub::default();
         let left = ReplicaSourceId::from("left");
 
