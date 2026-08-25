@@ -194,3 +194,62 @@ fn the_freeze_survives_a_run_that_never_mentions_the_twin() {
         "and still not deletable on the word of one vanished copy",
     );
 }
+
+/// The freeze is one item wide.
+///
+/// Refusing to guess costs the frozen item its sync and must cost nothing
+/// else: the run carries on over the rest of the collection, in both
+/// directions, and the duplicate is a warning the user acts on rather than a
+/// halt they have to clear before anything else moves.
+///
+/// This is what makes the freeze an acceptable answer at all. A rule that
+/// derives nothing is only safe while the "nothing" is scoped; the same rule
+/// applied a batch or a collection wide would strand a mailbox on one double
+/// delivery, which is a worse outcome than the mispairing it exists to prevent.
+#[test]
+fn a_frozen_item_does_not_stop_the_collection() {
+    let mut client = twin_client();
+    let opts = ReplicaSyncOptions::default();
+
+    // an ordinary neighbour, seeded beside the twins
+    client.remote_mut().seed(
+        "inbox",
+        "u3",
+        "msg-b",
+        &[],
+        b"From: a\r\nMessage-ID: <msg-b>\r\n\r\nother\r\n",
+    );
+
+    client.sync("inbox", opts).unwrap();
+    hydrate(&mut client);
+    assert_eq!(ambiguous(&client), ["u1"], "the twins froze");
+
+    // remote changes on both axes, one touching the frozen identity and one
+    // the neighbour
+    client.remote_mut().set_flags("inbox", "u1", &["seen"]);
+    client.remote_mut().set_flags("inbox", "u3", &["seen"]);
+    let report = client.sync("inbox", opts).unwrap();
+
+    assert_eq!(report.pulled, 1, "the neighbour pulled, the twins did not");
+    assert_eq!(
+        client.storage().placement("inbox", "u3").flags,
+        io_replica::placement::ReplicaFlags::from_iter(["seen"]),
+        "the neighbour took the remote flag",
+    );
+    assert_eq!(ambiguous(&client), ["u1"], "and the twins are still frozen");
+
+    // a local change on the neighbour still pushes, past the frozen item
+    client
+        .mutate(
+            "inbox",
+            io_replica::mutate::ReplicaMutation::SetFlags {
+                handle: ReplicaHandle::from("u3"),
+                flags: io_replica::placement::ReplicaFlags::from_iter(["seen", "flagged"]),
+            },
+        )
+        .unwrap();
+    let report = client.sync("inbox", opts).unwrap();
+
+    assert_eq!(report.pushed, 1, "the neighbour's edit reached the remote");
+    assert_eq!(ambiguous(&client), ["u1"]);
+}

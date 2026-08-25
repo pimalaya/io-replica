@@ -63,18 +63,6 @@ the moment it exists and no consumer has to invent a value. It is a plain value
 rather than an option because that is what the reference storage records, and
 one representation of "not known yet" is less to get wrong than two.
 
-### Requirement: A fetch refreshes the key at every tier
-An upgrade SHALL adopt the key from the fetched item at both tiers, unlike the
-link id, which is kept once resolved. The key is a projection of content rather
-than an identity, so the later and better-informed derivation wins: a full body
-carries the real date where an envelope may have carried none.
-
-### Requirement: A key survives a rekey
-Rebuilding a collection onto a new handle space SHALL carry each placement's key
-over, preferring the one the rekey's meta fetch resolved and falling back to the
-key the old placement held, so a handle-space change does not un-sort a
-collection.
-
 ### Requirement: An unread flag set is unknown rather than empty
 `ReplicaFlags` SHALL carry an `Unknown` state distinct from a known-empty set,
 since the reference storage records the two apart (pimdir SPEC §13: a `NULL`
