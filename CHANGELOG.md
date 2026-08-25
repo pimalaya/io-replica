@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ReplicaPlacement::staged_edit`, the single reading of "there is a local content edit here", replacing six hand-rolled predicates that disagreed about the status guard and about what a missing base means.
 
 - `coroutine::ReplicaArgError`, the one error a driver that breaks the coroutine contract gets, replacing the four per-verb enums that said it identically.
+- `ReplicaDeletePolicy` on `ReplicaSyncOptions`: what becomes of a local delete the source will not take, `Revert` (the default, mirroring the source) or `Keep` (holding the tombstone for a later run). One answer for both refusals, so `ReplicaPushRights::none()` and `push = false` finally agree on it.
 - `ReplicaSync::PUSH_CHUNK` and `ReplicaSync::WRITE_CHUNK`, the number of changes one push chunk holds and the number of writes one batch holds.
 
 ### Changed
@@ -35,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ReplicaLoadScope::Link` becomes `Links`, taking several: the reads that ask about an identity rather than a location have to see every row claiming it.
 - **No coroutine resumes once it has completed**, where only `ReplicaSync` refused before. The four others handed back a default output, which is exactly what a run that genuinely did nothing returns, so a driver with a loop bug was told it had succeeded.
 - `ReplicaMutateError` keeps its three real variants and composes the shared `ReplicaArgError` as `Arg`.
+- **A forbidden remove now reverts the tombstone rather than holding it**, following the new `ReplicaDeletePolicy` default. `delete: ReplicaDeletePolicy::Keep` restores the old behaviour, and now applies to a read-only source too, which never had it.
 - The hub projects its three placements (bound, tombstone, create) from one `ReplicaHubItem::project`, each settling only what the source binding decides. A field added to `ReplicaPlacement` is one edit rather than three, where forgetting one was a silently wrong projection rather than a compile error.
 
 ### Removed
@@ -43,6 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ReplicaOpenError`, `ReplicaUpgradeError`, `ReplicaRekeyError` and `ReplicaSyncError`, four byte-identical enums differing only in the verb their message named. `coroutine::ReplicaArgError` replaces them: a driver breaking the coroutine contract is one bug, and none of those four verbs can fail on its own terms.
 
 ### Fixed
+
+- **A rebuilt spine bet on the order its batch was applied in.** `rekey` dropped every old handle before upserting the new spine, so a new handle space reusing an old handle, and an unmatched staged edit resurrected under the handle it already had, each put a drop and an upsert of one key in a batch whose contract promised only atomicity. It now drops only the handles no upsert of the same batch writes. The contract is stated as well: a batch is applied in order, and a storage may not group it by op kind, because a sync legitimately writes a placement whose ambiguity cleared and then drops the same handle it reads as vanished.
 
 - **A collection holding one identity twice lost mail on a side nobody touched.** A placement is identified by its collection and link id and a source binds it with one handle, so a second copy of one `Message-ID` (a double delivery, a retried `APPEND`, a restore, a migration) had nowhere to live: the fetch that resolved it silently repointed the first binding, and the evidence was gone at that write. Deleting the bound copy then propagated a delete that removed the only copy on another source, while the source that reported it still held the message.
 

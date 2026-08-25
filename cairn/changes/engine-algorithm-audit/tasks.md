@@ -11,19 +11,20 @@ Triage: each accepted item became its own change with its own delta, named below
 
 - [x] `Move`: server-side move, or copy and remove? **Both**, recognising each other through the link id: the create delivers by copying from its origin, the remove relocates only while the destination does not already hold the identity. Dropping either half loses data in one of the two sync orders.
 - [x] What `DropPlacement` means, and whether it carries a reason. **`ReplicaDropReason::{Deleted, Superseded}`**; only `Deleted` propagates through the hub.
-- [ ] Whether the write batch is order-significant, or whether `rekey` stops depending on it. **Half done, and the half that is left is a live bug.** Marking a renumbering's drops `Superseded` stopped the hub reading it as a mass delete, but `rekey` still emits a drop for *every* old handle before upserting the new spine (rekey.rs, `writes`), so a new handle space overlapping the old one puts `DropPlacement(h)` and `UpsertPlacement(h)` for the same key in one batch and the end state depends on which the storage applies last. Overlap is the common case after a UIDVALIDITY bump. Fix: drop only the old handles the new spine does not reuse. Then the contract can state that a batch is a set applied atomically, with references resolving against the whole batch.
+- [x] Whether the write batch is order-significant, or whether `rekey` stops depending on it. **Both** (`write-batch-order`). `rekey` drops only the old handles no upsert of the same batch writes, which closed two collisions: a reused handle, and a resurrected edit under the handle it already had. The contract now states that a batch is applied in order and may not be grouped by op kind, because a sync legitimately writes a placement whose ambiguity cleared and then drops the same handle it reads as vanished.
 - [x] Whether a link id is unique per collection and source. **No**, and one a source holds twice is frozen rather than guessed (`duplicate-link-id-freeze`).
 - [x] Whether `enumerated` becomes a real invariant or the field goes. **The field went**, with `ReplicaCollection`.
 
 ## Correctness
 
 - [x] Fix the `Move` double delivery, and order the target add before the source remove.
-- [x] Keep a local delete pending on a read-only source under a delta enumerate, or force the next run full. *Reconciling `push = false` with `rights.remove = false` is still open*, below.
+- [x] Keep a local delete pending on a read-only source under a delta enumerate, or force the next run full. Reconciling `push = false` with `rights.remove = false` landed in `delete-disposition`.
 - [~] Key hub bindings by source and handle so two placements sharing a link id survive. **Rejected on merit.** Freezing the identity and reporting it until a human resolves it is simpler and truer than making the engine hold an ambiguity it cannot resolve: 1:N bindings would spread a guess across every source. Bindings stay 1:1 (`duplicate-link-id-freeze`).
 - [x] Give a `KeepBoth` duplicate a link id and a unique synthetic handle, both derived from the forked body.
 - [x] Stop `absorb_drop` propagating a local-only drop as a delete.
 - [x] Revisit a `Full` placement holding no object, and a `Meta` one holding no meta.
-- [ ] Close whether `pull_flags`'s fabricated base is the base-presence bug io-pimdir sees. Needs a reproduction from the io-pimdir end; deferred until the pimdir work is done.
+- [x] Close whether `pull_flags`'s fabricated base is the base-presence bug io-pimdir sees. **It is not, and the fabrication is not a lie.** `ReplicaPlacement::staged_edit` is deliberately status-free and reads a base holding no object exactly as it reads no base at all, so a body nothing has confirmed the remote holds reads as unsynced either way. That is true rather than wrong: the flag axis has no basis for claiming the remote holds a body it never reported. The 0.4.2 "dirty forever" shape was the upgrade dedup branch skipping its rebase, which is a different write.
+- [ ] **The residual that analysis did surface**: a never-based placement holding a body, present on both sides of an *immutable* backend, falls through `reconcile_content` (no revision, so no content signal), and the flag axis then lands it `Clean` with a base holding no object. The body is neither pushed (a content push needs `Dirty`) nor forgotten, so it is stranded. The mutable twin of this is already a create-collision conflict. Reachable only if a consumer mints a provisional handle that collides with a real one; wants a reproduction from a consumer before the merge is changed, since widening the collision rule would turn benign cases into conflicts a user has to resolve.
 
 ## Shape
 
@@ -32,7 +33,7 @@ Triage: each accepted item became its own change with its own delta, named below
 - [ ] Index the hub from source and handle to link, so a drop seeks. Mitigated rather than fixed: a drop now scans the *scoped* hub a storage loads for its batch. Performance only.
 - [x] Reconcile flags even when a content push is derived. *Keying the pending maps by handle and kind is still open*: one handle yields at most one change per run, because a push result names a handle. Now cheaper than it was, since every change carries a `ReplicaChangeKey` a result could name instead.
 - [x] Chunk pushes with their recording writes; derive an idempotency key for every change, not only adds (`chunked-pushes`).
-- [ ] Make the disposition of a local delete an explicit option rather than an emergent one. `push = false` reverts the delete, `rights.remove = false` keeps it pending, so `ReplicaPushRights::none()` is not `push = false` and nothing says so.
+- [x] Make the disposition of a local delete an explicit option rather than an emergent one (`delete-disposition`). `ReplicaDeletePolicy { Revert, Keep }`, `Revert` by default, consulted wherever a delete cannot go, so `ReplicaPushRights::none()` and `push = false` agree on it.
 
 ## Compaction
 
@@ -48,9 +49,9 @@ Triage: each accepted item became its own change with its own delta, named below
 - [x] A move end to end, in both sync orders, linked and never-fetched (`tests/membership.rs`).
 - [x] A local delete on a read-only source under a delta enumerate.
 - [x] Two placements sharing a link id in one collection (`tests/duplicate_link_id.rs`).
-- [ ] **The hub driven by the real sync engine.** Nothing in `tests/` touches the hub: its tests are project and absorb units over hand-built writes, so project, sync, absorb, project convergence has never run. The largest remaining unknown in the crate.
+- [x] **The hub driven by the real sync engine** (`hub-sync-harness`, `tests/hub.rs`). Eight scenarios over two sources and one shared store. It found that a hub-backed store must own the rows the hub cannot key (io-pimdir's residual list is required, not a bolt-on), that mirroring is a sync plus an upgrade, and that a reverted delete reads as add-beats-delete across sources.
 - [ ] `KeepBoth`, `PreferLocal` and `PreferRemote` end to end, and under crash injection. The property model only runs `Manual`.
-- [ ] A rekey while a hub is bound, and a rekey whose new handle space overlaps the old one.
-- [ ] A push result set that is short, out of order, duplicated, or names an unknown handle. The rule that an unreported push stays pending has no test, and the chunked drain now rests on it.
-- [ ] Rights combinations under the hub, such as one source refusing removes while another deletes.
-- [ ] A write batch applied in a different order than emitted, which should either break loudly or become contractual.
+- [ ] A rekey while a hub is bound. The overlapping handle space half landed with `write-batch-order`; the hub half now has `tests/hub.rs` to be written against.
+- [x] A push result set that is short, out of order, duplicated, or names an unknown handle (`hub-sync-harness`, in `sync.rs`): an unreported push stays dirty and counts as neither pushed nor rejected, and results are matched by handle, so a duplicate or an unknown handle changes nothing.
+- [x] Rights combinations under the hub, such as one source refusing removes while another deletes (`hub-sync-harness`), under both delete policies.
+- [x] A write batch applied in a different order than emitted: **contractual** (`write-batch-order`). It is applied in order, and a rebuild no longer emits a pair that depends on it.

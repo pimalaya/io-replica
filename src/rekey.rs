@@ -100,25 +100,13 @@ impl ReplicaRekey {
             .filter_map(|p| Some((p.link_id.clone()?, p.clone())))
             .collect();
 
-        // NOTE: the whole old spine goes, but nothing here is a delete:
-        // every row is either about to be rewritten under its new handle
-        // or lost with a handle space the server has already discarded.
-        // Marking the drops superseded is what keeps a storage sharing one
-        // item across sources from reading a renumbering as a mass delete,
-        // and what makes the batch order-insensitive.
-        for placement in &old {
-            writes.push(ReplicaWriteOp::DropPlacement {
-                collection: self.collection.clone(),
-                handle: placement.handle.clone(),
-                reason: ReplicaDropReason::Superseded,
-            });
-        }
-
+        let mut written = BTreeSet::new();
         let mut carried_over = BTreeSet::new();
         for item in mem::take(&mut self.items) {
             let resolved = links.get(&item.handle);
             let carried = resolved.and_then(|(link, _, _)| old_by_link.remove(link));
 
+            written.insert(item.handle.clone());
             match carried {
                 Some(old) => {
                     carried_over.insert(old.handle.clone());
@@ -156,6 +144,7 @@ impl ReplicaRekey {
                 resurrected.conflict_revision = None;
                 resurrected.base = None;
                 resurrected.origin = None;
+                written.insert(resurrected.handle.clone());
                 writes.push(ReplicaWriteOp::UpsertPlacement(resurrected));
                 carried_over.insert(placement.handle.clone());
                 self.report.rekeyed += 1;
@@ -165,6 +154,26 @@ impl ReplicaRekey {
             .iter()
             .filter(|p| p.status != ReplicaStatus::Clean && !carried_over.contains(&p.handle))
             .count();
+
+        // NOTE: the old spine goes, but only the rows this batch does not
+        // write itself. A handle the new space reuses, and the old handle a
+        // resurrected edit keeps, are written by an upsert above; dropping
+        // them too would leave the batch deciding by the order a storage
+        // applies it in, which the storage contract has never promised. The
+        // drop is not a delete either: every row here is lost with a handle
+        // space the server has already discarded, so marking it superseded
+        // is what keeps a storage sharing one item across sources from
+        // reading a renumbering as a mass delete.
+        for placement in &old {
+            if written.contains(&placement.handle) {
+                continue;
+            }
+            writes.push(ReplicaWriteOp::DropPlacement {
+                collection: self.collection.clone(),
+                handle: placement.handle.clone(),
+                reason: ReplicaDropReason::Superseded,
+            });
+        }
 
         writes.push(ReplicaWriteOp::SetCheckpoint {
             collection: self.collection.clone(),
@@ -463,6 +472,67 @@ mod tests {
             ReplicaWriteOp::UpsertPlacement(p) if p.handle.as_str() == handle => Some(p),
             _ => None,
         })
+    }
+
+    /// Whether the batch drops a handle it also writes, which is the one
+    /// way a rekey can depend on the order a storage applies it in.
+    fn dropped_and_upserted(writes: &[ReplicaWriteOp]) -> Vec<&str> {
+        writes
+            .iter()
+            .filter_map(|w| match w {
+                ReplicaWriteOp::DropPlacement { handle, .. } => Some(handle.as_str()),
+                _ => None,
+            })
+            .filter(|handle| upserted(writes, handle).is_some())
+            .collect()
+    }
+
+    /// A rekey whose new handle space reuses an old handle, which is the
+    /// common case: the server renumbers into the same range.
+    #[test]
+    fn a_reused_handle_is_not_dropped_by_the_batch_that_writes_it() {
+        let old = synced("1", "a", &[]);
+        let (writes, report) = run(vec![old], vec![item("1", &[])], vec![fetched("1", "a")]);
+
+        assert_eq!(report.rekeyed, 1, "the item is carried over");
+        assert!(
+            upserted(&writes, "1").is_some(),
+            "the new spine holds it: {writes:?}",
+        );
+        assert_eq!(
+            dropped_and_upserted(&writes),
+            Vec::<&str>::new(),
+            "the batch decides by apply order: {writes:?}",
+        );
+    }
+
+    /// The same hazard without any handle reuse: an unmatched staged edit
+    /// is resurrected under the handle it already had.
+    #[test]
+    fn a_resurrected_edit_is_not_dropped_by_the_batch_that_writes_it() {
+        let mut old = synced("1", "a", &[]);
+        old.status = ReplicaStatus::Dirty;
+        old.object = Some(ReplicaHash::from("h2"));
+        old.level = ReplicaLevel::Full;
+        old.base = Some(ReplicaBase {
+            flags: ReplicaFlags::default(),
+            revision: None,
+            object: Some(ReplicaHash::from("h1")),
+        });
+
+        let (writes, _report) = run(
+            vec![old],
+            vec![item("101", &[])],
+            vec![fetched("101", "other")],
+        );
+
+        let resurrected = upserted(&writes, "1").expect("the edit survives as a create");
+        assert_eq!(resurrected.status, ReplicaStatus::Created);
+        assert_eq!(
+            dropped_and_upserted(&writes),
+            Vec::<&str>::new(),
+            "the local edit survives only if the drop is applied first: {writes:?}",
+        );
     }
 
     #[test]

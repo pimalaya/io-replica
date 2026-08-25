@@ -192,3 +192,15 @@ The freeze is per source otherwise: in a two-sided store one side may hold the d
 The three placements the hub projects (a bound member, a tombstone for one deleted elsewhere, a create for one this source lacks) SHALL be built from one projection carrying the item's shared content, each settling only what the source's binding decides: the status it reads as, its base, its conflict revision, the handles it cannot resolve.
 
 Stating the shared content once is what makes a field added to `ReplicaPlacement` a change in one place: three hand-written projections make forgetting one a silent wrong answer rather than a compile error.
+
+### Requirement: A hub-backed store owns the rows the hub cannot key
+`ReplicaHub::absorb` SHALL ignore an upserted placement carrying no link id, because the hub keys items by link id and has nowhere to put one. Every row a sync pulls is such a placement: an enumeration yields handles, and the link id lands on the first meta fetch.
+
+A hub-backed storage SHALL therefore hold those rows itself and return them from `load` beside the projection, until a fetch resolves their identity and the hub takes them over. A storage that does not is not a partial mirror but a broken one: its replica forgets every member it pulls, and an incremental enumeration never lists them again.
+
+It follows that mirroring is a sync **plus** an upgrade. The hub offers a member to a source that lacks it only when it holds the body, so a consumer that never hydrates never mirrors anything.
+
+#### Scenario: A pulled member reaches the other source
+- GIVEN two sources over one hub, one holding a member the other lacks
+- WHEN the holder is synced and its rows hydrated
+- THEN the hub offers the member to the other source, which appends it

@@ -111,20 +111,53 @@ pub enum ReplicaConflictPolicy {
     KeepBoth,
 }
 
+/// What becomes of a local delete the source will not take.
+///
+/// Deletion is the one axis where the push switches are not orthogonal: a
+/// forbidden flag or content change simply stays dirty and re-derives, but a
+/// forbidden *delete* has to be either undone or held, and holding it hides a
+/// member the source still holds. Which one is right is the consumer's call,
+/// not something to read off `push` and [`ReplicaPushRights::remove`], which
+/// used to mean opposite things here.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ReplicaDeletePolicy {
+    /// Undo it: the replica mirrors the source, so the member comes back
+    /// with whatever it had cached. The right reading for a source the
+    /// replica does not own, and the default: a held tombstone hides a
+    /// member the source still holds, for good, since an incremental
+    /// enumeration never lists an untouched member again.
+    #[default]
+    Revert,
+    /// Hold it: the tombstone stays pending, so a later run that may push
+    /// still delivers it. The right reading when the refusal is a policy
+    /// that may lift (an archive that takes appends but no deletes today),
+    /// at the cost of a local view that hides the member meanwhile.
+    ///
+    /// **A source bound to a [hub](crate::hub) wants this one.** Reverting
+    /// says "this source still holds the member", which a hub reads as the
+    /// item being alive (add-beats-delete across sources): it clears the
+    /// deletion for every source, and mirrors the item back to the one it
+    /// was deleted on. Both readings are coherent, and only the consumer
+    /// knows which it means.
+    Keep,
+}
+
 /// Tuning for one sync run: the push direction and the enumerate depth.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplicaSyncOptions {
     /// The master push switch. When false the source is treated read-only:
     /// local flag and content changes are kept dirty and never pushed
-    /// (permission gating). A local delete is reverted instead of kept
-    /// pending: it can never propagate, so the replica mirrors the source
-    /// and the member comes back, keeping whatever it had cached.
+    /// (permission gating), and a local delete follows `delete`.
     pub push: bool,
     /// Per-kind refinement of `push`, consulted only when `push` is true. A
-    /// forbidden push kind is kept pending (never pushed, and a forbidden
-    /// delete is not applied to the replica either), while other kinds still
-    /// propagate.
+    /// forbidden push kind is kept pending (never pushed), while other kinds
+    /// still propagate; a forbidden delete follows `delete`.
     pub rights: ReplicaPushRights,
+    /// What becomes of a local delete this source will not take, whether
+    /// because `push` is false or because `rights` forbids the remove. One
+    /// answer for both, so `ReplicaPushRights::none()` and `push = false`
+    /// agree on it.
+    pub delete: ReplicaDeletePolicy,
     /// How a content conflict is resolved when the source is unattended.
     /// Defaults to `Manual` (mark and wait for an edit).
     pub conflict: ReplicaConflictPolicy,
@@ -140,6 +173,7 @@ impl Default for ReplicaSyncOptions {
         Self {
             push: true,
             rights: ReplicaPushRights::all(),
+            delete: ReplicaDeletePolicy::Revert,
             conflict: ReplicaConflictPolicy::Manual,
             full: false,
         }
@@ -535,29 +569,17 @@ impl ReplicaSync {
                     return None;
                 }
 
-                if !self.opts.push {
-                    // NOTE: read-only source: the delete can never
-                    // propagate and the replica mirrors the source, so it
-                    // is reverted here rather than applied and left for a
-                    // later enumerate to undo. An incremental enumerate
-                    // never lists an untouched member again, so a dropped
-                    // row would never come back at all.
-                    let mut reverted = local;
-                    reverted.status = ReplicaStatus::Clean;
-                    self.writes.push(ReplicaWriteOp::UpsertPlacement(reverted));
-                    return None;
-                }
-
                 // NOTE: a staged content edit rides ahead of a move: the
                 // update pushes first, so the relocated member carries the
                 // edited body; the move itself derives again on the next
                 // sync, once the base holds the pushed content. A plain
                 // delete supersedes the edit instead.
                 if local.staged_edit().is_some() && local.origin.is_some() {
-                    if !self.opts.rights.content {
-                        // NOTE: content push forbidden, keep the tombstone
-                        // pending.
-                        return None;
+                    if !(self.opts.push && self.opts.rights.content) {
+                        // NOTE: the edit cannot go, and the move must not go
+                        // without it, or the relocated member would carry the
+                        // body the edit replaced.
+                        return self.refuse_delete(local);
                     }
                     self.pending_content_pushes
                         .insert(handle.clone(), local.clone());
@@ -568,11 +590,8 @@ impl ReplicaSync {
                     });
                 }
 
-                if !self.opts.rights.remove {
-                    // NOTE: remove push forbidden, keep the tombstone pending,
-                    // and do not drop it locally (unlike a read-only source,
-                    // which mirrors the delete).
-                    return None;
+                if !(self.opts.push && self.opts.rights.remove) {
+                    return self.refuse_delete(local);
                 }
 
                 // NOTE: hold the drop until the remote confirms it (in
@@ -960,6 +979,26 @@ impl ReplicaSync {
                 })
             }
         }
+    }
+
+    /// Settles a local delete this source will not take, by
+    /// [`ReplicaDeletePolicy`]. Derives nothing either way.
+    fn refuse_delete(&mut self, local: ReplicaPlacement) -> Option<ReplicaChangeKind> {
+        match self.opts.delete {
+            ReplicaDeletePolicy::Revert => {
+                debug!("reverting a delete {} will not take", local.handle.as_str());
+                let mut reverted = local;
+                reverted.status = ReplicaStatus::Clean;
+                self.writes.push(ReplicaWriteOp::UpsertPlacement(reverted));
+            }
+            // NOTE: the tombstone stays as it is, so the next run that may
+            // push derives the remove again.
+            ReplicaDeletePolicy::Keep => {
+                trace!("holding a delete {} will not take", local.handle.as_str());
+            }
+        }
+
+        None
     }
 
     /// Records a per-item event for the report.
@@ -1812,6 +1851,86 @@ mod tests {
         );
     }
 
+    /// A dirty flag placement, ready to derive one push.
+    fn pending(handle: &str) -> ReplicaPlacement {
+        let mut placement = synced(handle, &[]);
+        placement.flags = ReplicaFlags::from_iter(["flagged"]);
+        placement.status = ReplicaStatus::Dirty;
+        placement
+    }
+
+    fn accepted(handle: &str) -> ReplicaPushResult {
+        ReplicaPushResult {
+            handle: ReplicaHandle::from(handle),
+            outcome: ReplicaPushOutcome::Accepted,
+            assigned: None,
+            revision: None,
+        }
+    }
+
+    /// A consumer that reports on fewer changes than it was handed leaves
+    /// the rest exactly as they were. The rule the chunked drain rests on:
+    /// a handle nobody reported is retried, never assumed.
+    #[test]
+    fn an_unreported_push_stays_pending() {
+        let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
+        let (writes, report) = drive_push(
+            &mut sync,
+            vec![pending("1"), pending("2")],
+            vec![remote("1", &[]), remote("2", &[])],
+            vec![accepted("1")],
+        );
+
+        assert_eq!(
+            upserted(&writes, "1")
+                .expect("the reported push rebases")
+                .status,
+            ReplicaStatus::Clean,
+        );
+        assert!(
+            upserted(&writes, "2").is_none(),
+            "an unreported push must stay dirty for the next run: {writes:?}",
+        );
+        assert_eq!(report.pushed, 1);
+        assert_eq!(report.rejected, 0, "silence is not a rejection");
+    }
+
+    /// Results are matched by handle, so their order does not matter, a
+    /// handle nobody pushed changes nothing, and one reported twice counts
+    /// once.
+    #[test]
+    fn a_result_set_is_matched_by_handle_not_by_shape() {
+        let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
+        let results = vec![
+            accepted("2"),
+            accepted("nobody-pushed-this"),
+            accepted("1"),
+            accepted("2"),
+        ];
+        let (writes, report) = drive_push(
+            &mut sync,
+            vec![pending("1"), pending("2")],
+            vec![remote("1", &[]), remote("2", &[])],
+            results,
+        );
+
+        for handle in ["1", "2"] {
+            let rebased = upserted(&writes, handle);
+            assert!(rebased.is_some_and(|p| p.status == ReplicaStatus::Clean));
+        }
+        assert!(upserted(&writes, "nobody-pushed-this").is_none());
+        assert_eq!(
+            report.pushed, 2,
+            "a duplicate result and an unknown handle cannot inflate the count",
+        );
+        assert_eq!(
+            report.events.len(),
+            2,
+            "nor emit an event twice: {:?}",
+            report.events,
+        );
+    }
+
     #[test]
     fn partial_push_accepts_one_rejects_other() {
         let mut one = synced("1", &[]);
@@ -2147,6 +2266,7 @@ mod tests {
         let opts = ReplicaSyncOptions {
             push: false,
             rights: ReplicaPushRights::all(),
+            delete: ReplicaDeletePolicy::Revert,
             conflict: ReplicaConflictPolicy::Manual,
             full: false,
         };
@@ -2321,6 +2441,7 @@ mod tests {
         let opts = ReplicaSyncOptions {
             push: false,
             rights: ReplicaPushRights::all(),
+            delete: ReplicaDeletePolicy::Revert,
             conflict: ReplicaConflictPolicy::Manual,
             full: false,
         };
@@ -2585,6 +2706,7 @@ mod tests {
             ReplicaSyncOptions {
                 push: true,
                 rights: ReplicaPushRights::all(),
+                delete: ReplicaDeletePolicy::Revert,
                 conflict: ReplicaConflictPolicy::Manual,
                 full: true,
             },
@@ -3043,6 +3165,7 @@ mod tests {
         let opts = ReplicaSyncOptions {
             push: false,
             rights: ReplicaPushRights::all(),
+            delete: ReplicaDeletePolicy::Revert,
             conflict: ReplicaConflictPolicy::Manual,
             full: false,
         };
@@ -3064,6 +3187,7 @@ mod tests {
             ReplicaSyncOptions {
                 push: false,
                 rights: ReplicaPushRights::all(),
+                delete: ReplicaDeletePolicy::Revert,
                 conflict: ReplicaConflictPolicy::Manual,
                 full: false,
             },
@@ -3090,6 +3214,7 @@ mod tests {
         let opts = ReplicaSyncOptions {
             push: false,
             rights: ReplicaPushRights::all(),
+            delete: ReplicaDeletePolicy::Revert,
             conflict: ReplicaConflictPolicy::Manual,
             full: false,
         };
@@ -3221,7 +3346,7 @@ mod tests {
     }
 
     #[test]
-    fn forbidding_remove_keeps_tombstone_undropped() {
+    fn forbidding_remove_reverts_the_tombstone_by_default() {
         let mut local = synced("1", &["seen"]);
         local.status = ReplicaStatus::Tombstone;
 
@@ -3234,9 +3359,50 @@ mod tests {
                 w,
                 ReplicaWriteOp::DropPlacement { handle, .. } if handle.as_str() == "1"
             )),
-            "the tombstone must be retained, not dropped: {writes:?}",
+            "a delete the source refuses is never applied to the replica: {writes:?}",
+        );
+        assert_eq!(
+            upserted(&writes, "1")
+                .expect("the tombstone is reverted")
+                .status,
+            ReplicaStatus::Clean,
+            "the default policy mirrors the source, as it does for a read-only one",
         );
         assert_eq!(report.pushed, 0);
+    }
+
+    /// The two ways a source can refuse a delete now answer to one policy,
+    /// so `ReplicaPushRights::none()` and `push = false` agree on it.
+    #[test]
+    fn keeping_a_refused_delete_holds_the_tombstone_either_way() {
+        let mut local = synced("1", &["seen"]);
+        local.status = ReplicaStatus::Tombstone;
+
+        let forbidden = ReplicaSyncOptions {
+            rights: ReplicaPushRights {
+                remove: false,
+                ..ReplicaPushRights::all()
+            },
+            delete: ReplicaDeletePolicy::Keep,
+            ..Default::default()
+        };
+        let read_only = ReplicaSyncOptions {
+            push: false,
+            delete: ReplicaDeletePolicy::Keep,
+            ..Default::default()
+        };
+
+        for opts in [forbidden, read_only] {
+            let mut sync = ReplicaSync::new("inbox", opts);
+            let (pushes, writes, _report) =
+                run(&mut sync, vec![local.clone()], vec![remote("1", &["seen"])]);
+
+            assert!(pushes.is_none(), "a refused delete must not push");
+            assert!(
+                upserted(&writes, "1").is_none(),
+                "the tombstone is held as it is, for a later run: {writes:?}",
+            );
+        }
     }
 
     #[test]

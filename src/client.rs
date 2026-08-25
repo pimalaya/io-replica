@@ -55,8 +55,14 @@ pub trait ReplicaStorage {
         links: &[ReplicaLinkId],
     ) -> Result<BTreeMap<ReplicaLinkId, ReplicaHash>, Self::Error>;
 
-    /// Applies a batch of writes atomically, maintaining the
-    /// pointer-derived object references [`ReplicaWriteOp`] documents.
+    /// Applies a batch of writes atomically and **in order**, maintaining
+    /// the pointer-derived object references [`ReplicaWriteOp`] documents.
+    ///
+    /// Order matters because a batch may name one handle twice: a sync that
+    /// clears an ambiguity and then reads the same handle as vanished writes
+    /// the cleared placement and then drops it, and the drop is the answer.
+    /// A storage may not group the batch by op kind, or otherwise reorder
+    /// it.
     ///
     /// The engine assumes a single writer per collection between a load
     /// and the write derived from it: a batch applied over state another
