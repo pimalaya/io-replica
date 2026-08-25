@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-08-25
+
+### Fixed
+
+- **A body linked from the object store read as a local edit, on every sync, for good.** `ReplicaUpgrade` resolves a link id against the store before fetching, so an item present in two collections is downloaded once; that branch set the placement's body and level but left its base behind, while the fetch branch a few lines down moves the base with the body. The placement then held a body its base did not, which is exactly the shape of a staged local edit: a storage projected it dirty, the consumer reported a change it never made, and nothing converged. Seen on plain mail, where the same message sits in two folders (an inbox copy and a trashed one).
+
+  The dedup branch now rebases too. **A store already holding such a placement is not repaired by this**: the item is at `Full` with a body, so no upgrade revisits it. Dropping and resyncing the replica clears it, and it cannot recur.
+
+- **A mutable body is no longer linked from another collection.** A link id says two copies are the same item, not that they hold the same bytes, and where a source rewrites bodies in place (CardDAV, CalDAV) the difference is observable through the revision each copy carries. Such a placement is now fetched rather than linked, so no copy's bytes are recorded under another copy's revision. Immutable content (mail) keeps the dedup, which is what it was written for; the object store still deduplicates the bytes either way, so the cost is one fetch, not one body.
+
 ## [0.4.1] - 2026-08-25
 
 ### Fixed
@@ -98,7 +108,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added the std client behind the client feature: a blocking ReplicaClient servicing every yield through the consumer-implemented Storage and Remote traits.
 - Documented the at-least-once push contract (an add's link_id dedups a retry, a remove of an already-missing member reads as accepted) and the pointer-derived object refcounting the consumer maintains by diffing placement upserts and drops.
 
-[unreleased]: https://github.com/pimalaya/io-replica/compare/v0.4.1..HEAD
+[unreleased]: https://github.com/pimalaya/io-replica/compare/v0.4.2..HEAD
+[0.4.2]: https://github.com/pimalaya/io-replica/compare/v0.4.1..v0.4.2
 [0.4.1]: https://github.com/pimalaya/io-replica/compare/v0.4.0..v0.4.1
 [0.4.0]: https://github.com/pimalaya/io-replica/compare/v0.3.0..v0.4.0
 [0.3.0]: https://github.com/pimalaya/io-replica/compare/v0.2.0..v0.3.0
