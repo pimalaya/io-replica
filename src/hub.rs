@@ -103,7 +103,8 @@ pub struct ReplicaHubItem {
     pub meta: Option<ReplicaMeta>,
     /// The current sort key, shared by every source; empty until derived.
     pub sort_key: ReplicaSortKey,
-    /// The highest detail level any source has reached.
+    /// The highest detail level any source has reached, which is the item's
+    /// own only while it holds a body ([`stored_level`](Self::stored_level)).
     pub level: ReplicaLevel,
     /// Set once a source removed the item: the delete propagates to every
     /// source still holding it, and it is never copied to one that lacks it. A
@@ -117,6 +118,25 @@ pub struct ReplicaHubItem {
     pub conflict_object: Option<ReplicaHash>,
     /// Per-source bindings, keyed by source id.
     pub sources: BTreeMap<ReplicaSourceId, ReplicaSourceBinding>,
+}
+
+impl ReplicaHubItem {
+    /// The detail level the item can honestly claim: [`Full`] means a stored
+    /// body, so an item holding none reads one rung down however far a source
+    /// got.
+    ///
+    /// [`level`](Self::level) is the high-water mark across sources, and only
+    /// [`object`](Self::object) says whether the body is there. Reading the
+    /// mark as the fact strands an item a content change refreshed, an upgrade
+    /// skipping whatever already reads as [`Full`].
+    ///
+    /// [`Full`]: ReplicaLevel::Full
+    pub fn stored_level(&self) -> ReplicaLevel {
+        match self.object {
+            Some(_) => self.level,
+            None => self.level.min(ReplicaLevel::Meta),
+        }
+    }
 }
 
 /// The multi-source hub: logical items keyed by link id.
@@ -136,7 +156,9 @@ impl ReplicaHub {
     /// seen reads as dirty and the engine pushes it. Each item the source
     /// lacks, whose body the hub already holds, yields a `Created` append
     /// (membership propagation). Never raises the level, so a two-source sync
-    /// of in-agreement items fetches zero bodies.
+    /// of in-agreement items fetches zero bodies, and projects the
+    /// [`stored_level`](ReplicaHubItem::stored_level), so an item whose body a
+    /// content change dropped is fetched again.
     pub fn project(
         &self,
         collection: &ReplicaCollectionId,
@@ -197,7 +219,7 @@ impl ReplicaHub {
             handle: binding.handle.clone(),
             link_id: Some(link.clone()),
             object: item.object.clone(),
-            level: item.level,
+            level: item.stored_level(),
             meta: item.meta.clone(),
             sort_key: item.sort_key.clone(),
             flags: item.flags.clone(),
@@ -224,7 +246,7 @@ impl ReplicaHub {
             handle: binding.handle.clone(),
             link_id: Some(link.clone()),
             object: item.object.clone(),
-            level: item.level,
+            level: item.stored_level(),
             meta: item.meta.clone(),
             sort_key: item.sort_key.clone(),
             flags: item.flags.clone(),
@@ -339,6 +361,8 @@ impl ReplicaHub {
         item.level = item.level.max(placement.level);
 
         Self::reconcile_content(item, source, placement, policy);
+
+        item.level = item.stored_level();
 
         item.sources
             .insert(source.clone(), Self::binding_of(placement));
@@ -1209,5 +1233,95 @@ mod flags_tests {
         hub.absorb(&left, &[upsert(ReplicaFlags::default())]);
         let projected = hub.project(&ReplicaCollectionId::from("inbox"), &left);
         assert_eq!(projected[0].flags, ReplicaFlags::default());
+    }
+}
+
+#[cfg(test)]
+mod stored_level_tests {
+
+    use crate::{
+        change::ReplicaWriteOp,
+        hub::*,
+        object::ReplicaHash,
+        placement::{ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaPlacement},
+    };
+
+    /// One source's placement of the same item, at the stated level and body.
+    fn upsert(level: ReplicaLevel, object: Option<&str>, base: Option<&str>) -> ReplicaWriteOp {
+        ReplicaWriteOp::UpsertPlacement(ReplicaPlacement {
+            collection: ReplicaCollectionId::from("contacts"),
+            handle: ReplicaHandle::from("card-1.vcf"),
+            link_id: Some(ReplicaLinkId::from("uid:card-1")),
+            object: object.map(ReplicaHash::from),
+            level,
+            meta: Some(ReplicaMeta(String::from("{\"v\":1}"))),
+            sort_key: ReplicaSortKey::default(),
+            flags: ReplicaFlags::default(),
+            status: ReplicaStatus::Clean,
+            conflict_revision: None,
+            base: Some(ReplicaBase {
+                flags: ReplicaFlags::default(),
+                revision: None,
+                object: base.map(ReplicaHash::from),
+            }),
+            origin: None,
+        })
+    }
+
+    #[test]
+    fn a_refreshed_item_stops_claiming_the_body_it_lost() {
+        // A remote content change through the hub: the merge dropped the
+        // stale body, so the item is summarised but no longer stored.
+        let mut hub = ReplicaHub::default();
+        let left = ReplicaSourceId::from("left");
+
+        hub.absorb(
+            &left,
+            &[upsert(ReplicaLevel::Full, Some("body1"), Some("body1"))],
+        );
+        hub.absorb(&left, &[upsert(ReplicaLevel::Probed, None, None)]);
+
+        let item = &hub.items[&ReplicaLinkId::from("uid:card-1")];
+        assert_eq!(item.object, None, "the stale body is gone");
+        assert_eq!(
+            item.level,
+            ReplicaLevel::Meta,
+            "so the level cannot be Full"
+        );
+
+        let projected = hub.project(&ReplicaCollectionId::from("contacts"), &left);
+        assert_eq!(projected[0].level, ReplicaLevel::Meta);
+    }
+
+    #[test]
+    fn a_body_less_item_stored_as_full_projects_below_it() {
+        // The shape a store written before this rule holds. An upgrade reads
+        // the projection, so this is what heals it.
+        let mut hub = ReplicaHub::default();
+        let left = ReplicaSourceId::from("left");
+
+        hub.absorb(&left, &[upsert(ReplicaLevel::Full, Some("body1"), None)]);
+        let item = hub
+            .items
+            .get_mut(&ReplicaLinkId::from("uid:card-1"))
+            .expect("the absorbed item");
+        item.object = None;
+        item.level = ReplicaLevel::Full;
+
+        let projected = hub.project(&ReplicaCollectionId::from("contacts"), &left);
+        assert_eq!(projected[0].level, ReplicaLevel::Meta);
+    }
+
+    #[test]
+    fn a_stored_body_keeps_the_level_it_reached() {
+        // The rule is the body's absence and nothing else.
+        let mut hub = ReplicaHub::default();
+        let left = ReplicaSourceId::from("left");
+
+        hub.absorb(&left, &[upsert(ReplicaLevel::Full, Some("body1"), None)]);
+
+        let item = &hub.items[&ReplicaLinkId::from("uid:card-1")];
+        assert_eq!(item.level, ReplicaLevel::Full);
+        assert_eq!(item.stored_level(), ReplicaLevel::Full);
     }
 }
