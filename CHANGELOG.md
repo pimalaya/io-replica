@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ReplicaDropReason`, carried by `ReplicaWriteOp::DropPlacement`: whether the item itself is gone, or only this row of it.
 - `ReplicaPlacement::staged_edit`, the single reading of "there is a local content edit here", replacing six hand-rolled predicates that disagreed about the status guard and about what a missing base means.
 
-- `ReplicaSync::PUSH_CHUNK`, the number of changes one push chunk holds.
+- `ReplicaSync::PUSH_CHUNK` and `ReplicaSync::WRITE_CHUNK`, the number of changes one push chunk holds and the number of writes one batch holds.
 
 ### Changed
 
@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A sync pushes and records in chunks**, yielding a `WantsPush` and the `WantsWrite` recording it per chunk of `ReplicaSync::PUSH_CHUNK` changes, instead of one of each per run. A crash between a serviced push and its recording write used to replay every push the run derived; it now replays only the chunk whose write never landed, and a chunk that was never reached was never pushed. A driver that assumed one push and one write per run has to loop; `ReplicaClient` already does.
 - The checkpoint lands in the last write of a run rather than in the middle of the batch, and stays the pre-push one: an intermediate chunk's write must not carry a cursor claiming its unrecorded pushes were seen.
+
+- **The merge joins the two sides instead of copying them.** It used to build a set union of the local and remote key spaces, cloning every handle, every remote item and every placement to produce a walk over two sides that were both ordered already; it now walks them together and takes each placement, copying one only where a write takes ownership. On 100k members that pass alone cost 83 ms before the merge looked at anything, against the 225 ms the whole merge takes.
+- **A merge hands its writes over in bounded batches** of `ReplicaSync::WRITE_CHUNK`, instead of holding one write per member until the last candidate is resolved. A batch is cut between candidates and never inside one, since the writes of a single candidate (a keep-both resolution stages a member beside the placement it forked from) are consistent only together. An interrupted merge now leaves its prefix applied where it used to leave nothing, which the unmoved checkpoint makes safe to resume.
+- `ReplicaRemoteSnapshot::items` is expected sorted by handle, each handle listed once. A snapshot that arrives unsorted is sorted and a repeated handle collapsed, so a consumer that gets it wrong pays a pass rather than correctness.
 
 - `ReplicaLoadScope::Link` becomes `Links`, taking several: the reads that ask about an identity rather than a location have to see every row claiming it.
 - A completed `ReplicaSync` no longer resumes. It used to hand back an empty report, which a caller cannot tell from a run that genuinely did nothing.

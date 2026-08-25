@@ -495,7 +495,6 @@ impl ReplicaSync {
         }
     }
 
-
     /// Three-way merges one candidate, writing the resolved placement and
     /// returning a push when the local side won.
     fn merge(&mut self, candidate: Candidate) -> Option<ReplicaChangeKind> {
@@ -1388,7 +1387,10 @@ impl Merge {
                 .or_else(|| base.revision.clone()),
         });
 
-        Some(Candidate { remote, ..candidate })
+        Some(Candidate {
+            remote,
+            ..candidate
+        })
     }
 }
 
@@ -1414,7 +1416,10 @@ struct Join {
 }
 
 impl Join {
-    fn new(local: BTreeMap<ReplicaHandle, ReplicaPlacement>, remote: Vec<ReplicaRemoteItem>) -> Self {
+    fn new(
+        local: BTreeMap<ReplicaHandle, ReplicaPlacement>,
+        remote: Vec<ReplicaRemoteItem>,
+    ) -> Self {
         Self {
             local: local.into_iter().peekable(),
             remote: remote.into_iter().peekable(),
@@ -1682,6 +1687,86 @@ mod tests {
         (writes, report)
     }
 
+    /// What a run asked for, in the order it asked.
+    struct Run {
+        /// Each push chunk, in order.
+        chunks: Vec<Vec<ReplicaChange>>,
+        /// Each write batch, in order.
+        batches: Vec<Vec<ReplicaWriteOp>>,
+        /// The yields as they came, so a test can pin the interleaving.
+        order: Vec<&'static str>,
+        report: ReplicaSyncReport,
+    }
+
+    impl Run {
+        /// Every write of the run, batch boundaries flattened away.
+        fn writes(&self) -> Vec<ReplicaWriteOp> {
+            self.batches.iter().flatten().cloned().collect()
+        }
+
+        /// The index of the batch holding a write, if any.
+        fn batch_of(&self, mut held: impl FnMut(&ReplicaWriteOp) -> bool) -> Option<usize> {
+            self.batches
+                .iter()
+                .position(|batch| batch.iter().any(&mut held))
+        }
+    }
+
+    /// Drives a sync to completion against a remote that accepts every push
+    /// and assigns nothing, collecting every yield.
+    ///
+    /// Unlike [`run`] it makes no assumption about how many pushes and
+    /// writes a run takes, which is what the chunked paths are about.
+    fn run_batches(
+        sync: &mut ReplicaSync,
+        local: Vec<ReplicaPlacement>,
+        snapshot: ReplicaRemoteSnapshot,
+    ) -> Run {
+        crate::testlog::init();
+        let _ = sync.resume(None);
+        let _ = sync.resume(Some(ReplicaArg::Load(ReplicaLoaded {
+            placements: local,
+            checkpoint: None,
+        })));
+
+        let mut run = Run {
+            chunks: Vec::new(),
+            batches: Vec::new(),
+            order: Vec::new(),
+            report: ReplicaSyncReport::default(),
+        };
+        let mut arg = Some(ReplicaArg::Enumerate(snapshot));
+
+        loop {
+            match sync.resume(arg.take()) {
+                ReplicaCoroutineState::Yielded(ReplicaYield::WantsPush { changes, .. }) => {
+                    run.order.push("push");
+                    let results = changes
+                        .iter()
+                        .map(|change| ReplicaPushResult {
+                            handle: change.handle().clone(),
+                            outcome: ReplicaPushOutcome::Accepted,
+                            assigned: None,
+                            revision: None,
+                        })
+                        .collect();
+                    run.chunks.push(changes);
+                    arg = Some(ReplicaArg::Push(results));
+                }
+                ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(writes)) => {
+                    run.order.push("write");
+                    run.batches.push(writes);
+                    arg = Some(ReplicaArg::Write);
+                }
+                ReplicaCoroutineState::Complete(Ok(report)) => {
+                    run.report = report;
+                    return run;
+                }
+                state => panic!("expected push or write, got {state:?}"),
+            }
+        }
+    }
+
     /// Finds the placement an UpsertPlacement op writes for `handle`, if any.
     fn upserted<'a>(writes: &'a [ReplicaWriteOp], handle: &str) -> Option<&'a ReplicaPlacement> {
         writes.iter().find_map(|w| match w {
@@ -1838,71 +1923,155 @@ mod tests {
             items.push(remote(&handle, &[]));
         }
 
-        crate::testlog::init();
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
-        let _ = sync.resume(None);
-        let _ = sync.resume(Some(ReplicaArg::Load(ReplicaLoaded {
-            placements: local,
-            checkpoint: None,
-        })));
+        let run = run_batches(&mut sync, local, full(items));
 
-        let mut order = Vec::new();
-        let mut chunks: Vec<Vec<ReplicaHandle>> = Vec::new();
-        let mut batches: Vec<Vec<ReplicaWriteOp>> = Vec::new();
-        let mut arg = Some(ReplicaArg::Enumerate(full(items)));
-
-        let report = loop {
-            match sync.resume(arg.take()) {
-                ReplicaCoroutineState::Yielded(ReplicaYield::WantsPush { changes, .. }) => {
-                    order.push("push");
-                    let results = changes
-                        .iter()
-                        .map(|change| ReplicaPushResult {
-                            handle: change.handle().clone(),
-                            outcome: ReplicaPushOutcome::Accepted,
-                            assigned: None,
-                            revision: None,
-                        })
-                        .collect();
-                    chunks.push(changes.iter().map(|c| c.handle().clone()).collect());
-                    arg = Some(ReplicaArg::Push(results));
-                }
-                ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(writes)) => {
-                    order.push("write");
-                    batches.push(writes);
-                    arg = Some(ReplicaArg::Write);
-                }
-                ReplicaCoroutineState::Complete(Ok(report)) => break report,
-                state => panic!("expected push or write, got {state:?}"),
-            }
-        };
-
-        assert_eq!(order, ["push", "write", "push", "write"]);
-        assert_eq!(chunks[0].len(), ReplicaSync::PUSH_CHUNK);
-        assert_eq!(chunks[1].len(), extra);
+        assert_eq!(run.order, ["push", "write", "push", "write"]);
+        assert_eq!(run.chunks[0].len(), ReplicaSync::PUSH_CHUNK);
+        assert_eq!(run.chunks[1].len(), extra);
 
         // each chunk is rebased by the write that follows it, and by no
         // other: nothing of the second chunk rides the first batch.
-        for handle in &chunks[0] {
-            let rebased = upserted(&batches[0], handle.as_str());
+        for change in &run.chunks[0] {
+            let rebased = upserted(&run.batches[0], change.handle().as_str());
             assert!(rebased.is_some_and(|p| p.status == ReplicaStatus::Clean));
         }
-        for handle in &chunks[1] {
-            assert!(upserted(&batches[0], handle.as_str()).is_none());
-            let rebased = upserted(&batches[1], handle.as_str());
+        for change in &run.chunks[1] {
+            let handle = change.handle().as_str();
+            assert!(upserted(&run.batches[0], handle).is_none());
+            let rebased = upserted(&run.batches[1], handle);
             assert!(rebased.is_some_and(|p| p.status == ReplicaStatus::Clean));
         }
 
         // the checkpoint lands in the last write, and only there
-        let checkpointed = |batch: &Vec<ReplicaWriteOp>| {
-            batch
-                .iter()
-                .any(|op| matches!(op, ReplicaWriteOp::SetCheckpoint { .. }))
-        };
-        assert!(!checkpointed(&batches[0]), "an early checkpoint");
-        assert!(checkpointed(&batches[1]), "no closing checkpoint");
+        assert!(
+            run.batch_of(|op| matches!(op, ReplicaWriteOp::SetCheckpoint { .. })) == Some(1),
+            "the checkpoint must land in the closing batch",
+        );
 
-        assert_eq!(report.pushed, count);
+        assert_eq!(run.report.pushed, count);
+    }
+
+    /// The join walks both sides in handle order, so an enumeration that
+    /// arrives out of order is ordered rather than trusted: it must derive
+    /// exactly what the same snapshot sorted derives.
+    #[test]
+    fn an_unordered_enumeration_merges_like_an_ordered_one() {
+        // every combination the join walks: a member both sides hold whose
+        // flags the remote changed, one both hold unchanged, one only the
+        // replica holds (removed upstream), one only the remote holds (new),
+        // and a locally dirty one (a push).
+        let local = || {
+            let mut dirty = synced("5", &[]);
+            dirty.flags = ReplicaFlags::from_iter(["flagged"]);
+            dirty.status = ReplicaStatus::Dirty;
+            vec![synced("1", &[]), synced("2", &[]), synced("3", &[]), dirty]
+        };
+        let items = || {
+            vec![
+                remote("1", &["seen"]),
+                remote("3", &[]),
+                remote("4", &[]),
+                remote("5", &[]),
+            ]
+        };
+
+        let mut ordered = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
+        let ordered = run_batches(&mut ordered, local(), full(items()));
+
+        let mut shuffled = items();
+        shuffled.reverse();
+        let mut unordered = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
+        let unordered = run_batches(&mut unordered, local(), full(shuffled));
+
+        assert_eq!(unordered.chunks, ordered.chunks, "different pushes");
+        assert_eq!(unordered.writes(), ordered.writes(), "different writes");
+        assert_eq!(unordered.report, ordered.report, "different report");
+        assert_eq!(
+            ordered.report.pulled, 3,
+            "one pull each of add, flags, drop"
+        );
+        assert_eq!(ordered.report.pushed, 1);
+    }
+
+    /// A handle the enumeration lists twice pairs with the one placement
+    /// holding it, rather than merging a second time against nothing and
+    /// pulling a phantom member.
+    #[test]
+    fn a_handle_listed_twice_is_merged_once() {
+        let snapshot = full(vec![remote("1", &["seen"]), remote("1", &["seen"])]);
+        let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
+        let run = run_batches(&mut sync, vec![synced("1", &[])], snapshot);
+
+        assert_eq!(run.report.events, [ReplicaEvent::FlagsChanged("1".into())]);
+        assert_eq!(
+            run.writes().len(),
+            2,
+            "one upsert and the checkpoint: {:?}",
+            run.writes(),
+        );
+    }
+
+    /// The merge hands a full write batch over rather than holding one write
+    /// per member until the last one is resolved.
+    #[test]
+    fn a_full_write_batch_is_handed_over_mid_merge() {
+        let extra = 76;
+        let count = ReplicaSync::WRITE_CHUNK + extra;
+        let items = (0..count)
+            .map(|index| remote(&format!("{index:05}"), &[]))
+            .collect();
+
+        let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
+        let run = run_batches(&mut sync, vec![], full(items));
+
+        assert_eq!(run.order, ["write", "write"], "one batch, or three");
+        assert_eq!(run.batches[0].len(), ReplicaSync::WRITE_CHUNK);
+        assert_eq!(
+            run.batches[1].len(),
+            extra + 1,
+            "the rest, plus the checkpoint",
+        );
+        assert!(
+            run.batch_of(|op| matches!(op, ReplicaWriteOp::SetCheckpoint { .. })) == Some(1),
+            "a mid-merge batch must not checkpoint what it has not merged",
+        );
+        assert_eq!(run.report.pulled, count);
+    }
+
+    /// A batch boundary falls between candidates and never inside one: a
+    /// keep-both resolution writes the pulled placement and the local body
+    /// staged beside it, and losing either would lose a version.
+    #[test]
+    fn a_batch_never_cuts_through_one_candidate() {
+        // fillers enough to leave the boundary exactly on the resolution
+        let fillers = ReplicaSync::WRITE_CHUNK - 1;
+        let items = (0..fillers)
+            .map(|index| remote(&format!("{index:05}"), &[]))
+            .chain([remote_rev("zz", "r2")])
+            .collect();
+
+        let mut sync = ReplicaSync::new("inbox", with_conflict(ReplicaConflictPolicy::KeepBoth));
+        let run = run_batches(&mut sync, vec![edited("zz")], full(items));
+
+        let staged = run
+            .batch_of(|op| matches!(op, ReplicaWriteOp::UpsertPlacement(p) if p.status == ReplicaStatus::Created))
+            .expect("a keep-both duplicate");
+        let pulled = run
+            .batch_of(
+                |op| matches!(op, ReplicaWriteOp::UpsertPlacement(p) if p.handle.as_str() == "zz"),
+            )
+            .expect("the pulled placement");
+
+        assert!(
+            run.batches[0].len() > ReplicaSync::WRITE_CHUNK,
+            "the boundary must fall on the resolution, not before it",
+        );
+        assert_eq!(
+            staged, pulled,
+            "both versions of one candidate must land together: {:?}",
+            run.order,
+        );
     }
 
     #[test]

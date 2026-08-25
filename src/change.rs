@@ -323,9 +323,12 @@ pub enum ReplicaWriteOp {
         reason: ReplicaDropReason,
     },
     /// Store an object body. Storing takes no reference of its own:
-    /// references come from placement pointers only, and a paired
-    /// [`ReplicaWriteOp::UpsertPlacement`] pointing at the hash lands in the
-    /// same batch.
+    /// references come from placement pointers only, so a stored object is
+    /// unreferenced until an [`ReplicaWriteOp::UpsertPlacement`] points at its
+    /// hash. That upsert usually rides in the same batch, but it need not: a
+    /// consumer streaming bodies ahead of their metadata stores them in one
+    /// batch and attaches them in a later one, and a storage backend must keep
+    /// an unreferenced object rather than collect it at the commit.
     StoreObject {
         /// The object metadata.
         object: ReplicaObject,
