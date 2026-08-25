@@ -18,9 +18,12 @@
 //! survives a remote delete as a pending create. Permission gating drops
 //! pushes a read-only source forbids.
 
-use core::mem;
+use core::{cmp::Ordering, iter::Peekable, mem};
 
-use alloc::{collections::BTreeMap, collections::BTreeSet, string::String, vec::Vec};
+use alloc::{
+    collections::BTreeMap, collections::BTreeSet, collections::btree_map::IntoIter, string::String,
+    vec::IntoIter as VecIntoIter, vec::Vec,
+};
 
 use log::{debug, trace};
 use thiserror::Error;
@@ -203,6 +206,9 @@ pub struct ReplicaSync {
     opts: ReplicaSyncOptions,
     local: BTreeMap<ReplicaHandle, ReplicaPlacement>,
     checkpoint: Option<ReplicaCheckpoint>,
+    /// The merge in progress, from the enumerate that opens it to the
+    /// candidate that exhausts it.
+    merging: Option<Merge>,
     writes: Vec<ReplicaWriteOp>,
     /// The changes the merge derived and no chunk has taken yet, in the
     /// order they were derived.
@@ -248,6 +254,17 @@ impl ReplicaSync {
     /// window, not throughput.
     pub const PUSH_CHUNK: usize = 64;
 
+    /// How many storage writes one batch holds before the merge hands it
+    /// over.
+    ///
+    /// A merge over a whole collection would otherwise hold a write per
+    /// member until the last one is resolved, so this bounds what the run
+    /// keeps in memory rather than a crash window: a lost batch costs a
+    /// re-merge, which is free, where a lost push costs a round trip. It is
+    /// a floor, not a ceiling, and never cuts through the writes of one
+    /// candidate.
+    pub const WRITE_CHUNK: usize = 1024;
+
     /// Creates a coroutine that reconciles `collection`.
     pub fn new(collection: impl Into<ReplicaCollectionId>, opts: ReplicaSyncOptions) -> Self {
         let collection = collection.into();
@@ -262,6 +279,7 @@ impl ReplicaSync {
             opts,
             local: BTreeMap::new(),
             checkpoint: None,
+            merging: None,
             writes: Vec::new(),
             pushes: Vec::new(),
             in_flight: Vec::new(),
@@ -327,45 +345,103 @@ impl ReplicaSync {
         batch
     }
 
-    /// Runs the three-way merge, filling `self.writes` and `self.report`
-    /// and returning the pushes to send.
-    fn reconcile(&mut self, snapshot: ReplicaRemoteSnapshot) -> Vec<ReplicaChange> {
+    /// Opens the three-way merge over what the enumerate reported.
+    ///
+    /// The local placements are taken out of the coroutine and handed to the
+    /// join: nothing else reads them, so the merge owns each one instead of
+    /// cloning it per candidate.
+    fn open_merge(&mut self, snapshot: ReplicaRemoteSnapshot) {
         let ReplicaRemoteSnapshot {
-            items,
+            mut items,
             vanished,
             complete,
             checkpoint,
         } = snapshot;
 
-        let remote: BTreeMap<ReplicaHandle, ReplicaRemoteItem> =
-            items.into_iter().map(|i| (i.handle.clone(), i)).collect();
+        // NOTE: the join walks both sides in handle order, so a snapshot
+        // that arrives unordered is ordered here rather than trusted; an
+        // already-ordered one (what the contract asks for) costs one pass.
+        // A handle listed twice is collapsed to its first item, which is
+        // what pairing it against a local placement that exists once can
+        // mean.
+        if !items.is_sorted_by(|a, b| a.handle <= b.handle) {
+            debug!("enumeration is not ordered by handle, sorting it");
+            items.sort_by(|a, b| a.handle.cmp(&b.handle));
+        }
+        items.dedup_by(|a, b| a.handle == b.handle);
+
         let vanished: BTreeSet<ReplicaHandle> = vanished.into_iter().collect();
+        let mut local = mem::take(&mut self.local);
 
         // NOTE: before anything is merged, because a placement the source no
         // longer holds twice has to reconcile in this same run rather than
         // wait for an enumeration that may never list it again.
-        self.thaw(&remote, &vanished, complete);
+        self.thaw(&mut local, &items, &vanished, complete);
 
-        let candidates = if complete {
-            self.full_candidates(&remote)
-        } else {
-            self.delta_candidates(&remote, &vanished)
-        };
+        self.merging = Some(Merge {
+            join: Join::new(local, items),
+            vanished,
+            complete,
+            checkpoint,
+        });
+    }
 
-        let mut pushes = Vec::new();
+    /// Merges candidates until the write batch is full, or until the join
+    /// runs out and the run moves on to its pushes.
+    fn merge_step(
+        &mut self,
+    ) -> ReplicaCoroutineState<ReplicaYield, Result<ReplicaSyncReport, ReplicaSyncError>> {
+        while let Some(candidate) = self.next_candidate() {
+            // NOTE: the merge derives what to do; keying it is the last
+            // thing that happens to it, in one place, so no change can exist
+            // without its key or with one that names something else.
+            if let Some(kind) = self.merge(candidate) {
+                self.pushes.push(ReplicaChange::new(&self.collection, kind));
+            }
 
-        // NOTE: the merge derives what to do; keying it is the last thing
-        // that happens to it, in one place, so no change can exist without
-        // its key or with one that names something else.
-        for (handle, remote_item) in candidates {
-            if let Some(kind) = self.merge(&handle, remote_item) {
-                pushes.push(ReplicaChange::new(&self.collection, kind));
+            // NOTE: between candidates and never inside one. The writes one
+            // candidate derives are consistent only together: a keep-both
+            // resolution stages the local body as a new member beside the
+            // pulled placement it forked from, and a batch cut between them
+            // would lose that body if the next one never landed.
+            if self.writes.len() >= Self::WRITE_CHUNK {
+                self.state = State::Merging;
+                let batch = self.batch();
+                return ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(batch));
             }
         }
 
-        self.next_checkpoint = Some(checkpoint);
+        let merge = self.merging.take().expect("a merge in progress");
+        self.next_checkpoint = Some(merge.checkpoint);
+        debug!(
+            "reconciled: {} pulled, {} conflicts, {} changes to push",
+            self.report.pulled,
+            self.report.conflicts,
+            self.pushes.len(),
+        );
 
-        pushes
+        self.step()
+    }
+
+    /// The next handle to merge, or `None` once the join is exhausted.
+    ///
+    /// A complete snapshot merges every handle either side holds. A delta
+    /// merges the ones it reported changed or vanished, plus every locally
+    /// non-clean handle, whose pending push it would otherwise never
+    /// revisit.
+    fn next_candidate(&mut self) -> Option<Candidate> {
+        let merge = self.merging.as_mut()?;
+
+        loop {
+            let candidate = merge.join.next()?;
+
+            if merge.complete {
+                return Some(candidate);
+            }
+            if let Some(candidate) = merge.narrow(candidate) {
+                return Some(candidate);
+            }
+        }
     }
 
     /// Drops the ambiguous handles this snapshot shows the source no longer
@@ -382,20 +458,21 @@ impl ReplicaSync {
     /// than waiting for an enumeration that may never list it again.
     fn thaw(
         &mut self,
-        remote: &BTreeMap<ReplicaHandle, ReplicaRemoteItem>,
+        local: &mut BTreeMap<ReplicaHandle, ReplicaPlacement>,
+        remote: &[ReplicaRemoteItem],
         vanished: &BTreeSet<ReplicaHandle>,
         complete: bool,
     ) {
         let mut thawed = Vec::new();
 
-        for placement in self.local.values_mut() {
+        for placement in local.values_mut() {
             if placement.ambiguous_handles.is_empty() {
                 continue;
             }
 
             let before = placement.ambiguous_handles.len();
             placement.ambiguous_handles.retain(|handle| match complete {
-                true => remote.contains_key(handle),
+                true => remote.binary_search_by(|i| i.handle.cmp(handle)).is_ok(),
                 false => !vanished.contains(handle),
             });
             if placement.ambiguous_handles.len() == before {
@@ -418,83 +495,15 @@ impl ReplicaSync {
         }
     }
 
-    /// The handles to merge for a complete snapshot, each paired with its
-    /// remote state: the union of local and remote handles, where a local
-    /// handle absent from `remote` reads as removed upstream.
-    fn full_candidates(
-        &self,
-        remote: &BTreeMap<ReplicaHandle, ReplicaRemoteItem>,
-    ) -> Vec<(ReplicaHandle, Option<ReplicaRemoteItem>)> {
-        let handles: BTreeSet<ReplicaHandle> =
-            self.local.keys().chain(remote.keys()).cloned().collect();
-        handles
-            .into_iter()
-            .map(|handle| {
-                let item = remote.get(&handle).cloned();
-                (handle, item)
-            })
-            .collect()
-    }
 
-    /// The handles to merge for a delta snapshot: the changed handles, the
-    /// vanished ones, and any locally dirty handle (whose pending push the
-    /// delta would otherwise never revisit). An unlisted dirty handle is
-    /// unchanged upstream, so its remote state is its own base.
-    fn delta_candidates(
-        &self,
-        remote: &BTreeMap<ReplicaHandle, ReplicaRemoteItem>,
-        vanished: &BTreeSet<ReplicaHandle>,
-    ) -> Vec<(ReplicaHandle, Option<ReplicaRemoteItem>)> {
-        let dirty = self
-            .local
-            .iter()
-            .filter(|(_, p)| p.status != ReplicaStatus::Clean)
-            .map(|(handle, _)| handle.clone());
-
-        let handles: BTreeSet<ReplicaHandle> = remote
-            .keys()
-            .cloned()
-            .chain(vanished.iter().cloned())
-            .chain(dirty)
-            .collect();
-
-        handles
-            .into_iter()
-            .map(|handle| {
-                let item = if vanished.contains(&handle) {
-                    None
-                } else if let Some(item) = remote.get(&handle) {
-                    Some(item.clone())
-                } else {
-                    self.local.get(&handle).and_then(|p| {
-                        let base = p.base.as_ref()?;
-                        Some(ReplicaRemoteItem {
-                            handle: handle.clone(),
-                            flags: base.flags.clone(),
-                            // NOTE: the best-known remote state: a
-                            // conflicted placement has observed a remote
-                            // revision past its base, and synthesizing the
-                            // base one would regress its conflict tracking
-                            revision: p
-                                .conflict_revision
-                                .clone()
-                                .or_else(|| base.revision.clone()),
-                        })
-                    })
-                };
-                (handle, item)
-            })
-            .collect()
-    }
-
-    /// Three-way merges one handle against its remote state, writing the
-    /// resolved placement and returning a push when the local side won.
-    fn merge(
-        &mut self,
-        handle: &ReplicaHandle,
-        remote_item: Option<ReplicaRemoteItem>,
-    ) -> Option<ReplicaChangeKind> {
-        let local = self.local.get(handle).cloned();
+    /// Three-way merges one candidate, writing the resolved placement and
+    /// returning a push when the local side won.
+    fn merge(&mut self, candidate: Candidate) -> Option<ReplicaChangeKind> {
+        let Candidate {
+            handle,
+            local,
+            remote: remote_item,
+        } = candidate;
 
         // NOTE: the source holds this identity more than once, so which copy
         // any change refers to cannot be decided. Nothing is derived in
@@ -525,7 +534,7 @@ impl ReplicaSync {
         match (local_present, based, remote_present) {
             // NOTE: local delete or move: both knew it, we removed it here
             (false, true, true) if local_tombstone => {
-                let local = local.as_ref().expect("local present");
+                let local = local.expect("local present");
                 let item = remote_item.as_ref().expect("remote present");
 
                 // NOTE: the remote edited what was deleted locally: the
@@ -546,7 +555,7 @@ impl ReplicaSync {
                     // later enumerate to undo. An incremental enumerate
                     // never lists an untouched member again, so a dropped
                     // row would never come back at all.
-                    let mut reverted = local.clone();
+                    let mut reverted = local;
                     reverted.status = ReplicaStatus::Clean;
                     self.writes.push(ReplicaWriteOp::UpsertPlacement(reverted));
                     return None;
@@ -595,12 +604,12 @@ impl ReplicaSync {
             }
             // NOTE: local delete of something already gone remote
             (false, _, false) if local_tombstone => {
-                self.drop(handle, ReplicaDropReason::Deleted);
+                self.drop(&handle, ReplicaDropReason::Deleted);
                 None
             }
             // NOTE: remote delete: we had it in sync, it vanished upstream
             (true, true, false) => {
-                let local = local.as_ref().expect("local present");
+                let local = local.expect("local present");
 
                 // NOTE: the edit-beats-delete rule, push direction: a
                 // staged local edit survives the remote delete as a
@@ -616,7 +625,7 @@ impl ReplicaSync {
                         .as_ref()
                         .is_some_and(|b| local.object != b.object);
                 if edited {
-                    let mut resurrected = local.clone();
+                    let mut resurrected = local;
                     resurrected.status = ReplicaStatus::Created;
                     resurrected.conflict_revision = None;
                     resurrected.base = None;
@@ -629,17 +638,22 @@ impl ReplicaSync {
                         // resurrected create staged and pending, do not push.
                         return None;
                     }
-                    self.pending_creates.insert(handle.clone(), resurrected);
-                    return Some(ReplicaChangeKind::Add {
+
+                    // NOTE: the resurrected copy carries the identity, the
+                    // markers and the body the add re-uploads, the three the
+                    // resurrection leaves alone.
+                    let add = ReplicaChangeKind::Add {
                         handle: handle.clone(),
-                        link_id: local.link_id.clone(),
-                        flags: local.flags.clone(),
+                        link_id: resurrected.link_id.clone(),
+                        flags: resurrected.flags.clone(),
                         origin: None,
-                        object: local.object.clone(),
-                    });
+                        object: resurrected.object.clone(),
+                    };
+                    self.pending_creates.insert(handle, resurrected);
+                    return Some(add);
                 }
 
-                self.drop(handle, ReplicaDropReason::Deleted);
+                self.drop(&handle, ReplicaDropReason::Deleted);
                 self.report.pulled += 1;
                 self.emit(ReplicaEvent::Vanished(handle.clone()));
                 None
@@ -653,7 +667,7 @@ impl ReplicaSync {
             }
             // NOTE: present on both: reconcile content, then flags
             (true, _, true) => {
-                let local = local.as_ref().expect("local present");
+                let local = local.expect("local present");
                 let item = remote_item.as_ref().expect("remote present");
 
                 // NOTE: the content axis may have rewritten the placement
@@ -668,16 +682,16 @@ impl ReplicaSync {
                 // handle, so one handle yields at most one change. The
                 // merged flags are still written, dirty on the old base,
                 // and their own push derives again next sync.
-                match self.reconcile_content(local, item) {
+                match self.reconcile_content(&local, item) {
                     ContentOutcome::Push(change) => {
-                        self.reconcile_flags(local, item, PushFlags::Withhold);
+                        self.reconcile_flags(&local, item, PushFlags::Withhold);
                         Some(change)
                     }
                     ContentOutcome::Rewritten(rewritten) => {
                         self.reconcile_flags(&rewritten, item, PushFlags::Derive)
                     }
                     ContentOutcome::Untouched => {
-                        self.reconcile_flags(local, item, PushFlags::Derive)
+                        self.reconcile_flags(&local, item, PushFlags::Derive)
                     }
                 }
             }
@@ -686,17 +700,18 @@ impl ReplicaSync {
             // handle is held until the push reports it (in PendingPush). A
             // plain base-less placement that is not Created is left untouched.
             (true, false, false) => {
-                let local = local.as_ref().expect("local present");
+                let local = local.expect("local present");
                 if self.opts.push && self.opts.rights.add && local.status == ReplicaStatus::Created
                 {
-                    self.pending_creates.insert(handle.clone(), local.clone());
-                    return Some(ReplicaChangeKind::Add {
+                    let add = ReplicaChangeKind::Add {
                         handle: handle.clone(),
                         link_id: local.link_id.clone(),
                         flags: local.flags.clone(),
                         origin: local.origin.clone(),
                         object: local.object.clone(),
-                    });
+                    };
+                    self.pending_creates.insert(handle, local);
+                    return Some(add);
                 }
                 None
             }
@@ -1157,16 +1172,11 @@ impl ReplicaCoroutine for ReplicaSync {
                     snapshot.vanished.len(),
                     snapshot.complete,
                 );
-                self.pushes = self.reconcile(snapshot);
-                debug!(
-                    "reconciled: {} pulled, {} conflicts, {} changes to push",
-                    self.report.pulled,
-                    self.report.conflicts,
-                    self.pushes.len(),
-                );
-
-                self.step()
+                self.open_merge(snapshot);
+                self.merge_step()
             }
+
+            (State::Merging, Some(ReplicaArg::Write)) => self.merge_step(),
 
             (State::PendingPush, Some(ReplicaArg::Push(results))) => {
                 for result in &results {
@@ -1314,9 +1324,144 @@ enum State {
     Start,
     PendingLoad,
     PendingEnumerate,
+    Merging,
     PendingPush,
     PendingWrite,
     Done,
+}
+
+/// The merge in progress: what the enumerate reported, and how far the join
+/// has walked it.
+///
+/// Held across yields, because the merge is bounded like the pushes are: it
+/// stops at a full write batch and picks up where it left off.
+struct Merge {
+    join: Join,
+    /// The handles the delta reported gone, as a set: the delta rule asks
+    /// about handles the join is not walking.
+    vanished: BTreeSet<ReplicaHandle>,
+    /// Whether the snapshot is the whole remote, which is what makes a
+    /// locally-held handle it omits a removal rather than silence.
+    complete: bool,
+    /// The cursor the run checkpoints once every candidate is merged and
+    /// every push recorded.
+    checkpoint: ReplicaCheckpoint,
+}
+
+impl Merge {
+    /// Narrows a joined handle to what a delta snapshot makes a candidate,
+    /// or drops it as untouched.
+    ///
+    /// A handle the delta reported vanished is merged against no remote
+    /// state; one it listed is merged against what it listed; a locally
+    /// non-clean one it never mentioned is unchanged upstream, so its own
+    /// base stands in as the remote state and its pending push derives. A
+    /// clean handle the delta never mentioned has nothing to reconcile.
+    fn narrow(&self, candidate: Candidate) -> Option<Candidate> {
+        if self.vanished.contains(&candidate.handle) {
+            return Some(Candidate {
+                remote: None,
+                ..candidate
+            });
+        }
+        if candidate.remote.is_some() {
+            return Some(candidate);
+        }
+
+        let local = candidate.local.as_ref()?;
+        if local.status == ReplicaStatus::Clean {
+            return None;
+        }
+
+        // NOTE: a never-based placement (a staged create) has no remote
+        // state to stand in for, and is still a candidate: it is exactly the
+        // one whose add the delta will never mention until it lands.
+        let remote = local.base.as_ref().map(|base| ReplicaRemoteItem {
+            handle: candidate.handle.clone(),
+            flags: base.flags.clone(),
+            // NOTE: the best-known remote state: a conflicted placement has
+            // observed a remote revision past its base, and synthesizing the
+            // base one would regress its conflict tracking
+            revision: local
+                .conflict_revision
+                .clone()
+                .or_else(|| base.revision.clone()),
+        });
+
+        Some(Candidate { remote, ..candidate })
+    }
+}
+
+/// One handle to merge: the placement holding it locally, the state the
+/// remote reports for it, or both.
+struct Candidate {
+    handle: ReplicaHandle,
+    local: Option<ReplicaPlacement>,
+    remote: Option<ReplicaRemoteItem>,
+}
+
+/// Walks the local placements and the remote items in handle order, pairing
+/// them as it goes.
+///
+/// Both sides are ordered already, the local one because it is a
+/// `BTreeMap` and the remote one because the snapshot contract asks for it,
+/// so their union is a two-pointer walk rather than a set to build. It also
+/// owns both sides, which is what lets the merge take a placement rather
+/// than copy one per candidate.
+struct Join {
+    local: Peekable<IntoIter<ReplicaHandle, ReplicaPlacement>>,
+    remote: Peekable<VecIntoIter<ReplicaRemoteItem>>,
+}
+
+impl Join {
+    fn new(local: BTreeMap<ReplicaHandle, ReplicaPlacement>, remote: Vec<ReplicaRemoteItem>) -> Self {
+        Self {
+            local: local.into_iter().peekable(),
+            remote: remote.into_iter().peekable(),
+        }
+    }
+}
+
+impl Iterator for Join {
+    type Item = Candidate;
+
+    fn next(&mut self) -> Option<Candidate> {
+        let side = match (self.local.peek(), self.remote.peek()) {
+            (None, None) => return None,
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (Some((handle, _)), Some(item)) => handle.cmp(&item.handle),
+        };
+
+        let candidate = match side {
+            Ordering::Less => {
+                let (handle, local) = self.local.next()?;
+                Candidate {
+                    handle,
+                    local: Some(local),
+                    remote: None,
+                }
+            }
+            Ordering::Greater => {
+                let item = self.remote.next()?;
+                Candidate {
+                    handle: item.handle.clone(),
+                    local: None,
+                    remote: Some(item),
+                }
+            }
+            Ordering::Equal => {
+                let (handle, local) = self.local.next()?;
+                Candidate {
+                    handle,
+                    local: Some(local),
+                    remote: self.remote.next(),
+                }
+            }
+        };
+
+        Some(candidate)
+    }
 }
 
 #[cfg(test)]

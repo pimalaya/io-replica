@@ -55,6 +55,14 @@ pub struct ReplicaRemoteItem {
 pub struct ReplicaRemoteSnapshot {
     /// The members observed: every current member when `complete`, else
     /// only those added or changed since the cursor.
+    ///
+    /// Sorted by handle, and each handle listed once: the merge walks this
+    /// beside the local placements in that order rather than indexing it,
+    /// which is what keeps a whole-collection sync from copying both sides
+    /// to join them. Protocols hand it over sorted already (an IMAP SEARCH
+    /// returns ascending UIDs). A snapshot that arrives unsorted is sorted
+    /// by the engine and a handle listed twice is collapsed to its first
+    /// item, so getting it wrong costs a pass rather than correctness.
     pub items: Vec<ReplicaRemoteItem>,
     /// Handles removed upstream since the cursor. Always empty for a
     /// complete snapshot (absence from `items` already means removed).
