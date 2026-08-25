@@ -140,6 +140,7 @@ impl ReplicaCoroutine for ReplicaUpgrade {
                         let links: Vec<_> = pending
                             .iter()
                             .filter_map(|h| self.placements.get(h))
+                            .filter(|p| !is_mutable(p))
                             .filter_map(|p| p.link_id.clone())
                             .collect();
 
@@ -171,11 +172,19 @@ impl ReplicaCoroutine for ReplicaUpgrade {
                     let hit = placement
                         .link_id
                         .as_ref()
+                        .filter(|_| !is_mutable(placement))
                         .and_then(|link| known.get(link).cloned());
 
                     match hit {
                         Some(hash) => {
                             let mut patched = placement.clone();
+                            // NOTE: the base moves with the body, as it does on
+                            // the fetch below. A body linked from the store is
+                            // the item's synced content, and a base left behind
+                            // reads as a local edit on every later sync.
+                            if let Some(base) = &mut patched.base {
+                                base.object = Some(hash.clone());
+                            }
                             patched.object = Some(hash);
                             patched.level = ReplicaLevel::Full;
                             self.ops.push(ReplicaWriteOp::UpsertPlacement(patched));
@@ -302,6 +311,20 @@ impl ReplicaCoroutine for ReplicaUpgrade {
     }
 }
 
+/// Whether the placement's content is mutable, which the last-synced revision
+/// is the mark of: only a source that rewrites a body in place has one.
+///
+/// Such a placement is fetched rather than linked from the store: the link id
+/// says two copies are the same item, not that they hold the same bytes, and a
+/// revision is what makes the difference observable. Linking one copy's body
+/// under another's revision would record a body no fetch ever confirmed.
+fn is_mutable(placement: &ReplicaPlacement) -> bool {
+    placement
+        .base
+        .as_ref()
+        .is_some_and(|base| base.revision.is_some())
+}
+
 enum State {
     Start,
     PendingLoad,
@@ -312,7 +335,7 @@ enum State {
 
 #[cfg(test)]
 mod tests {
-    use alloc::{collections::BTreeMap, vec};
+    use alloc::{collections::BTreeMap, string::String, vec};
 
     use crate::{
         object::ReplicaHash,
@@ -854,5 +877,84 @@ mod tests {
         assert_eq!(report.upgraded, 2);
         assert_eq!(report.deduped, 1);
         assert_eq!(report.fetched, 1);
+    }
+
+    /// A placement already reconciled once: based, summarised, and with the
+    /// revision its source reports (`None` for immutable content).
+    fn based(handle: &str, link: &str, revision: Option<&str>) -> ReplicaPlacement {
+        let mut placement = probed(handle, Some(link), ReplicaLevel::Meta);
+        placement.base = Some(ReplicaBase {
+            flags: ReplicaFlags::default(),
+            revision: revision.map(String::from),
+            object: None,
+        });
+        placement
+    }
+
+    /// Runs a `Full` upgrade of one placement up to its first yield after the
+    /// link lookup, answering the lookup with `known`.
+    fn upgrade_with_lookup(
+        placement: ReplicaPlacement,
+        known: BTreeMap<ReplicaLinkId, ReplicaHash>,
+    ) -> ReplicaCoroutineState<ReplicaYield, Result<ReplicaUpgradeReport, ReplicaUpgradeError>>
+    {
+        let handle = placement.handle.clone();
+        let loaded = ReplicaLoaded {
+            placements: vec![placement],
+            checkpoint: None,
+        };
+        let mut up = ReplicaUpgrade::new("inbox", vec![handle], ReplicaTier::Full);
+        let _ = up.resume(None);
+
+        match up.resume(Some(ReplicaArg::Load(loaded))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsLookupObject(_)) => {
+                up.resume(Some(ReplicaArg::LookupObject(known)))
+            }
+            state => state,
+        }
+    }
+
+    #[test]
+    fn a_deduped_body_rebases_so_the_placement_reads_clean() {
+        // The same message in two collections: the second placement links the
+        // body the first one fetched. Leaving its base behind reads as a local
+        // edit, which a storage projects dirty and re-derives on every sync,
+        // for good.
+        let known = BTreeMap::from([(ReplicaLinkId::from("msg-a"), ReplicaHash::from("h-a"))]);
+
+        let ops = match upgrade_with_lookup(based("2", "msg-a", None), known) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite (no fetch), got {state:?}"),
+        };
+        let ReplicaWriteOp::UpsertPlacement(placement) = &ops[0] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[0]);
+        };
+
+        assert_eq!(placement.object, Some(ReplicaHash::from("h-a")));
+        assert_eq!(placement.level, ReplicaLevel::Full);
+        assert_eq!(
+            placement.base.as_ref().and_then(|base| base.object.clone()),
+            Some(ReplicaHash::from("h-a")),
+            "the base holds the linked body, so nothing reads as edited"
+        );
+    }
+
+    #[test]
+    fn a_mutable_placement_is_fetched_rather_than_linked() {
+        // A link id says two copies are the same item, not that they hold the
+        // same bytes. Where a revision makes the difference observable, the
+        // body is fetched, so no copy's bytes are recorded under another's
+        // revision.
+        let known = BTreeMap::from([(ReplicaLinkId::from("uid:card-1"), ReplicaHash::from("h-a"))]);
+
+        let state = upgrade_with_lookup(based("card-1.vcf", "uid:card-1", Some("etag-1")), known);
+
+        match state {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsFetch { handles, tier, .. }) => {
+                assert_eq!(tier, ReplicaTier::Full);
+                assert_eq!(handles, vec![ReplicaHandle::from("card-1.vcf")]);
+            }
+            state => panic!("expected WantsFetch, got {state:?}"),
+        }
     }
 }
