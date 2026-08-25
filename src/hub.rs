@@ -26,28 +26,10 @@ use crate::{
     },
 };
 
-/// A source of a shared item: one authoritative replica (`left`, `right`,
-/// `phone`).
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct ReplicaSourceId(pub String);
-
-impl ReplicaSourceId {
-    /// Borrows the id as a string slice.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<&str> for ReplicaSourceId {
-    fn from(value: &str) -> Self {
-        Self(value.into())
-    }
-}
-
-impl From<String> for ReplicaSourceId {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
+crate::replica_id! {
+    /// A source of a shared item: one authoritative replica (`left`, `right`,
+    /// `phone`).
+    ReplicaSourceId, Ord, PartialOrd,
 }
 
 /// One source's binding of a shared item: its handle there, the base last
@@ -72,6 +54,14 @@ pub struct ReplicaSourceBinding {
     /// what a resolver fetches and merges against. `None` when not conflicted,
     /// or when the remote reports no revision.
     pub conflict_revision: Option<String>,
+    /// The other handles *this source* holds the item's identity under, empty
+    /// in the ordinary case.
+    ///
+    /// The identity-axis twin of [`conflicted`](Self::conflicted), and per
+    /// source for the same reason: in a two-sided store one side may hold the
+    /// duplicate and the other not. A binding carrying any projects
+    /// [`ReplicaStatus::Ambiguous`], which the engine derives nothing for.
+    pub ambiguous_handles: Vec<ReplicaHandle>,
 }
 
 /// How the hub resolves a cross-source content conflict — both sources edited
@@ -137,6 +127,18 @@ impl ReplicaHubItem {
             None => self.level.min(ReplicaLevel::Meta),
         }
     }
+
+    /// Whether any source holds this identity under more than one handle.
+    ///
+    /// Per-source state read across the item, because the two rules it gates
+    /// are cross-source: an identity one source cannot resolve is neither
+    /// offered to a source that lacks it, nor deleted everywhere on the word
+    /// of the source that cannot resolve it.
+    pub fn is_ambiguous(&self) -> bool {
+        self.sources
+            .values()
+            .any(|binding| !binding.ambiguous_handles.is_empty())
+    }
 }
 
 /// The multi-source hub: logical items keyed by link id.
@@ -178,6 +180,11 @@ impl ReplicaHub {
                 (false, Some(binding)) => {
                     out.push(self.bound_placement(collection, link, item, binding));
                 }
+                // NOTE: an identity some source holds twice is not offered to
+                // one that lacks it: the engine cannot say which copy the
+                // append would be, and appending a copy it cannot account for
+                // is how a duplicate spreads.
+                (false, None) if item.is_ambiguous() => {}
                 (false, None) => {
                     if let Some(created) = self.created_placement(collection, link, item) {
                         out.push(created);
@@ -201,7 +208,13 @@ impl ReplicaHub {
             .base
             .as_ref()
             .is_some_and(|b| b.flags == item.flags && b.object == item.object);
-        let status = if binding.conflicted {
+        let status = if !binding.ambiguous_handles.is_empty() {
+            // NOTE: this source holds the identity more than once, so which
+            // copy any change refers to cannot be decided. It outranks every
+            // other reading, including a conflict: the engine derives nothing
+            // for it until the source reports the identity once again.
+            ReplicaStatus::Ambiguous
+        } else if binding.conflicted {
             // NOTE: an unresolved conflict outranks the base comparison. The
             // merge leaves a conflicted placement alone; downgrading it to
             // Dirty here would re-derive the push it already rejected, so the
@@ -227,6 +240,7 @@ impl ReplicaHub {
             conflict_revision: binding.conflict_revision.clone(),
             base: binding.base.clone(),
             origin: None,
+            ambiguous_handles: binding.ambiguous_handles.clone(),
         }
     }
 
@@ -254,6 +268,7 @@ impl ReplicaHub {
             conflict_revision: None,
             base: binding.base.clone(),
             origin: None,
+            ambiguous_handles: Vec::new(),
         }
     }
 
@@ -283,6 +298,7 @@ impl ReplicaHub {
             conflict_revision: None,
             base: None,
             origin: None,
+            ambiguous_handles: Vec::new(),
         })
     }
 
@@ -384,6 +400,10 @@ impl ReplicaHub {
             handle: placement.handle.clone(),
             base: placement.base.clone(),
             conflicted,
+            // The identity axis travels as data rather than as a status:
+            // a projection reads them back into `Ambiguous`, and an upsert
+            // carrying none is what clears the freeze.
+            ambiguous_handles: placement.ambiguous_handles.clone(),
             // Only meaningful while conflicted; dropping it otherwise keeps a
             // resolved binding from carrying a stale revision forward.
             conflict_revision: conflicted
@@ -457,8 +477,13 @@ impl ReplicaHub {
                 // NOTE: only a genuine delete propagates to the sources
                 // that still hold the item. A superseded row is a handle
                 // the same batch replaces, and reading it as a delete
-                // would push a Remove nobody asked for.
-                item.deleted |= reason == ReplicaDropReason::Deleted;
+                // would push a Remove nobody asked for. Nor does a drop
+                // from a source that holds the identity twice: the copy
+                // that vanished says nothing about the one that did not,
+                // and propagating on that reading removes the only copy on
+                // a source nobody touched.
+                let genuine = reason == ReplicaDropReason::Deleted && !item.is_ambiguous();
+                item.deleted |= genuine;
                 item.sources.remove(source);
             }
         }
@@ -497,6 +522,7 @@ mod tests {
                 base: Some(base(flags)),
                 conflicted: false,
                 conflict_revision: None,
+                ambiguous_handles: Vec::new(),
             },
         );
         let item = ReplicaHubItem {
@@ -533,6 +559,7 @@ mod tests {
                     base: Some(base(flags)),
                     conflicted: false,
                     conflict_revision: None,
+                    ambiguous_handles: Vec::new(),
                 },
             );
     }
@@ -554,6 +581,7 @@ mod tests {
                     base: Some(base(&["seen"])),
                     conflicted: false,
                     conflict_revision: None,
+                    ambiguous_handles: Vec::new(),
                 },
             );
 
@@ -583,6 +611,7 @@ mod tests {
                     base: Some(base(&[])),
                     conflicted: false,
                     conflict_revision: None,
+                    ambiguous_handles: Vec::new(),
                 },
             );
 
@@ -646,6 +675,7 @@ mod tests {
                     base: Some(base(&["seen"])),
                     conflicted: false,
                     conflict_revision: None,
+                    ambiguous_handles: Vec::new(),
                 },
             );
 
@@ -661,6 +691,78 @@ mod tests {
         let item = hub.items.get(&ReplicaLinkId::from("m1")).expect("kept");
         assert!(!item.sources.contains_key(&ReplicaSourceId::from("left")));
         assert!(item.sources.contains_key(&ReplicaSourceId::from("right")));
+    }
+
+    #[test]
+    fn an_ambiguous_binding_projects_ambiguous_and_propagates_nothing() {
+        // One source holds the identity twice, the other does not. The
+        // ambiguity is per source, so right keeps syncing; left is frozen,
+        // and the item is not offered to a source that lacks it.
+        let mut hub = hub_with_left(&["seen"]);
+        bind_right(&mut hub, &["seen"]);
+        let item = hub.items.get_mut(&ReplicaLinkId::from("m1")).unwrap();
+        // NOTE: a body both sources agree on, so the only thing that can make
+        // either of them read as anything but Clean is the ambiguity itself.
+        item.object = Some(ReplicaHash::from("body"));
+        for binding in item.sources.values_mut() {
+            if let Some(base) = &mut binding.base {
+                base.object = Some(ReplicaHash::from("body"));
+            }
+        }
+        item.sources
+            .get_mut(&ReplicaSourceId::from("left"))
+            .unwrap()
+            .ambiguous_handles = alloc::vec![ReplicaHandle::from("l2")];
+
+        let left = placements(&hub, "left");
+        assert_eq!(left[0].status, ReplicaStatus::Ambiguous);
+        assert_eq!(
+            left[0].ambiguous_handles,
+            alloc::vec![ReplicaHandle::from("l2")],
+            "the handles travel to the source that has to stay frozen",
+        );
+        assert_eq!(
+            placements(&hub, "right")[0].status,
+            ReplicaStatus::Clean,
+            "the other source is unaffected: the ambiguity is per source",
+        );
+        assert!(
+            placements(&hub, "phone").is_empty(),
+            "an identity the engine cannot resolve is not offered to a third \
+             source: it would be appending a copy it cannot account for",
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_binding_blocks_a_cross_source_delete() {
+        // The reproduction: left's bound copy vanishes while left still holds
+        // the identity, and the delete reaches right and removes the only
+        // copy there.
+        let mut hub = hub_with_left(&["seen"]);
+        bind_right(&mut hub, &["seen"]);
+        hub.items
+            .get_mut(&ReplicaLinkId::from("m1"))
+            .unwrap()
+            .sources
+            .get_mut(&ReplicaSourceId::from("left"))
+            .unwrap()
+            .ambiguous_handles = alloc::vec![ReplicaHandle::from("l2")];
+
+        hub.absorb(
+            &ReplicaSourceId::from("left"),
+            &[ReplicaWriteOp::DropPlacement {
+                collection: "inbox".into(),
+                handle: ReplicaHandle::from("l1"),
+                reason: ReplicaDropReason::Deleted,
+            }],
+        );
+
+        let item = hub.items.get(&ReplicaLinkId::from("m1")).expect("kept");
+        assert!(
+            !item.deleted,
+            "a source that holds the identity twice has not shown it is gone",
+        );
+        assert_eq!(placements(&hub, "right")[0].status, ReplicaStatus::Clean);
     }
 
     #[test]
@@ -803,6 +905,7 @@ mod tests {
             conflict_revision: None,
             base: Some(base(&["seen", "flagged"])),
             origin: None,
+            ambiguous_handles: Vec::new(),
         };
         hub.absorb(
             &ReplicaSourceId::from("left"),
@@ -841,6 +944,7 @@ mod tests {
             }),
             conflicted: false,
             conflict_revision: None,
+            ambiguous_handles: Vec::new(),
         };
         let mut sources = BTreeMap::new();
         sources.insert(ReplicaSourceId::from("left"), based("l1"));
@@ -881,6 +985,7 @@ mod tests {
                 object: Some(ReplicaHash::from(object)),
             }),
             origin: None,
+            ambiguous_handles: Vec::new(),
         })
     }
 
@@ -1001,6 +1106,7 @@ mod tests {
                 object: Some(ReplicaHash::from("o0")),
             }),
             origin: None,
+            ambiguous_handles: Vec::new(),
         })
     }
 
@@ -1161,6 +1267,7 @@ mod sort_key_tests {
             conflict_revision: None,
             base: None,
             origin: None,
+            ambiguous_handles: Vec::new(),
         })
     }
 
@@ -1237,6 +1344,7 @@ mod flags_tests {
             conflict_revision: None,
             base: None,
             origin: None,
+            ambiguous_handles: Vec::new(),
         })
     }
 
@@ -1302,6 +1410,7 @@ mod stored_level_tests {
                 object: base.map(ReplicaHash::from),
             }),
             origin: None,
+            ambiguous_handles: Vec::new(),
         })
     }
 

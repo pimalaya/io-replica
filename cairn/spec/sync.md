@@ -197,3 +197,67 @@ An upgrade SHALL revisit a placement whose level claims a tier it does not hold:
 
 ### Requirement: A push is counted when it matched
 `ReplicaSyncReport::pushed` SHALL count the changes this run derived and the remote accepted, not the results the consumer reported: a result naming a handle nobody pushed, or naming one twice, cannot inflate it.
+
+### Requirement: A fetch never establishes a link the collection already holds
+Applying a fetched item SHALL NOT set a placement's `link_id` to one another placement of the same collection already carries, whether that other placement is in the same batch or only in the store. The engine identifies a placement by its collection and link id, and a source binds it with one handle, so a second placement resolving to the same identity has nowhere to live: linking it overwrites the first binding's handle, and the fact that the source holds the identity twice is lost at that write, before any later rule can act on it.
+
+The losing handle SHALL instead be recorded on the placement that holds the identity (`ReplicaPlacement::ambiguous_handles`, persisted per source as `ReplicaSourceBinding::ambiguous_handles`), so the ambiguity survives the round trip through the storage. That is what makes the freeze below sticky, which it must be: the twin appears in exactly one enumeration, the one that discovers it, and an incremental enumeration never mentions it again.
+
+A fetch that would establish an identity the batch has not already seen SHALL check it against the whole collection, not only the placements being upgraded, since a batch hydrating just the second copy would otherwise link it.
+
+#### Scenario: A second copy is recorded, not linked
+- GIVEN a collection whose placement already holds a link id
+- WHEN a fetch resolves another handle of that collection to the same link id
+- THEN the second placement stays unlinked, and the first records the second handle as ambiguous
+
+### Requirement: An ambiguous identity derives nothing
+A placement carrying ambiguous handles SHALL read as `ReplicaStatus::Ambiguous`, and the engine SHALL derive no change for it in either direction while it does: no push of any kind on any axis, no vanish-delete, no staged mutation, and no cross-source propagation.
+
+Its absence from a complete snapshot in particular SHALL NOT be read as the item being gone from that source: the source demonstrably holds another copy of the identity, and deleting on that reading is what removes the only copy on a source nobody touched.
+
+The rule is *derive nothing* rather than *pick a copy* because the engine has no basis for choosing which copy a change belongs to, and choosing wrongly destroys mail. A frozen item is mirrored zero times rather than once, which is the cost of not guessing.
+
+#### Scenario: An ambiguous placement is never deleted by a vanish
+- GIVEN an ambiguous placement bound to a source
+- WHEN a complete snapshot of that source omits its handle
+- THEN no delete is derived, on that source or on any other holding the identity
+
+### Requirement: An ambiguity clears when the source resolves it
+A complete snapshot that omits a recorded ambiguous handle, or a delta that reports it vanished, SHALL drop that handle: the source is saying that copy is gone. A delta that merely does not mention it says nothing and clears nothing. A placement left with no ambiguous handles lands `Clean` and reconciles in that same run, so what it slept through is picked up rather than waiting for an enumeration that may never list it again.
+
+A rekey SHALL carry the state over a handle-space change: renumbering the copies does not merge them.
+
+#### Scenario: Resolving the duplicate resumes the sync
+- GIVEN an ambiguous placement
+- WHEN an enumeration reports the identity under a single handle
+- THEN the ambiguous handles are cleared and the placement reconciles normally
+
+
+### Requirement: A run records its pushes in bounded chunks
+A sync SHALL push its derived changes in bounded chunks, yielding the writes a chunk produced before the next chunk is pushed: one `WantsPush` per chunk, each followed by the `WantsWrite` recording its outcomes. The bound is the engine's (`ReplicaSync::PUSH_CHUNK`), not a consumer option, because what it bounds is a crash window rather than throughput.
+
+Pushes stay at-least-once, but the window is one chunk rather than one run: a crash between a serviced push and the write recording it replays only the chunk whose write never landed, since every earlier chunk is already recorded and a later one was never sent. A driver therefore MUST NOT assume one push and one write per run; the reference driver services yields in a loop and needs no change.
+
+Only the handles of the chunk being serviced SHALL be resolved when its outcomes land: a handle a chunk never reported on is left pending exactly as before, and a later chunk's handles are still waiting for their own outcome.
+
+#### Scenario: A crash after the first chunk
+- GIVEN a run deriving more changes than one chunk holds
+- WHEN the first chunk is pushed and recorded, and the write recording the second chunk is lost
+- THEN the placements of the first chunk are recorded clean, and only the second chunk's are still pending
+
+### Requirement: The checkpoint lands in the last write
+The checkpoint the enumerate reported SHALL land in the write that follows the final chunk, and SHALL stay the pre-push one, which is what makes the engine's own echo re-listed by the next delta enumeration. An intermediate chunk's write SHALL NOT carry it, so an interrupted run resumes from the same cursor rather than from one claiming its unrecorded pushes were seen.
+
+### Requirement: Every change carries an idempotency key
+A `ReplicaChange` SHALL be a `ReplicaChangeKind` (what the remote is asked to do, the four verbs that were the change itself) plus the `ReplicaChangeKey` naming it. The key SHALL be derived from the collection, the handle, the kind and the target state the change makes true: the flag set of a `SetFlags`, the body of an `Update`, the destination of a `Remove`, and the identity, markers, origin and body of an `Add`. The same derived change SHALL key the same on every run, and changes differing in any of those SHALL key differently.
+
+A precondition is deliberately not part of it: `if_match` states what the change was attempted against, not what it makes true, and a retry of one operation is one operation.
+
+The split is what keeps the key honest. `ReplicaChange::new` is the only way to make one, so a change cannot exist without a key; the engine derives a *kind* and keying it is the last thing that happens to it, so there is no state in which a keyed change is half-built or names something other than what it carries.
+
+Recording the key is what makes the at-least-once contract actionable for every kind: an add could already be recognised by its `link_id`, but a flag set, a content update and a remove carried nothing a consumer could log to recognise a replay of *this* operation.
+
+#### Scenario: A replayed change keys the same
+- GIVEN a change an interrupted run pushed
+- WHEN the next run derives it again from the same local state
+- THEN it carries the same key, and the consumer recognises the replay

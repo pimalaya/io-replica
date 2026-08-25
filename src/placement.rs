@@ -10,63 +10,28 @@
 use alloc::{
     collections::BTreeSet,
     string::{String, ToString},
+    vec::Vec,
 };
 
 use crate::{collection::ReplicaCollectionId, object::ReplicaHash};
 
-/// The protocol's per-collection location of an item.
-///
-/// IMAP uidvalidity plus uid, WebDAV href, JMAP id; always a string so
-/// non-integer ids are a non-issue. Identifies a placement within its
-/// collection.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
-pub struct ReplicaHandle(pub String);
-
-impl ReplicaHandle {
-    /// Borrows the handle as a string slice.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
+crate::replica_id! {
+    /// The protocol's per-collection location of an item.
+    ///
+    /// IMAP uidvalidity plus uid, WebDAV href, JMAP id; always a string so
+    /// non-integer ids are a non-issue. Identifies a placement within its
+    /// collection.
+    ReplicaHandle, Ord, PartialOrd, Hash,
 }
 
-impl From<&str> for ReplicaHandle {
-    fn from(value: &str) -> Self {
-        Self(value.into())
-    }
-}
-
-impl From<String> for ReplicaHandle {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-
-/// The logical-item identity used to group copies and map across
-/// protocols.
-///
-/// A source global id (a provider message id, a JMAP id), else a stable
-/// content id (the Message-ID header, the vCard or iCalendar UID). Never
-/// derived from a size or other per-copy value a provider may rewrite.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
-pub struct ReplicaLinkId(pub String);
-
-impl ReplicaLinkId {
-    /// Borrows the link id as a string slice.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<&str> for ReplicaLinkId {
-    fn from(value: &str) -> Self {
-        Self(value.into())
-    }
-}
-
-impl From<String> for ReplicaLinkId {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
+crate::replica_id! {
+    /// The logical-item identity used to group copies and map across
+    /// protocols.
+    ///
+    /// A source global id (a provider message id, a JMAP id), else a stable
+    /// content id (the Message-ID header, the vCard or iCalendar UID). Never
+    /// derived from a size or other per-copy value a provider may rewrite.
+    ReplicaLinkId, Ord, PartialOrd, Hash,
 }
 
 /// A minimal cached summary: enough for a list row and to resolve the
@@ -231,6 +196,19 @@ pub enum ReplicaStatus {
     /// a create is pending. Its [`ReplicaPlacement::handle`] is a provisional
     /// placeholder until the push reconciles it to the server-assigned one.
     Created,
+    /// The source holds this identity under more than one handle, so which
+    /// copy a change belongs to cannot be decided. The identity-axis twin of
+    /// [`Conflict`](Self::Conflict): the engine derives nothing for it, in
+    /// either direction, until the source holds the identity once again.
+    ///
+    /// A placement is identified by its collection and link id, and a source
+    /// binds it with one handle, so a second copy of one identity has nowhere
+    /// to live. Guessing which copy a delete or a flag change refers to
+    /// destroys mail: a delete of the copy the engine happens to have bound
+    /// propagates to every other source and removes the only copy there, while
+    /// the source still holds the message. Deriving nothing mirrors the item
+    /// zero times instead of once, which is the cost of not guessing.
+    Ambiguous,
 }
 
 /// Where a pending create's content already lives, so the push can reuse a
@@ -304,6 +282,17 @@ pub struct ReplicaPlacement {
     /// lives so the push can copy or move it; `None` otherwise (and for an
     /// append).
     pub origin: Option<ReplicaOrigin>,
+    /// The other handles the source holds this identity under, empty in the
+    /// ordinary case: what makes the placement
+    /// [`Ambiguous`](ReplicaStatus::Ambiguous), and what a later enumeration
+    /// clears as those handles stop being reported.
+    ///
+    /// Recorded here rather than inferred, because the evidence appears in
+    /// exactly one enumeration, the one that discovers the second copy: an
+    /// incremental enumeration never mentions it again, so a freeze that is
+    /// not persisted forgets on the next run and the item goes back to being
+    /// deletable.
+    pub ambiguous_handles: Vec<ReplicaHandle>,
 }
 
 impl ReplicaPlacement {

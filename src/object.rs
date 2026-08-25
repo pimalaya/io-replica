@@ -6,33 +6,13 @@
 //! and the old one is dereferenced. Many placements may point at one
 //! object: this is the dedup and unified-view mechanism.
 
-use alloc::string::String;
-
-/// The byte-exact identity of an object, naming it in the object store.
-///
-/// A collision-resistant content hash (for example truncated SHA-256).
-/// Size is a valid cheap pre-check only: identical bytes have identical
-/// size, but equal size does not imply equal bytes.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
-pub struct ReplicaHash(pub String);
-
-impl ReplicaHash {
-    /// Borrows the hash as a string slice.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<&str> for ReplicaHash {
-    fn from(value: &str) -> Self {
-        Self(value.into())
-    }
-}
-
-impl From<String> for ReplicaHash {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
+crate::replica_id! {
+    /// The byte-exact identity of an object, naming it in the object store.
+    ///
+    /// A collision-resistant content hash (for example truncated SHA-256).
+    /// Size is a valid cheap pre-check only: identical bytes have identical
+    /// size, but equal size does not imply equal bytes.
+    ReplicaHash, Ord, PartialOrd, Hash,
 }
 
 /// A stored object: its content hash and byte size.

@@ -5,7 +5,7 @@
 //! locally. The engine itself performs neither: both travel as coroutine
 //! yields.
 
-use alloc::{string::String, vec::Vec};
+use alloc::{format, string::String, vec::Vec};
 
 use crate::{
     collection::{ReplicaCheckpoint, ReplicaCollectionId},
@@ -13,18 +13,55 @@ use crate::{
     placement::{ReplicaFlags, ReplicaHandle, ReplicaLinkId, ReplicaOrigin, ReplicaPlacement},
 };
 
-/// A change to push to the remote.
+/// A change to push to the remote: what to do, and the key naming it.
+///
+/// Pushes are at-least-once: a crash between a serviced push and the
+/// storage write that records it makes the next sync push the same change
+/// again. The window is one chunk rather than one run (see
+/// [`ReplicaSync::PUSH_CHUNK`](crate::sync::ReplicaSync::PUSH_CHUNK)), and
+/// every change names itself through `key`, so a consumer that records the
+/// keys it applied recognises a replay of any kind. Flag and content
+/// pushes also re-apply harmlessly on their own; the other two are kept
+/// harmless by treating a remove of an already-missing member as accepted,
+/// and by using an add's `link_id` to detect that it already landed
+/// instead of duplicating it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplicaChange {
+    /// What the remote is asked to do.
+    pub kind: ReplicaChangeKind,
+    /// The idempotency key naming this change, as
+    /// [`new`](Self::new) derives it.
+    pub key: ReplicaChangeKey,
+}
+
+impl ReplicaChange {
+    /// Keys `kind` in `collection`.
+    ///
+    /// The only way a change is made, so it cannot exist without its key,
+    /// and the key cannot disagree with what it names: the engine derives
+    /// the kind, and keying it is the last thing that happens to it.
+    pub fn new(collection: &ReplicaCollectionId, kind: ReplicaChangeKind) -> Self {
+        let key = kind.key(collection);
+
+        Self { kind, key }
+    }
+
+    /// The member this change acts on.
+    pub fn handle(&self) -> &ReplicaHandle {
+        match &self.kind {
+            ReplicaChangeKind::Add { handle, .. } => handle,
+            ReplicaChangeKind::Remove { handle, .. } => handle,
+            ReplicaChangeKind::SetFlags { handle, .. } => handle,
+            ReplicaChangeKind::Update { handle, .. } => handle,
+        }
+    }
+}
+
+/// What a [`ReplicaChange`] asks the remote to do.
 ///
 /// Membership is add or remove only. An add reuses a server-side copy or
 /// move when it carries an [`ReplicaOrigin`], else it uploads the stored
 /// body (a genuine append).
-///
-/// Pushes are at-least-once: a crash between a serviced push and the
-/// storage write that records it makes the next sync push the same change
-/// again. Flag and content pushes re-apply harmlessly; the consumer keeps
-/// the retries of the other two harmless by treating a remove of an
-/// already-missing member as accepted, and by using an add's `link_id` to
-/// detect that it already landed instead of duplicating it.
 ///
 /// # A move is two halves that must not both deliver
 ///
@@ -47,7 +84,7 @@ use crate::{
 /// stays visibly pending, since an add carries no key that separates a
 /// second copy the user asked for from one the remove already served.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ReplicaChange {
+pub enum ReplicaChangeKind {
     /// Add a member. The push reconciles the provisional `handle` to the
     /// server-assigned one (returned as
     /// [`crate::remote::ReplicaPushResult::assigned`]).
@@ -107,6 +144,138 @@ pub enum ReplicaChange {
         /// one.
         if_match: Option<String>,
     },
+}
+
+impl ReplicaChangeKind {
+    /// Derives this kind's idempotency key in `collection`.
+    ///
+    /// The key covers the collection, the handle, the kind and the target
+    /// state the change makes true: the flag set of a
+    /// [`SetFlags`](Self::SetFlags), the body of an [`Update`](Self::Update),
+    /// the destination of a [`Remove`](Self::Remove), and the identity,
+    /// markers, origin and body of an [`Add`](Self::Add). The same derived
+    /// change keys the same on every run, and changes differing in any of
+    /// those key differently.
+    ///
+    /// A precondition is deliberately not part of it: `if_match` states what
+    /// the change was attempted against, not what it makes true, and a retry
+    /// of one operation is one operation.
+    fn key(&self, collection: &ReplicaCollectionId) -> ReplicaChangeKey {
+        let handle = match self {
+            Self::Add { handle, .. } => handle,
+            Self::Remove { handle, .. } => handle,
+            Self::SetFlags { handle, .. } => handle,
+            Self::Update { handle, .. } => handle,
+        };
+
+        let mut digest = ReplicaChangeDigest::new();
+
+        digest
+            .field(collection.as_str().as_bytes())
+            .field(handle.as_str().as_bytes());
+
+        match self {
+            Self::Add {
+                link_id,
+                flags,
+                origin,
+                object,
+                ..
+            } => {
+                digest
+                    .field(b"add")
+                    .option(link_id.as_ref().map(|link| link.as_str().as_bytes()))
+                    .flags(flags);
+                match origin {
+                    Some(origin) => digest
+                        .field(b"1")
+                        .field(origin.collection.as_str().as_bytes())
+                        .field(origin.handle.as_str().as_bytes()),
+                    None => digest.field(b"0"),
+                }
+                .option(object.as_ref().map(|hash| hash.as_str().as_bytes()));
+            }
+            Self::Remove { to, .. } => {
+                digest
+                    .field(b"remove")
+                    .option(to.as_ref().map(|to| to.as_str().as_bytes()));
+            }
+            Self::SetFlags { flags, .. } => {
+                digest.field(b"set-flags").flags(flags);
+            }
+            Self::Update { object, .. } => {
+                digest.field(b"update").field(object.as_str().as_bytes());
+            }
+        }
+
+        digest.finish()
+    }
+}
+
+crate::replica_id! {
+    /// The idempotency key naming a derived change, as
+    /// [`ReplicaChange::new`] derives it.
+    ///
+    /// Sixteen lowercase hexadecimal characters; opaque to the engine, which
+    /// never reads one back. A consumer records the keys it has applied and
+    /// recognises a replay by looking one up.
+    ReplicaChangeKey, Ord, PartialOrd, Hash,
+}
+
+/// The digest a [`ReplicaChangeKind`] is folded into to key it.
+///
+/// FNV-1a, sixty-four bits, computed here rather than pulled in as a
+/// dependency: the crate has none beyond `log` and `thiserror`, and what an
+/// idempotency key needs is determinism, not resistance to a forged
+/// collision.
+struct ReplicaChangeDigest(u64);
+
+impl ReplicaChangeDigest {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+
+    fn new() -> Self {
+        Self(Self::OFFSET)
+    }
+
+    /// Folds one field in, terminated so that two different splits of the
+    /// same bytes key differently.
+    fn field(&mut self, bytes: &[u8]) -> &mut Self {
+        for byte in bytes.iter().chain(&[0]) {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(Self::PRIME);
+        }
+
+        self
+    }
+
+    /// Folds an optional field in, a present and an absent one keying
+    /// differently.
+    fn option(&mut self, bytes: Option<&[u8]>) -> &mut Self {
+        match bytes {
+            Some(bytes) => self.field(b"1").field(bytes),
+            None => self.field(b"0"),
+        }
+    }
+
+    /// Folds a flag set in, counted first so a marker cannot pass for the
+    /// field that follows the set. An unknown set is not an empty one.
+    fn flags(&mut self, flags: &ReplicaFlags) -> &mut Self {
+        let Some(flags) = flags.known() else {
+            return self.field(b"unknown");
+        };
+
+        self.field(b"known").field(&flags.len().to_le_bytes());
+        for flag in flags {
+            self.field(flag.as_bytes());
+        }
+
+        self
+    }
+
+    fn finish(&self) -> ReplicaChangeKey {
+        ReplicaChangeKey::from(format!("{:016x}", self.0))
+    }
 }
 
 /// Why a placement is being dropped.
@@ -172,4 +341,150 @@ pub enum ReplicaWriteOp {
         /// The new checkpoint.
         checkpoint: ReplicaCheckpoint,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{collections::BTreeSet, string::String, vec, vec::Vec};
+
+    use crate::{
+        change::{ReplicaChange, ReplicaChangeKey, ReplicaChangeKind},
+        collection::ReplicaCollectionId,
+        object::ReplicaHash,
+        placement::{ReplicaFlags, ReplicaHandle, ReplicaLinkId, ReplicaOrigin},
+    };
+
+    fn key(collection: &ReplicaCollectionId, kind: ReplicaChangeKind) -> ReplicaChangeKey {
+        ReplicaChange::new(collection, kind).key
+    }
+
+    fn set_flags(handle: &str, flags: &[&str]) -> ReplicaChangeKind {
+        ReplicaChangeKind::SetFlags {
+            handle: ReplicaHandle::from(handle),
+            flags: ReplicaFlags::from_iter(flags.iter().copied()),
+        }
+    }
+
+    fn update(handle: &str, object: &str, if_match: Option<&str>) -> ReplicaChangeKind {
+        ReplicaChangeKind::Update {
+            handle: ReplicaHandle::from(handle),
+            object: ReplicaHash::from(object),
+            if_match: if_match.map(String::from),
+        }
+    }
+
+    #[test]
+    fn the_same_derived_change_keys_the_same() {
+        let inbox = ReplicaCollectionId::from("inbox");
+
+        assert_eq!(
+            key(&inbox, set_flags("1", &["seen"])),
+            key(&inbox, set_flags("1", &["seen"])),
+        );
+    }
+
+    #[test]
+    fn a_key_separates_collection_handle_kind_and_target_state() {
+        let inbox = ReplicaCollectionId::from("inbox");
+        let archive = ReplicaCollectionId::from("archive");
+
+        let keys: Vec<ReplicaChangeKey> = vec![
+            // the collection
+            key(&inbox, set_flags("1", &["seen"])),
+            key(&archive, set_flags("1", &["seen"])),
+            // the handle
+            key(&inbox, set_flags("2", &["seen"])),
+            // the target state
+            key(&inbox, set_flags("1", &["flagged"])),
+            key(&inbox, set_flags("1", &["seen", "flagged"])),
+            key(&inbox, set_flags("1", &[])),
+            // the kind, on one handle and one state
+            key(&inbox, update("1", "aaa", None)),
+            key(&inbox, update("1", "bbb", None)),
+            key(
+                &inbox,
+                ReplicaChangeKind::Remove {
+                    handle: ReplicaHandle::from("1"),
+                    to: None,
+                    link_id: None,
+                    if_match: None,
+                },
+            ),
+            key(
+                &inbox,
+                ReplicaChangeKind::Remove {
+                    handle: ReplicaHandle::from("1"),
+                    to: Some(archive.clone()),
+                    link_id: None,
+                    if_match: None,
+                },
+            ),
+            key(
+                &inbox,
+                ReplicaChangeKind::Add {
+                    handle: ReplicaHandle::from("1"),
+                    link_id: None,
+                    flags: ReplicaFlags::default(),
+                    origin: None,
+                    object: None,
+                },
+            ),
+            key(
+                &inbox,
+                ReplicaChangeKind::Add {
+                    handle: ReplicaHandle::from("1"),
+                    link_id: Some(ReplicaLinkId::from("mid")),
+                    flags: ReplicaFlags::default(),
+                    origin: None,
+                    object: None,
+                },
+            ),
+            key(
+                &inbox,
+                ReplicaChangeKind::Add {
+                    handle: ReplicaHandle::from("1"),
+                    link_id: None,
+                    flags: ReplicaFlags::default(),
+                    origin: Some(ReplicaOrigin {
+                        collection: archive.clone(),
+                        handle: ReplicaHandle::from("9"),
+                    }),
+                    object: None,
+                },
+            ),
+            key(
+                &inbox,
+                ReplicaChangeKind::Add {
+                    handle: ReplicaHandle::from("1"),
+                    link_id: None,
+                    flags: ReplicaFlags::default(),
+                    origin: None,
+                    object: Some(ReplicaHash::from("aaa")),
+                },
+            ),
+        ];
+
+        let distinct: BTreeSet<&ReplicaChangeKey> = keys.iter().collect();
+        assert_eq!(distinct.len(), keys.len(), "keys collided: {keys:?}");
+    }
+
+    #[test]
+    fn a_precondition_is_not_part_of_the_key() {
+        let inbox = ReplicaCollectionId::from("inbox");
+        let keyed = key(&inbox, update("1", "aaa", None));
+
+        assert_eq!(key(&inbox, update("1", "aaa", Some("r1"))), keyed);
+        assert_eq!(key(&inbox, update("1", "aaa", Some("r2"))), keyed);
+    }
+
+    #[test]
+    fn an_unknown_flag_set_does_not_key_as_an_empty_one() {
+        let inbox = ReplicaCollectionId::from("inbox");
+        let unknown = ReplicaChangeKind::SetFlags {
+            handle: ReplicaHandle::from("1"),
+            flags: ReplicaFlags::Unknown,
+        };
+
+        assert_ne!(key(&inbox, unknown), key(&inbox, set_flags("1", &[])));
+    }
 }

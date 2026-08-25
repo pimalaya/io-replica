@@ -77,7 +77,7 @@ enum State {
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec;
+    use alloc::{vec, vec::Vec};
 
     use crate::{
         collection::ReplicaCheckpoint,
@@ -99,6 +99,7 @@ mod tests {
             conflict_revision: None,
             base: None,
             origin: None,
+            ambiguous_handles: Vec::new(),
         }
     }
 

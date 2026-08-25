@@ -30,8 +30,10 @@ pub enum ReplicaLoadScope {
     All,
     /// The placements holding these handles.
     Handles(Vec<ReplicaHandle>),
-    /// Every placement holding this link id, however many rows that is.
-    Link(ReplicaLinkId),
+    /// Every placement holding one of these link ids, however many rows that
+    /// is: the reads that ask about an identity rather than about a location,
+    /// and so have to see every row that claims it.
+    Links(Vec<ReplicaLinkId>),
 }
 
 /// A loaded collection: its placements and its last checkpoint.

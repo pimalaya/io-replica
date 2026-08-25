@@ -26,7 +26,7 @@ use log::{debug, trace};
 use thiserror::Error;
 
 use crate::{
-    change::{ReplicaChange, ReplicaDropReason, ReplicaWriteOp},
+    change::{ReplicaChange, ReplicaChangeKind, ReplicaDropReason, ReplicaWriteOp},
     collection::{ReplicaCheckpoint, ReplicaCollectionId},
     coroutine::*,
     placement::{
@@ -204,6 +204,17 @@ pub struct ReplicaSync {
     local: BTreeMap<ReplicaHandle, ReplicaPlacement>,
     checkpoint: Option<ReplicaCheckpoint>,
     writes: Vec<ReplicaWriteOp>,
+    /// The changes the merge derived and no chunk has taken yet, in the
+    /// order they were derived.
+    pushes: Vec<ReplicaChange>,
+    /// The handles of the chunk awaiting its outcome. Only these are
+    /// forgotten when the outcomes land: a later chunk's are still waiting
+    /// for their own.
+    in_flight: Vec<ReplicaHandle>,
+    /// The checkpoint the enumerate reported, held out of every
+    /// intermediate write so it lands in the last one, once every chunk is
+    /// recorded.
+    next_checkpoint: Option<ReplicaCheckpoint>,
     /// Flag pushes awaiting their outcome: the local placement to rebase
     /// once the remote confirms, keyed by handle. A rejected push leaves
     /// the placement untouched (dirty) so the next sync retries it.
@@ -228,6 +239,15 @@ pub struct ReplicaSync {
 }
 
 impl ReplicaSync {
+    /// How many changes one push chunk holds.
+    ///
+    /// A run pushes its changes in chunks this size, recording each chunk's
+    /// outcomes before the next is pushed, so an interrupted run replays at
+    /// most this many pushes instead of every push it derived. The bound is
+    /// the engine's rather than a consumer option: what it bounds is a crash
+    /// window, not throughput.
+    pub const PUSH_CHUNK: usize = 64;
+
     /// Creates a coroutine that reconciles `collection`.
     pub fn new(collection: impl Into<ReplicaCollectionId>, opts: ReplicaSyncOptions) -> Self {
         let collection = collection.into();
@@ -243,6 +263,9 @@ impl ReplicaSync {
             local: BTreeMap::new(),
             checkpoint: None,
             writes: Vec::new(),
+            pushes: Vec::new(),
+            in_flight: Vec::new(),
+            next_checkpoint: None,
             pending_flag_pushes: BTreeMap::new(),
             pending_content_pushes: BTreeMap::new(),
             pending_drops: BTreeSet::new(),
@@ -250,6 +273,58 @@ impl ReplicaSync {
             report: ReplicaSyncReport::default(),
             state: State::Start,
         }
+    }
+
+    /// Yields the next chunk of pushes, or the write recording the last one
+    /// when there is no chunk left to send.
+    fn step(
+        &mut self,
+    ) -> ReplicaCoroutineState<ReplicaYield, Result<ReplicaSyncReport, ReplicaSyncError>> {
+        if self.pushes.is_empty() {
+            debug!("write {} storage ops", self.writes.len());
+            self.state = State::PendingWrite;
+            let batch = self.batch();
+            return ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(batch));
+        }
+
+        let size = self.pushes.len().min(Self::PUSH_CHUNK);
+        let changes: Vec<ReplicaChange> = self.pushes.drain(..size).collect();
+        self.in_flight = changes.iter().map(|c| c.handle().clone()).collect();
+
+        debug!(
+            "push {} local changes to remote, {} left after them",
+            changes.len(),
+            self.pushes.len(),
+        );
+        trace!("changes: {changes:?}");
+        self.state = State::PendingPush;
+        ReplicaCoroutineState::Yielded(ReplicaYield::WantsPush {
+            collection: self.collection.clone(),
+            changes,
+        })
+    }
+
+    /// Takes the writes accumulated so far, ending them with the checkpoint
+    /// once every chunk has been serviced.
+    ///
+    /// The checkpoint lands in the last write of the run and stays the
+    /// pre-push one, so the next delta enumeration re-lists the engine's own
+    /// echo; an intermediate chunk's write must not carry it, or a crashed
+    /// run would resume from a cursor claiming its unrecorded pushes were
+    /// seen.
+    fn batch(&mut self) -> Vec<ReplicaWriteOp> {
+        let mut batch = mem::take(&mut self.writes);
+
+        if self.pushes.is_empty()
+            && let Some(checkpoint) = self.next_checkpoint.take()
+        {
+            batch.push(ReplicaWriteOp::SetCheckpoint {
+                collection: self.collection.clone(),
+                checkpoint,
+            });
+        }
+
+        batch
     }
 
     /// Runs the three-way merge, filling `self.writes` and `self.report`
@@ -266,6 +341,11 @@ impl ReplicaSync {
             items.into_iter().map(|i| (i.handle.clone(), i)).collect();
         let vanished: BTreeSet<ReplicaHandle> = vanished.into_iter().collect();
 
+        // NOTE: before anything is merged, because a placement the source no
+        // longer holds twice has to reconcile in this same run rather than
+        // wait for an enumeration that may never list it again.
+        self.thaw(&remote, &vanished, complete);
+
         let candidates = if complete {
             self.full_candidates(&remote)
         } else {
@@ -274,18 +354,68 @@ impl ReplicaSync {
 
         let mut pushes = Vec::new();
 
+        // NOTE: the merge derives what to do; keying it is the last thing
+        // that happens to it, in one place, so no change can exist without
+        // its key or with one that names something else.
         for (handle, remote_item) in candidates {
-            if let Some(change) = self.merge(&handle, remote_item) {
-                pushes.push(change);
+            if let Some(kind) = self.merge(&handle, remote_item) {
+                pushes.push(ReplicaChange::new(&self.collection, kind));
             }
         }
 
-        self.writes.push(ReplicaWriteOp::SetCheckpoint {
-            collection: self.collection.clone(),
-            checkpoint,
-        });
+        self.next_checkpoint = Some(checkpoint);
 
         pushes
+    }
+
+    /// Drops the ambiguous handles this snapshot shows the source no longer
+    /// holds, and unfreezes a placement that has none left.
+    ///
+    /// The engine never sees an identity in an enumeration, only handles, so
+    /// this is what "the source reports the identity once again" reduces to: a
+    /// complete snapshot that omits a recorded handle, or a delta that reports
+    /// it vanished, is the source saying that copy is gone. A delta that
+    /// merely does not mention it says nothing, and clears nothing.
+    ///
+    /// Once the last one goes the placement lands `Clean` and reconciles in
+    /// this same run, so the changes it slept through are picked up rather
+    /// than waiting for an enumeration that may never list it again.
+    fn thaw(
+        &mut self,
+        remote: &BTreeMap<ReplicaHandle, ReplicaRemoteItem>,
+        vanished: &BTreeSet<ReplicaHandle>,
+        complete: bool,
+    ) {
+        let mut thawed = Vec::new();
+
+        for placement in self.local.values_mut() {
+            if placement.ambiguous_handles.is_empty() {
+                continue;
+            }
+
+            let before = placement.ambiguous_handles.len();
+            placement.ambiguous_handles.retain(|handle| match complete {
+                true => remote.contains_key(handle),
+                false => !vanished.contains(handle),
+            });
+            if placement.ambiguous_handles.len() == before {
+                continue;
+            }
+
+            if placement.ambiguous_handles.is_empty() {
+                placement.status = ReplicaStatus::Clean;
+            }
+            thawed.push(placement.clone());
+        }
+
+        for placement in thawed {
+            debug!(
+                "identity of {} holds {} other handles",
+                placement.handle.as_str(),
+                placement.ambiguous_handles.len(),
+            );
+            self.writes.push(ReplicaWriteOp::UpsertPlacement(placement));
+        }
     }
 
     /// The handles to merge for a complete snapshot, each paired with its
@@ -363,8 +493,25 @@ impl ReplicaSync {
         &mut self,
         handle: &ReplicaHandle,
         remote_item: Option<ReplicaRemoteItem>,
-    ) -> Option<ReplicaChange> {
+    ) -> Option<ReplicaChangeKind> {
         let local = self.local.get(handle).cloned();
+
+        // NOTE: the source holds this identity more than once, so which copy
+        // any change refers to cannot be decided. Nothing is derived in
+        // either direction, and in particular the absence of this handle from
+        // a complete snapshot is not read as the item being gone: the source
+        // demonstrably still holds another copy of it, and deleting on that
+        // reading is what removed the only copy on a side nobody touched.
+        if local
+            .as_ref()
+            .is_some_and(|p| p.status == ReplicaStatus::Ambiguous)
+        {
+            trace!(
+                "{} holds an ambiguous identity, deriving nothing",
+                handle.as_str()
+            );
+            return None;
+        }
 
         let based = local.as_ref().map(|p| p.base.is_some()).unwrap_or(false);
 
@@ -418,7 +565,7 @@ impl ReplicaSync {
                     }
                     self.pending_content_pushes
                         .insert(handle.clone(), local.clone());
-                    return Some(ReplicaChange::Update {
+                    return Some(ReplicaChangeKind::Update {
                         handle: handle.clone(),
                         object: local.object.clone().expect("a staged edited body"),
                         if_match: base_revision,
@@ -439,7 +586,7 @@ impl ReplicaSync {
                 // the target copy plus this plain remove.
                 self.pending_drops.insert(handle.clone());
                 let to = local.origin.as_ref().map(|o| o.collection.clone());
-                Some(ReplicaChange::Remove {
+                Some(ReplicaChangeKind::Remove {
                     handle: handle.clone(),
                     to,
                     link_id: local.link_id.clone(),
@@ -483,7 +630,7 @@ impl ReplicaSync {
                         return None;
                     }
                     self.pending_creates.insert(handle.clone(), resurrected);
-                    return Some(ReplicaChange::Add {
+                    return Some(ReplicaChangeKind::Add {
                         handle: handle.clone(),
                         link_id: local.link_id.clone(),
                         flags: local.flags.clone(),
@@ -543,7 +690,7 @@ impl ReplicaSync {
                 if self.opts.push && self.opts.rights.add && local.status == ReplicaStatus::Created
                 {
                     self.pending_creates.insert(handle.clone(), local.clone());
-                    return Some(ReplicaChange::Add {
+                    return Some(ReplicaChangeKind::Add {
                         handle: handle.clone(),
                         link_id: local.link_id.clone(),
                         flags: local.flags.clone(),
@@ -625,7 +772,7 @@ impl ReplicaSync {
                 }
                 self.pending_content_pushes
                     .insert(local.handle.clone(), local.clone());
-                ContentOutcome::Push(ReplicaChange::Update {
+                ContentOutcome::Push(ReplicaChangeKind::Update {
                     handle: local.handle.clone(),
                     object: local.object.clone().expect("a staged edited body"),
                     if_match: base.revision.clone(),
@@ -656,7 +803,7 @@ impl ReplicaSync {
                 }
                 self.pending_content_pushes
                     .insert(local.handle.clone(), local.clone());
-                ContentOutcome::Push(ReplicaChange::Update {
+                ContentOutcome::Push(ReplicaChangeKind::Update {
                     handle: local.handle.clone(),
                     object: local.object.clone().expect("a staged edited body"),
                     if_match: item.revision.clone(),
@@ -720,6 +867,7 @@ impl ReplicaSync {
             conflict_revision: None,
             base: None,
             origin: None,
+            ambiguous_handles: Vec::new(),
         };
         self.writes.push(ReplicaWriteOp::UpsertPlacement(dup));
     }
@@ -736,7 +884,7 @@ impl ReplicaSync {
         local: &ReplicaPlacement,
         remote: &ReplicaRemoteItem,
         allow: PushFlags,
-    ) -> Option<ReplicaChange> {
+    ) -> Option<ReplicaChangeKind> {
         let base_flags = local.base.as_ref().map(|b| b.flags.clone());
 
         let Some(base_flags) = base_flags else {
@@ -804,7 +952,7 @@ impl ReplicaSync {
                 // never took (which QRESYNC would then never revisit).
                 self.pending_flag_pushes
                     .insert(local.handle.clone(), updated);
-                Some(ReplicaChange::SetFlags {
+                Some(ReplicaChangeKind::SetFlags {
                     handle: local.handle.clone(),
                     flags: merged,
                 })
@@ -843,6 +991,7 @@ impl ReplicaSync {
                 object: None,
             }),
             origin: None,
+            ambiguous_handles: Vec::new(),
         };
         self.writes.push(ReplicaWriteOp::UpsertPlacement(placement));
     }
@@ -1008,27 +1157,15 @@ impl ReplicaCoroutine for ReplicaSync {
                     snapshot.vanished.len(),
                     snapshot.complete,
                 );
-                let pushes = self.reconcile(snapshot);
+                self.pushes = self.reconcile(snapshot);
+                debug!(
+                    "reconciled: {} pulled, {} conflicts, {} changes to push",
+                    self.report.pulled,
+                    self.report.conflicts,
+                    self.pushes.len(),
+                );
 
-                if pushes.is_empty() {
-                    debug!(
-                        "reconciled pull-only: {} pulled, {} conflicts, write {} ops",
-                        self.report.pulled,
-                        self.report.conflicts,
-                        self.writes.len(),
-                    );
-                    self.state = State::PendingWrite;
-                    let writes = mem::take(&mut self.writes);
-                    return ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(writes));
-                }
-
-                debug!("push {} local changes to remote", pushes.len());
-                trace!("changes: {pushes:?}");
-                self.state = State::PendingPush;
-                ReplicaCoroutineState::Yielded(ReplicaYield::WantsPush {
-                    collection: self.collection.clone(),
-                    changes: pushes,
-                })
+                self.step()
             }
 
             (State::PendingPush, Some(ReplicaArg::Push(results))) => {
@@ -1099,21 +1236,30 @@ impl ReplicaCoroutine for ReplicaSync {
                         ReplicaPushOutcome::Rejected => self.report.rejected += 1,
                     }
                 }
-                // NOTE: any handle the push never reported on stays pending
-                // too.
-                self.pending_flag_pushes.clear();
-                self.pending_content_pushes.clear();
-                self.pending_drops.clear();
-                self.pending_creates.clear();
+                // NOTE: any handle this chunk never reported on stays
+                // pending too. Only this chunk's are forgotten: a later
+                // chunk has not been pushed yet.
+                for handle in mem::take(&mut self.in_flight) {
+                    self.pending_flag_pushes.remove(&handle);
+                    self.pending_content_pushes.remove(&handle);
+                    self.pending_drops.remove(&handle);
+                    self.pending_creates.remove(&handle);
+                }
 
                 debug!("pushed, write {} storage ops", self.writes.len());
                 trace!("push results: {results:?}");
                 self.state = State::PendingWrite;
-                let writes = mem::take(&mut self.writes);
-                ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(writes))
+                let batch = self.batch();
+                ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(batch))
             }
 
             (State::PendingWrite, Some(ReplicaArg::Write)) => {
+                // NOTE: the chunk this write recorded is safe from a replay;
+                // the next one goes out only now.
+                if !self.pushes.is_empty() {
+                    return self.step();
+                }
+
                 debug!(
                     "sync done: {} pulled, {} pushed, {} refreshed, {} conflicts, {} rejected",
                     self.report.pulled,
@@ -1122,6 +1268,11 @@ impl ReplicaCoroutine for ReplicaSync {
                     self.report.conflicts,
                     self.report.rejected,
                 );
+                // NOTE: a completed coroutine stays completed. Without this
+                // the state would still read `PendingWrite`, so resuming a
+                // finished sync would hand back an empty report, which a
+                // caller cannot tell from a run that genuinely did nothing.
+                self.state = State::Done;
                 ReplicaCoroutineState::Complete(Ok(mem::take(&mut self.report)))
             }
 
@@ -1143,6 +1294,10 @@ enum PushFlags {
 }
 
 /// What the content axis decided for a placement present on both sides.
+// NOTE: one of these is produced per candidate on the merge's hot path and
+// consumed immediately, so boxing the placement to even the variants out
+// would trade a move for an allocation per item.
+#[allow(clippy::large_enum_variant)]
 enum ContentOutcome {
     /// No content signal on either side: the flag merge runs on the
     /// placement as loaded.
@@ -1152,7 +1307,7 @@ enum ContentOutcome {
     /// rewritten copy, never on the stale loaded one.
     Rewritten(ReplicaPlacement),
     /// The local content won: the change to push.
-    Push(ReplicaChange),
+    Push(ReplicaChangeKind),
 }
 
 enum State {
@@ -1161,11 +1316,12 @@ enum State {
     PendingEnumerate,
     PendingPush,
     PendingWrite,
+    Done,
 }
 
 #[cfg(test)]
 mod tests {
-    use alloc::{vec, vec::Vec};
+    use alloc::{format, vec, vec::Vec};
 
     use crate::{
         object::ReplicaHash,
@@ -1193,6 +1349,7 @@ mod tests {
                 collection: "sent".into(),
                 handle: ReplicaHandle::from("9"),
             }),
+            ambiguous_handles: Vec::new(),
         }
     }
 
@@ -1214,6 +1371,7 @@ mod tests {
                 object: None,
             }),
             origin: None,
+            ambiguous_handles: Vec::new(),
         }
     }
 
@@ -1277,19 +1435,11 @@ mod tests {
                 // the fake remote accepts everything, assigning nothing
                 let results = changes
                     .iter()
-                    .map(|change| {
-                        let handle = match change {
-                            ReplicaChange::Add { handle, .. } => handle,
-                            ReplicaChange::Remove { handle, .. } => handle,
-                            ReplicaChange::SetFlags { handle, .. } => handle,
-                            ReplicaChange::Update { handle, .. } => handle,
-                        };
-                        ReplicaPushResult {
-                            handle: handle.clone(),
-                            outcome: ReplicaPushOutcome::Accepted,
-                            assigned: None,
-                            revision: None,
-                        }
+                    .map(|change| ReplicaPushResult {
+                        handle: change.handle().clone(),
+                        outcome: ReplicaPushOutcome::Accepted,
+                        assigned: None,
+                        revision: None,
                     })
                     .collect();
                 pushes = Some(changes);
@@ -1354,7 +1504,7 @@ mod tests {
         let (pushes, _writes, report) = run(&mut sync, vec![local], vec![remote("1", &[])]);
 
         let pushes = pushes.expect("a push");
-        assert!(matches!(pushes[0], ReplicaChange::SetFlags { .. }));
+        assert!(matches!(pushes[0].kind, ReplicaChangeKind::SetFlags { .. }));
         assert_eq!(report.pushed, 1);
     }
 
@@ -1518,8 +1668,96 @@ mod tests {
         let mut second = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
         let (pushes, _writes, report) = run(&mut second, vec![local], vec![remote("1", &[])]);
         let pushes = pushes.expect("the dirty change is pushed again");
-        assert!(matches!(pushes[0], ReplicaChange::SetFlags { .. }));
+        assert!(matches!(pushes[0].kind, ReplicaChangeKind::SetFlags { .. }));
         assert_eq!(report.pushed, 1);
+    }
+
+    /// The crash window is one chunk: a run deriving more changes than one
+    /// chunk holds records each chunk before pushing the next, so an
+    /// interrupted run replays only the chunk whose write never landed.
+    #[test]
+    fn a_chunk_is_recorded_before_the_next_one_is_pushed() {
+        let extra = 3;
+        let count = ReplicaSync::PUSH_CHUNK + extra;
+
+        // every member carries a local flag edit, so every one derives a
+        // push; the handles are padded so the merge orders them as numbered
+        let mut local = Vec::new();
+        let mut items = Vec::new();
+        for index in 0..count {
+            let handle = format!("{index:03}");
+            let mut placement = synced(&handle, &[]);
+            placement.flags = ReplicaFlags::from_iter(["seen"]);
+            placement.status = ReplicaStatus::Dirty;
+            local.push(placement);
+            items.push(remote(&handle, &[]));
+        }
+
+        crate::testlog::init();
+        let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
+        let _ = sync.resume(None);
+        let _ = sync.resume(Some(ReplicaArg::Load(ReplicaLoaded {
+            placements: local,
+            checkpoint: None,
+        })));
+
+        let mut order = Vec::new();
+        let mut chunks: Vec<Vec<ReplicaHandle>> = Vec::new();
+        let mut batches: Vec<Vec<ReplicaWriteOp>> = Vec::new();
+        let mut arg = Some(ReplicaArg::Enumerate(full(items)));
+
+        let report = loop {
+            match sync.resume(arg.take()) {
+                ReplicaCoroutineState::Yielded(ReplicaYield::WantsPush { changes, .. }) => {
+                    order.push("push");
+                    let results = changes
+                        .iter()
+                        .map(|change| ReplicaPushResult {
+                            handle: change.handle().clone(),
+                            outcome: ReplicaPushOutcome::Accepted,
+                            assigned: None,
+                            revision: None,
+                        })
+                        .collect();
+                    chunks.push(changes.iter().map(|c| c.handle().clone()).collect());
+                    arg = Some(ReplicaArg::Push(results));
+                }
+                ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(writes)) => {
+                    order.push("write");
+                    batches.push(writes);
+                    arg = Some(ReplicaArg::Write);
+                }
+                ReplicaCoroutineState::Complete(Ok(report)) => break report,
+                state => panic!("expected push or write, got {state:?}"),
+            }
+        };
+
+        assert_eq!(order, ["push", "write", "push", "write"]);
+        assert_eq!(chunks[0].len(), ReplicaSync::PUSH_CHUNK);
+        assert_eq!(chunks[1].len(), extra);
+
+        // each chunk is rebased by the write that follows it, and by no
+        // other: nothing of the second chunk rides the first batch.
+        for handle in &chunks[0] {
+            let rebased = upserted(&batches[0], handle.as_str());
+            assert!(rebased.is_some_and(|p| p.status == ReplicaStatus::Clean));
+        }
+        for handle in &chunks[1] {
+            assert!(upserted(&batches[0], handle.as_str()).is_none());
+            let rebased = upserted(&batches[1], handle.as_str());
+            assert!(rebased.is_some_and(|p| p.status == ReplicaStatus::Clean));
+        }
+
+        // the checkpoint lands in the last write, and only there
+        let checkpointed = |batch: &Vec<ReplicaWriteOp>| {
+            batch
+                .iter()
+                .any(|op| matches!(op, ReplicaWriteOp::SetCheckpoint { .. }))
+        };
+        assert!(!checkpointed(&batches[0]), "an early checkpoint");
+        assert!(checkpointed(&batches[1]), "no closing checkpoint");
+
+        assert_eq!(report.pushed, count);
     }
 
     #[test]
@@ -1549,8 +1787,8 @@ mod tests {
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
         let (pushes, writes, report) = run(&mut sync, vec![local], vec![remote("1", &["seen"])]);
 
-        match &pushes.expect("a push")[0] {
-            ReplicaChange::SetFlags { flags, .. } => {
+        match &pushes.expect("a push")[0].kind {
+            ReplicaChangeKind::SetFlags { flags, .. } => {
                 assert!(flags.contains("flagged") && flags.contains("seen"));
             }
             other => panic!("expected a SetFlags push, got {other:?}"),
@@ -1588,8 +1826,8 @@ mod tests {
             vec![remote("1", &["seen", "important"])],
         );
 
-        match &pushes.expect("a push")[0] {
-            ReplicaChange::SetFlags { flags, .. } => {
+        match &pushes.expect("a push")[0].kind {
+            ReplicaChangeKind::SetFlags { flags, .. } => {
                 assert!(flags.contains("important"), "the remote addition wins");
                 assert!(!flags.contains("seen"), "the local removal wins");
             }
@@ -1680,7 +1918,7 @@ mod tests {
         let (pushes, _writes, report) = run_snapshot(&mut sync, vec![local], snapshot);
 
         let pushes = pushes.expect("a push");
-        assert!(matches!(pushes[0], ReplicaChange::SetFlags { .. }));
+        assert!(matches!(pushes[0].kind, ReplicaChangeKind::SetFlags { .. }));
         assert_eq!(report.pushed, 1);
     }
 
@@ -1926,8 +2164,8 @@ mod tests {
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
         let (pushes, _writes, report) = run(&mut sync, vec![local], vec![]);
 
-        match &pushes.expect("a push")[0] {
-            ReplicaChange::Add { origin, flags, .. } => {
+        match &pushes.expect("a push")[0].kind {
+            ReplicaChangeKind::Add { origin, flags, .. } => {
                 assert!(origin.is_some());
                 assert!(flags.contains("seen"), "the flag set rides the add");
             }
@@ -2006,8 +2244,8 @@ mod tests {
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
         let (pushes, _writes, report) = run(&mut sync, vec![local], vec![remote("1", &["seen"])]);
 
-        match &pushes.expect("a push")[0] {
-            ReplicaChange::Remove { to: Some(to), .. } => assert_eq!(to.as_str(), "archive"),
+        match &pushes.expect("a push")[0].kind {
+            ReplicaChangeKind::Remove { to: Some(to), .. } => assert_eq!(to.as_str(), "archive"),
             other => panic!("expected a move Remove, got {other:?}"),
         }
         assert_eq!(report.pushed, 1);
@@ -2095,8 +2333,8 @@ mod tests {
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
         let (pushes, writes, _report) = run(&mut sync, vec![local], vec![item]);
 
-        match &pushes.expect("a push")[0] {
-            ReplicaChange::Update { .. } => {}
+        match &pushes.expect("a push")[0].kind {
+            ReplicaChangeKind::Update { .. } => {}
             other => panic!("expected an Update push, got {other:?}"),
         }
         let pulled = upserted(&writes, "1").expect("the flag pull");
@@ -2124,8 +2362,8 @@ mod tests {
             ReplicaCoroutineState::Yielded(ReplicaYield::WantsPush { changes, .. }) => changes,
             state => panic!("expected WantsPush, got {state:?}"),
         };
-        match &pushes[0] {
-            ReplicaChange::Update {
+        match &pushes[0].kind {
+            ReplicaChangeKind::Update {
                 handle,
                 object,
                 if_match,
@@ -2397,8 +2635,8 @@ mod tests {
         let (pushes, _writes, _report) =
             run(&mut sync, vec![placement], vec![remote_rev("1", "r1")]);
 
-        match &pushes.expect("a push")[0] {
-            ReplicaChange::Remove { to, if_match, .. } => {
+        match &pushes.expect("a push")[0].kind {
+            ReplicaChangeKind::Remove { to, if_match, .. } => {
                 assert_eq!(*to, None, "a plain remove, not a server-side move");
                 assert_eq!(if_match.as_deref(), Some("r1"));
             }
@@ -2421,8 +2659,8 @@ mod tests {
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
         let (pushes, _writes, _report) = run(&mut sync, vec![placement], vec![remote("1", &[])]);
 
-        match &pushes.expect("a push")[0] {
-            ReplicaChange::Remove { to: Some(to), .. } => assert_eq!(to.as_str(), "archive"),
+        match &pushes.expect("a push")[0].kind {
+            ReplicaChangeKind::Remove { to: Some(to), .. } => assert_eq!(to.as_str(), "archive"),
             other => panic!("expected a move Remove, got {other:?}"),
         }
     }
@@ -2438,8 +2676,10 @@ mod tests {
         let (pushes, _writes, _report) =
             run(&mut sync, vec![placement], vec![remote_rev("1", "r1")]);
 
-        match &pushes.expect("a push")[0] {
-            ReplicaChange::Remove { if_match, .. } => assert_eq!(if_match.as_deref(), Some("r1")),
+        match &pushes.expect("a push")[0].kind {
+            ReplicaChangeKind::Remove { if_match, .. } => {
+                assert_eq!(if_match.as_deref(), Some("r1"))
+            }
             other => panic!("expected a Remove push, got {other:?}"),
         }
     }
@@ -2453,8 +2693,8 @@ mod tests {
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
         let (pushes, writes, _report) = run(&mut sync, vec![edited("1")], vec![]);
 
-        match &pushes.expect("a push")[0] {
-            ReplicaChange::Add { object, origin, .. } => {
+        match &pushes.expect("a push")[0].kind {
+            ReplicaChangeKind::Add { object, origin, .. } => {
                 assert_eq!(object, &Some(ReplicaHash::from("h2")), "the edited body");
                 assert!(origin.is_none(), "an append, not a copy");
             }
@@ -2480,8 +2720,8 @@ mod tests {
         let (pushes, writes, _report) = run(&mut sync, vec![placement], vec![]);
 
         assert!(matches!(
-            &pushes.expect("a push")[0],
-            ReplicaChange::Add { origin: None, .. }
+            &pushes.expect("a push")[0].kind,
+            ReplicaChangeKind::Add { origin: None, .. }
         ));
         let resurrected = upserted(&writes, "1").expect("a resurrected placement");
         assert_eq!(resurrected.status, ReplicaStatus::Created);
@@ -2631,6 +2871,18 @@ mod tests {
     }
 
     #[test]
+    fn a_completed_sync_does_not_resume() {
+        // An empty report is indistinguishable from a run that genuinely did
+        // nothing, so a driver resuming a finished sync must be told.
+        let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
+        let _ = run(&mut sync, vec![], vec![]);
+        match sync.resume(Some(ReplicaArg::Write)) {
+            ReplicaCoroutineState::Complete(Err(ReplicaSyncError::UnexpectedArg)) => {}
+            state => panic!("expected UnexpectedArg, got {state:?}"),
+        }
+    }
+
+    #[test]
     fn unexpected_arg_errors() {
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
         let _ = sync.resume(None);
@@ -2704,7 +2956,7 @@ mod tests {
         assert!(
             pushes
                 .iter()
-                .all(|c| matches!(c, ReplicaChange::SetFlags { .. })),
+                .all(|c| matches!(c.kind, ReplicaChangeKind::SetFlags { .. })),
             "only the flag change may be pushed, not the delete: {pushes:?}",
         );
     }
@@ -2814,8 +3066,8 @@ mod tests {
             run(&mut sync, vec![edited("1")], vec![remote_rev("1", "r2")]);
 
         let pushes = pushes.expect("prefer-local pushes the edit");
-        match &pushes[0] {
-            ReplicaChange::Update {
+        match &pushes[0].kind {
+            ReplicaChangeKind::Update {
                 object, if_match, ..
             } => {
                 assert_eq!(object, &ReplicaHash::from("h2"));

@@ -14,7 +14,7 @@
 use std::{collections::BTreeMap, convert::Infallible};
 
 use io_replica::{
-    change::{ReplicaChange, ReplicaWriteOp},
+    change::{ReplicaChange, ReplicaChangeKind, ReplicaWriteOp},
     client::{ReplicaClient, ReplicaRemote, ReplicaStorage},
     collection::{ReplicaCheckpoint, ReplicaCollectionId},
     mutate::ReplicaMutation,
@@ -214,7 +214,7 @@ impl ReplicaRemote for MemRemote {
     ) -> Result<Vec<ReplicaPushResult>, Infallible> {
         let mut results = Vec::new();
         for change in changes {
-            let ReplicaChange::SetFlags { handle, flags } = change else {
+            let ReplicaChangeKind::SetFlags { handle, flags } = change.kind else {
                 unreachable!("this example only stages flag changes");
             };
             let members = self.collections.get_mut(collection).unwrap();

@@ -1,29 +1,11 @@
 //! A mailbox, address book or calendar: the id the engine scopes every
 //! verb to, and the opaque token it round-trips between the two seams.
 
-use alloc::{string::String, vec::Vec};
+use alloc::vec::Vec;
 
-/// The account-scoped identity of a collection.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
-pub struct ReplicaCollectionId(pub String);
-
-impl ReplicaCollectionId {
-    /// Borrows the id as a string slice.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<&str> for ReplicaCollectionId {
-    fn from(value: &str) -> Self {
-        Self(value.into())
-    }
-}
-
-impl From<String> for ReplicaCollectionId {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
+crate::replica_id! {
+    /// The account-scoped identity of a collection.
+    ReplicaCollectionId, Ord, PartialOrd, Hash,
 }
 
 /// An opaque per-collection sync token.

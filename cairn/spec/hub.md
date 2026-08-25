@@ -170,3 +170,20 @@ already placed. A known key SHALL replace another known key.
 - GIVEN a hub item whose key one source derived
 - WHEN another source absorbs the same item with an unknown key
 - THEN the projection still carries the derived key
+
+### Requirement: An ambiguous identity is neither propagated nor deleted across sources
+A binding carrying ambiguous handles SHALL project `ReplicaStatus::Ambiguous` for that source, and the handles SHALL round-trip through `absorb`, an upsert carrying none clearing the freeze.
+
+Two rules read the state across the item rather than per source, because both are cross-source: an identity any source holds twice SHALL NOT be offered as a `Created` append to a source that lacks it, and a drop of it SHALL NOT mark the shared item deleted. The copy that vanished says nothing about the one that did not, and propagating on that reading removes the only copy on a source nobody touched.
+
+The freeze is per source otherwise: in a two-sided store one side may hold the duplicate while the other holds the identity once, and that side keeps syncing.
+
+#### Scenario: One source holds it twice, the other once
+- GIVEN an item bound to two sources, ambiguous on one
+- WHEN the hub projects each source
+- THEN the ambiguous side reads `Ambiguous` and the other reads as it otherwise would
+
+#### Scenario: A drop from the ambiguous side propagates nothing
+- GIVEN that item
+- WHEN the ambiguous source drops its bound handle as deleted
+- THEN the shared item is not marked deleted and the other source is untouched

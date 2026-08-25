@@ -11,7 +11,7 @@
 use std::{collections::BTreeMap, convert::Infallible};
 
 use io_replica::{
-    change::{ReplicaChange, ReplicaWriteOp},
+    change::{ReplicaChange, ReplicaChangeKind, ReplicaWriteOp},
     client::{ReplicaRemote, ReplicaStorage},
     collection::{ReplicaCheckpoint, ReplicaCollectionId},
     object::{ReplicaHash, ReplicaObject},
@@ -52,7 +52,9 @@ impl ReplicaStorage for MemStorage {
         let in_scope = |p: &ReplicaPlacement| match scope {
             ReplicaLoadScope::All => true,
             ReplicaLoadScope::Handles(handles) => handles.contains(&p.handle),
-            ReplicaLoadScope::Link(link) => p.link_id.as_ref() == Some(link),
+            ReplicaLoadScope::Links(links) => {
+                p.link_id.as_ref().is_some_and(|link| links.contains(link))
+            }
         };
         let placements = self
             .placements
@@ -140,6 +142,9 @@ pub struct MemRemote {
     /// The handle assigned to the next accepted append (an add with no
     /// origin); incremented per append.
     pub next_appended: usize,
+    /// The size of each push batch it was handed, in order: how a run split
+    /// its changes into chunks.
+    pub push_batches: Vec<usize>,
     /// When true the remote reports content revisions (a WebDAV etag) and
     /// rejects pushes whose if_match is stale; when false it behaves like
     /// an immutable-content backend (IMAP) and reports none.
@@ -420,11 +425,12 @@ impl ReplicaRemote for MemRemote {
         changes: Vec<ReplicaChange>,
     ) -> Result<Vec<ReplicaPushResult>, Infallible> {
         self.calls += 1;
+        self.push_batches.push(changes.len());
         let mut results = Vec::new();
 
         for change in changes {
-            let result = match change {
-                ReplicaChange::SetFlags { handle, flags } => {
+            let result = match change.kind {
+                ReplicaChangeKind::SetFlags { handle, flags } => {
                     let seq = self.bump();
                     if let Some(item) = self
                         .items
@@ -436,7 +442,7 @@ impl ReplicaRemote for MemRemote {
                     }
                     accepted(handle, None, None)
                 }
-                ReplicaChange::Remove {
+                ReplicaChangeKind::Remove {
                     handle,
                     to,
                     link_id,
@@ -484,7 +490,7 @@ impl ReplicaRemote for MemRemote {
                         accepted(handle, None, None)
                     }
                 }
-                ReplicaChange::Update {
+                ReplicaChangeKind::Update {
                     handle,
                     object,
                     if_match,
@@ -521,7 +527,7 @@ impl ReplicaRemote for MemRemote {
                 // append the uploaded body under a fresh handle. A copy
                 // whose origin is gone is rejected (a real server errors
                 // on copying an expunged message).
-                ReplicaChange::Add {
+                ReplicaChangeKind::Add {
                     handle,
                     link_id,
                     flags,

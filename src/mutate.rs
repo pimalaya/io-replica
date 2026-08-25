@@ -135,7 +135,7 @@ impl ReplicaMutation {
     /// collide with.
     fn scope(&self) -> ReplicaLoadScope {
         match self {
-            Self::Add { link_id, .. } => ReplicaLoadScope::Link(link_id.clone()),
+            Self::Add { link_id, .. } => ReplicaLoadScope::Links(alloc::vec![link_id.clone()]),
             other => match other.handle() {
                 Some(handle) => ReplicaLoadScope::Handles(alloc::vec![handle.clone()]),
                 None => ReplicaLoadScope::All,
@@ -153,6 +153,11 @@ pub enum ReplicaMutateError {
     /// An `Add` names a link id a live placement already holds.
     #[error("Replica MUTATE failed: link id already present: {0}")]
     LinkExists(String),
+    /// The targeted placement holds an identity its source holds twice, so
+    /// which copy the edit belongs to cannot be decided. Nothing is staged:
+    /// the source has to hold the identity once again first.
+    #[error("Replica MUTATE failed: ambiguous identity at handle {0}")]
+    Ambiguous(String),
     /// The driver fed back an arg that does not match the pending yield.
     #[error("Replica MUTATE failed: unexpected coroutine arg")]
     UnexpectedArg,
@@ -314,6 +319,7 @@ impl ReplicaMutate {
             conflict_revision: None,
             base: None,
             origin,
+            ambiguous_handles: Vec::new(),
         }
     }
 
@@ -347,6 +353,7 @@ impl ReplicaMutate {
             conflict_revision: None,
             base: None,
             origin: None,
+            ambiguous_handles: Vec::new(),
         };
         vec![
             ReplicaWriteOp::StoreObject {
@@ -398,6 +405,15 @@ impl ReplicaCoroutine for ReplicaMutate {
                         let err = ReplicaMutateError::UnknownHandle(handle.as_str().into());
                         return ReplicaCoroutineState::Complete(Err(err));
                     };
+                    // NOTE: the source holds this identity more than once, so
+                    // which copy the edit belongs to cannot be decided.
+                    // Staging it anyway would attach the change to whichever
+                    // copy happens to be bound, and the sync would then push
+                    // it as if it were the only one.
+                    if placement.status == ReplicaStatus::Ambiguous {
+                        let err = ReplicaMutateError::Ambiguous(handle.as_str().into());
+                        return ReplicaCoroutineState::Complete(Err(err));
+                    }
                     self.writes(placement)
                 };
 
@@ -454,6 +470,7 @@ mod tests {
                     object: None,
                 }),
                 origin: None,
+                ambiguous_handles: Vec::new(),
             }],
             checkpoint: None,
         }
@@ -927,7 +944,10 @@ mod tests {
         let mut mutate = ReplicaMutate::new("inbox", add);
         match mutate.resume(None) {
             ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad { scope, .. }) => {
-                assert_eq!(scope, ReplicaLoadScope::Link(ReplicaLinkId::from("m1")));
+                assert_eq!(
+                    scope,
+                    ReplicaLoadScope::Links(vec![ReplicaLinkId::from("m1")]),
+                );
             }
             state => panic!("expected WantsLoad, got {state:?}"),
         }

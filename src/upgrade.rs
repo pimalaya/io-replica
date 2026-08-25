@@ -19,8 +19,8 @@ use crate::{
     collection::ReplicaCollectionId,
     coroutine::*,
     object::ReplicaObject,
-    placement::{ReplicaHandle, ReplicaLevel, ReplicaPlacement},
-    remote::{ReplicaFetchedBody, ReplicaTier},
+    placement::{ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaPlacement, ReplicaStatus},
+    remote::{ReplicaFetchedBody, ReplicaFetchedItem, ReplicaTier},
     storage::ReplicaLoadScope,
 };
 
@@ -52,6 +52,8 @@ pub struct ReplicaUpgrade {
     handles: Vec<ReplicaHandle>,
     tier: ReplicaTier,
     placements: BTreeMap<ReplicaHandle, ReplicaPlacement>,
+    /// Fetched items held between the fetch and the identity check.
+    fetched: Vec<ReplicaFetchedItem>,
     ops: Vec<ReplicaWriteOp>,
     report: ReplicaUpgradeReport,
     state: State,
@@ -77,9 +79,45 @@ impl ReplicaUpgrade {
             handles,
             tier,
             placements: BTreeMap::new(),
+            fetched: Vec::new(),
             ops: Vec::new(),
             report: ReplicaUpgradeReport::default(),
             state: State::Start,
+        }
+    }
+
+    /// Records each losing handle on the placement that holds its identity,
+    /// which is what freezes it: a placement carrying ambiguous handles reads
+    /// as [`ReplicaStatus::Ambiguous`] and the engine derives nothing for it.
+    ///
+    /// The record is what makes the freeze sticky, and it has to be: the
+    /// second copy appears in exactly one enumeration, the one that discovers
+    /// it, and an incremental enumeration never mentions it again.
+    fn freeze(&mut self, ambiguous: Vec<(ReplicaHandle, ReplicaHandle)>) {
+        let mut by_holder: BTreeMap<ReplicaHandle, Vec<ReplicaHandle>> = BTreeMap::new();
+        for (holder, lost) in ambiguous {
+            by_holder.entry(holder).or_default().push(lost);
+        }
+
+        for (holder, lost) in by_holder {
+            // NOTE: patch whatever this batch already staged for the holder,
+            // so a holder fetched in the same batch keeps its new body.
+            let staged = self.ops.iter_mut().find_map(|op| match op {
+                ReplicaWriteOp::UpsertPlacement(p) if p.handle == holder => Some(p),
+                _ => None,
+            });
+
+            match staged {
+                Some(placement) => mark_ambiguous(placement, lost),
+                None => {
+                    let Some(placement) = self.placements.get(&holder) else {
+                        continue;
+                    };
+                    let mut patched = placement.clone();
+                    mark_ambiguous(&mut patched, lost);
+                    self.ops.push(ReplicaWriteOp::UpsertPlacement(patched));
+                }
+            }
         }
     }
 
@@ -226,82 +264,48 @@ impl ReplicaCoroutine for ReplicaUpgrade {
 
             (State::PendingFetch, Some(ReplicaArg::Fetch(items))) => {
                 trace!("fetched {} items", items.len());
-                for item in items {
-                    let Some(placement) = self.placements.get(&item.handle) else {
-                        continue;
-                    };
-                    let mut patched = placement.clone();
-                    // NOTE: keep an already-resolved link id. A fetch establishes
-                    // the link only for a not-yet-linked item (a `Meta` upgrade of
-                    // a probed placement); a `Full` body fetch of a linked item
-                    // must not re-identify it. Two tiers can otherwise disagree on
-                    // the link (a server ENVELOPE reporting a `Message-ID` the body
-                    // parser does not, or a differently formatted date in the
-                    // fallback digest), which would strand the linked item and
-                    // duplicate it under the body's link.
-                    if patched.link_id.is_none() {
-                        patched.link_id = Some(item.link_id);
-                    }
-                    patched.meta = Some(item.meta);
-                    // NOTE: unlike the link id, the key is refreshed on
-                    // every tier. It is a projection of the content, not
-                    // an identity, so the later and better-informed
-                    // derivation should win: a `Full` body carries the
-                    // real date where an envelope may have carried none.
-                    // A connector whose kind defines no key sends an
-                    // empty one, which reads as unknown either way.
-                    patched.sort_key = item.sort_key;
 
-                    match (self.tier, item.body) {
-                        (ReplicaTier::Full, Some(body)) => {
-                            // NOTE: the body is either inline bytes to store, or
-                            // a reference to an object the consumer already
-                            // streamed into its blob store (bounded memory) —
-                            // then the store op carries no bytes.
-                            let (object, store_body) = match body {
-                                ReplicaFetchedBody::Inline { hash, bytes } => {
-                                    let object = ReplicaObject {
-                                        hash,
-                                        size: bytes.len(),
-                                    };
-                                    (object, Some(bytes))
-                                }
-                                ReplicaFetchedBody::Persisted { hash, size } => {
-                                    (ReplicaObject { hash, size }, None)
-                                }
-                            };
-                            let hash = object.hash.clone();
-                            self.ops.push(ReplicaWriteOp::StoreObject {
-                                object,
-                                body: store_body,
-                            });
+                // NOTE: an identity this fetch would newly establish has to be
+                // checked against every placement of the collection that could
+                // already hold it, not just the ones being upgraded: a batch
+                // hydrating only the second copy would otherwise link it and
+                // destroy the evidence. The check is one scoped read, asked
+                // only when the fetch actually resolves a new identity.
+                let fresh: Vec<ReplicaLinkId> = items
+                    .iter()
+                    .filter(|item| {
+                        self.placements
+                            .get(&item.handle)
+                            .is_some_and(|p| p.link_id.is_none())
+                    })
+                    .map(|item| item.link_id.clone())
+                    .collect();
 
-                            // NOTE: the revision travels with the body: the
-                            // stored object is the remote content as of the
-                            // fetch, so the base records both.
-                            if let Some(base) = &mut patched.base {
-                                base.revision = item.revision.clone();
-                                base.object = Some(hash.clone());
-                            }
-
-                            patched.object = Some(hash);
-                            patched.level = ReplicaLevel::Full;
-                            self.report.fetched += 1;
-                        }
-                        _ => {
-                            patched.level = ReplicaLevel::Meta;
-                            self.report.fetched += 1;
-                        }
-                    }
-
-                    self.ops.push(ReplicaWriteOp::UpsertPlacement(patched));
-                    self.report.upgraded += 1;
+                self.fetched = items;
+                if fresh.is_empty() {
+                    return self.write_fetched();
                 }
 
-                debug!("write {} storage ops", self.ops.len());
-                self.state = State::PendingWrite;
-                let ops = mem::take(&mut self.ops);
-                ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops))
+                debug!(
+                    "check {} fresh link ids against the collection",
+                    fresh.len()
+                );
+                self.state = State::PendingLinkCheck;
+                ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad {
+                    collection: self.collection.clone(),
+                    scope: ReplicaLoadScope::Links(fresh),
+                })
+            }
+
+            (State::PendingLinkCheck, Some(ReplicaArg::Load(loaded))) => {
+                // NOTE: holders the upgrade batch never named; folded in by
+                // handle, so the identity check below sees the whole picture.
+                for placement in loaded.placements {
+                    self.placements
+                        .entry(placement.handle.clone())
+                        .or_insert(placement);
+                }
+                self.write_fetched()
             }
 
             (State::PendingWrite, Some(ReplicaArg::Write)) => {
@@ -318,6 +322,134 @@ impl ReplicaCoroutine for ReplicaUpgrade {
             (_, None) => ReplicaCoroutineState::Complete(Err(ReplicaUpgradeError::MissingArg)),
         }
     }
+}
+
+impl ReplicaUpgrade {
+    /// Applies the fetched items and yields the write batch.
+    fn write_fetched(
+        &mut self,
+    ) -> ReplicaCoroutineState<ReplicaYield, <Self as ReplicaCoroutine>::Return> {
+        // NOTE: (holder, losing handle) pairs this batch discovered:
+        // an identity the collection turns out to hold twice. Applied
+        // after the loop, so a holder that also appears in the batch
+        // is patched once, with every handle it lost.
+        let mut ambiguous: Vec<(ReplicaHandle, ReplicaHandle)> = Vec::new();
+
+        // NOTE: who holds each identity, seeded from what the collection
+        // already claims and extended as this batch resolves more. Both
+        // copies of a duplicate are commonly fetched together, and neither
+        // is linked yet, so a check against the stored rows alone would see
+        // nothing and link both.
+        let mut claimed: BTreeMap<ReplicaLinkId, ReplicaHandle> = self
+            .placements
+            .values()
+            .filter_map(|p| Some((p.link_id.clone()?, p.handle.clone())))
+            .collect();
+
+        for item in mem::take(&mut self.fetched) {
+            let Some(placement) = self.placements.get(&item.handle) else {
+                continue;
+            };
+            let mut patched = placement.clone();
+            // NOTE: keep an already-resolved link id. A fetch establishes
+            // the link only for a not-yet-linked item (a `Meta` upgrade of
+            // a probed placement); a `Full` body fetch of a linked item
+            // must not re-identify it. Two tiers can otherwise disagree on
+            // the link (a server ENVELOPE reporting a `Message-ID` the body
+            // parser does not, or a differently formatted date in the
+            // fallback digest), which would strand the linked item and
+            // duplicate it under the body's link.
+            if patched.link_id.is_none() {
+                // NOTE: nor does it establish a link another placement
+                // of the collection already holds. The second copy has
+                // nowhere to live, and linking it overwrites the first
+                // binding's handle: the fact that the source holds the
+                // identity twice would be destroyed at this write,
+                // before any later rule could act on it. The losing
+                // handle is recorded on the holder instead.
+                match claimed.get(&item.link_id) {
+                    Some(holder) => ambiguous.push((holder.clone(), item.handle.clone())),
+                    None => {
+                        claimed.insert(item.link_id.clone(), item.handle.clone());
+                        patched.link_id = Some(item.link_id);
+                    }
+                }
+            }
+            patched.meta = Some(item.meta);
+            // NOTE: unlike the link id, the key is refreshed on
+            // every tier. It is a projection of the content, not
+            // an identity, so the later and better-informed
+            // derivation should win: a `Full` body carries the
+            // real date where an envelope may have carried none.
+            // A connector whose kind defines no key sends an
+            // empty one, which reads as unknown either way.
+            patched.sort_key = item.sort_key;
+
+            match (self.tier, item.body) {
+                (ReplicaTier::Full, Some(body)) => {
+                    // NOTE: the body is either inline bytes to store, or
+                    // a reference to an object the consumer already
+                    // streamed into its blob store (bounded memory) —
+                    // then the store op carries no bytes.
+                    let (object, store_body) = match body {
+                        ReplicaFetchedBody::Inline { hash, bytes } => {
+                            let object = ReplicaObject {
+                                hash,
+                                size: bytes.len(),
+                            };
+                            (object, Some(bytes))
+                        }
+                        ReplicaFetchedBody::Persisted { hash, size } => {
+                            (ReplicaObject { hash, size }, None)
+                        }
+                    };
+                    let hash = object.hash.clone();
+                    self.ops.push(ReplicaWriteOp::StoreObject {
+                        object,
+                        body: store_body,
+                    });
+
+                    // NOTE: the revision travels with the body: the
+                    // stored object is the remote content as of the
+                    // fetch, so the base records both.
+                    if let Some(base) = &mut patched.base {
+                        base.revision = item.revision.clone();
+                        base.object = Some(hash.clone());
+                    }
+
+                    patched.object = Some(hash);
+                    patched.level = ReplicaLevel::Full;
+                    self.report.fetched += 1;
+                }
+                _ => {
+                    patched.level = ReplicaLevel::Meta;
+                    self.report.fetched += 1;
+                }
+            }
+
+            self.ops.push(ReplicaWriteOp::UpsertPlacement(patched));
+            self.report.upgraded += 1;
+        }
+
+        self.freeze(ambiguous);
+
+        debug!("write {} storage ops", self.ops.len());
+        self.state = State::PendingWrite;
+        let ops = mem::take(&mut self.ops);
+        ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops))
+    }
+}
+
+/// Freezes a placement on the identity axis: it holds an identity the source
+/// reports under `lost` too, so which copy any change refers to cannot be
+/// decided and the engine derives nothing for it.
+fn mark_ambiguous(placement: &mut ReplicaPlacement, lost: Vec<ReplicaHandle>) {
+    for handle in lost {
+        if !placement.ambiguous_handles.contains(&handle) {
+            placement.ambiguous_handles.push(handle);
+        }
+    }
+    placement.status = ReplicaStatus::Ambiguous;
 }
 
 /// Whether the placement's content is mutable, which the last-synced revision
@@ -339,6 +471,7 @@ enum State {
     PendingLoad,
     PendingLookup,
     PendingFetch,
+    PendingLinkCheck,
     PendingWrite,
 }
 
@@ -368,6 +501,7 @@ mod tests {
             conflict_revision: None,
             base: None,
             origin: None,
+            ambiguous_handles: Vec::new(),
         }
     }
 
@@ -588,7 +722,16 @@ mod tests {
             body: None,
             revision: None,
         }];
-        let ops = match up.resume(Some(ReplicaArg::Fetch(items))) {
+        // NOTE: a fetch that establishes a fresh identity checks it against
+        // the collection first; nothing else holds it here.
+        match up.resume(Some(ReplicaArg::Fetch(items))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad {
+                scope: ReplicaLoadScope::Links(links),
+                ..
+            }) => assert_eq!(links, vec![ReplicaLinkId::from("mid:resolved")]),
+            state => panic!("expected WantsLoad, got {state:?}"),
+        }
+        let ops = match up.resume(Some(ReplicaArg::Load(ReplicaLoaded::default()))) {
             ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
             state => panic!("expected WantsWrite, got {state:?}"),
         };

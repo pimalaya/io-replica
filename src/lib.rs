@@ -119,6 +119,46 @@
 
 extern crate alloc;
 
+/// Declares one of the crate's string-newtype identities.
+///
+/// Five of them exist (a handle, a link id, a collection id, a source id, a
+/// content hash), and each was the same fifteen lines: the tuple struct, an
+/// `as_str`, and a conversion from each of the two string types. They differ
+/// only in what they mean and in which traits they derive, so that is all the
+/// macro takes; the doc comments stay on the call, which is where a reader
+/// looks for them.
+macro_rules! replica_id {
+    (
+        $(#[$meta:meta])*
+        $name:ident $(, $derive:ident)* $(,)?
+    ) => {
+        $(#[$meta])*
+        #[derive(Clone, Debug, Eq, PartialEq $(, $derive)*)]
+        pub struct $name(pub alloc::string::String);
+
+        impl $name {
+            #[doc = concat!("Borrows the ", stringify!($name), " as a string slice.")]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl From<&str> for $name {
+            fn from(value: &str) -> Self {
+                Self(value.into())
+            }
+        }
+
+        impl From<alloc::string::String> for $name {
+            fn from(value: alloc::string::String) -> Self {
+                Self(value)
+            }
+        }
+    };
+}
+
+pub(crate) use replica_id;
+
 pub mod change;
 pub mod client;
 pub mod collection;

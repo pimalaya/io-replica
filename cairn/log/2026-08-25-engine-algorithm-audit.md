@@ -42,7 +42,7 @@ Every fix went in test-first: the regression test was written against the old co
 
 ## Verification
 
-- 178 tests green (159 lib, 19 integration/property/membership/client/soft-delete), `cargo clippy --all-targets` clean, `cargo fmt`, `cargo doc` without warnings.
+- 188 tests green, `cargo clippy --all-targets` clean, `cargo fmt`, `cargo doc` without warnings.
 - New `tests/membership.rs` covers a move in both sync orders, linked and never-fetched, and a copy.
 - The property suite (crash injection, delta-vs-full equivalence, two concurrent replicas, the intent ledger) is unchanged and green; it caught the first move design and is what rejected it.
 
@@ -51,3 +51,15 @@ Every fix went in test-first: the regression test was written against the old co
 Breaking, on a 0.x line: `ReplicaStorage::load` takes a scope, `ReplicaWriteOp::DropPlacement` carries a reason, `ReplicaChange::Remove` carries a link id, `ReplicaYield::WantsLoad` is a struct variant, `ReplicaCollection` is gone. io-pimdir must at minimum match the new shapes; propagating a `Superseded` drop as a delete is the one that matters for data.
 
 Capabilities moved: `sync`, `storage`, `mutate`, `hub`.
+
+## Addendum, same day
+
+Two of the deferred items were revisited after `duplicate-link-id-freeze` landed, and one of them is now closed on the merits rather than on effort.
+
+- **The `ReplicaStatus` split is withdrawn, not deferred.** The case for it was seven special cases plus six hand-rolled "is there a content edit" predicates plus the tombstone whose origin meant destination. The predicates are now one `staged_edit`, the tombstone bug was fixed where it was, and `duplicate-link-id-freeze` deliberately added `Ambiguous` as a *variant* precisely so the compiler forces every rule to say what it does with an identity the engine cannot resolve. That exhaustiveness is the safety property the freeze rests on, and splitting the enum into orthogonal axes would remove it. The remaining special cases are each a rule saying something true about one state.
+
+- **The hub's per-drop scan is mitigated rather than fixed.** It was O(k·n) per batch; it now scans only the *scoped* hub a storage loads for its batch, so n is the batch rather than the collection wherever the storage honours the scope, which the reference one does. The index remains worth adding if a consumer ever loads whole collections.
+
+Still open, unchanged: chunked pushes with a per-change idempotency key (the crash window is the whole batch), and the merge's set-build-plus-clone where a sorted merge-join would do.
+
+Also landed here: the five string-newtype identities are one `replica_id!` declaration each rather than fifteen lines of identical impls, and `ReplicaLoadScope::Link` became `Links`.

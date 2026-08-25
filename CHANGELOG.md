@@ -9,20 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ReplicaStatus::Ambiguous`, plus `ambiguous_handles` on `ReplicaPlacement` and `ReplicaSourceBinding`**: an identity one collection holds twice, which the engine refuses to resolve and refuses to act on. A status variant rather than a flag, so every rule that matches the enum has to say what it does with an identity that cannot be resolved.
+
 - `ReplicaLoadScope`, carried by `ReplicaYield::WantsLoad` and by `ReplicaStorage::load`: a mutation now reads the one placement it edits (an `Add`, the rows holding its link id) and an upgrade the handles it raises, instead of the whole collection. The scope is a floor rather than a ceiling, so a storage that ignores it stays correct.
 - `ReplicaDropReason`, carried by `ReplicaWriteOp::DropPlacement`: whether the item itself is gone, or only this row of it.
 - `ReplicaPlacement::staged_edit`, the single reading of "there is a local content edit here", replacing six hand-rolled predicates that disagreed about the status guard and about what a missing base means.
+
+- `ReplicaSync::PUSH_CHUNK`, the number of changes one push chunk holds.
 
 ### Changed
 
 - `ReplicaChange::Remove` carries the `link_id` its destination would receive, so a consumer relocates a moved member only while the destination does not already hold it.
 - `ReplicaSyncReport::pushed` counts the changes a run derived and the remote accepted, rather than the results the consumer reported: a result naming an unknown handle, or one twice, no longer inflates it.
 
+- **`ReplicaChange` carries an idempotency key.** It is now the `ReplicaChangeKind` it used to be (the four verbs, unchanged) plus the `ReplicaChangeKey` naming it, derived from the collection, the handle, the kind and the target state the change makes true. A consumer that records the keys it applied recognises a replay of any kind, where only an add could be recognised before, through its `link_id`. `ReplicaChange::new` is the only way to make one, so a change cannot exist without its key, and `ReplicaChange::handle` reaches the member any kind acts on.
+
+- **A sync pushes and records in chunks**, yielding a `WantsPush` and the `WantsWrite` recording it per chunk of `ReplicaSync::PUSH_CHUNK` changes, instead of one of each per run. A crash between a serviced push and its recording write used to replay every push the run derived; it now replays only the chunk whose write never landed, and a chunk that was never reached was never pushed. A driver that assumed one push and one write per run has to loop; `ReplicaClient` already does.
+- The checkpoint lands in the last write of a run rather than in the middle of the batch, and stays the pre-push one: an intermediate chunk's write must not carry a cursor claiming its unrecorded pushes were seen.
+
+- `ReplicaLoadScope::Link` becomes `Links`, taking several: the reads that ask about an identity rather than a location have to see every row claiming it.
+- A completed `ReplicaSync` no longer resumes. It used to hand back an empty report, which a caller cannot tell from a run that genuinely did nothing.
+
 ### Removed
 
 - `ReplicaCollection`, referenced nowhere. Its `enumerated` flag stated an invariant the engine models nowhere: spine completeness comes off the consumer's snapshot on every run.
 
 ### Fixed
+
+- **A collection holding one identity twice lost mail on a side nobody touched.** A placement is identified by its collection and link id and a source binds it with one handle, so a second copy of one `Message-ID` (a double delivery, a retried `APPEND`, a restore, a migration) had nowhere to live: the fetch that resolved it silently repointed the first binding, and the evidence was gone at that write. Deleting the bound copy then propagated a delete that removed the only copy on another source, while the source that reported it still held the message.
+
+  Such an identity is now frozen rather than guessed: the losing handle is recorded on the placement that holds it, which reads as `Ambiguous`, and the engine derives nothing for it in either direction, including reading its absence from a complete snapshot as a delete. The record is what makes the freeze survive: the twin appears in exactly one enumeration, and an incremental one never mentions it again. An enumeration reporting the identity once again clears it and syncing resumes.
 
 - **A move delivered the item to the target twice.** Both halves of a move can deliver on their own, the target's create by copying from its origin and the source's tombstone by relocating the member, so syncing the target first left the server holding the copy *and* the relocation. Both now recognise what the other did through the link id, and an item whose link id is not resolved yet stages the source half alone, since it has no such key. Neither half could simply be dropped: the create is what makes a move work through a hub, whose bindings carry no origin, and the relocation is what keeps a never-fetched item from being deleted before its copy can run.
 

@@ -208,6 +208,13 @@ impl ReplicaRekey {
         let status = match old.status {
             ReplicaStatus::Tombstone => ReplicaStatus::Tombstone,
             ReplicaStatus::Conflict => ReplicaStatus::Conflict,
+            // NOTE: a handle-space change renumbers the copies, it does not
+            // merge them: the source still holds the identity twice, so the
+            // freeze carries over. The recorded handles belong to the old
+            // space, and the next complete enumeration clears them, after
+            // which the meta fetch re-detects the duplicate under its new
+            // handles if it is still there.
+            ReplicaStatus::Ambiguous => ReplicaStatus::Ambiguous,
             _ if content_edit => ReplicaStatus::Dirty,
             _ if flags != item.flags => ReplicaStatus::Dirty,
             _ => ReplicaStatus::Clean,
@@ -239,6 +246,7 @@ impl ReplicaRekey {
                 object: old.base.as_ref().and_then(|b| b.object.clone()),
             }),
             origin: old.origin,
+            ambiguous_handles: old.ambiguous_handles,
         }
     }
 
@@ -270,6 +278,7 @@ impl ReplicaRekey {
                 object: None,
             }),
             origin: None,
+            ambiguous_handles: Vec::new(),
         }
     }
 }
@@ -394,6 +403,7 @@ mod tests {
                 object: None,
             }),
             origin: None,
+            ambiguous_handles: Vec::new(),
         }
     }
 
@@ -664,5 +674,32 @@ mod tests {
             ReplicaCoroutineState::Complete(Err(ReplicaRekeyError::UnexpectedArg)) => {}
             state => panic!("expected UnexpectedArg, got {state:?}"),
         }
+    }
+
+    #[test]
+    fn an_ambiguous_identity_survives_a_handle_space_change() {
+        // Renumbering the copies does not merge them: the source still holds
+        // the identity twice, so the freeze carries over rather than the item
+        // becoming deletable again on the other side of a UIDVALIDITY bump.
+        let mut old = synced("7", "m1", &[]);
+        old.status = ReplicaStatus::Ambiguous;
+        old.ambiguous_handles = vec![ReplicaHandle::from("8")];
+
+        let (writes, report) = run(
+            vec![old],
+            vec![item("v2-0", &[])],
+            vec![fetched("v2-0", "m1")],
+        );
+
+        assert_eq!(report.rekeyed, 1);
+        let carried = writes
+            .iter()
+            .find_map(|op| match op {
+                ReplicaWriteOp::UpsertPlacement(p) if p.handle.as_str() == "v2-0" => Some(p),
+                _ => None,
+            })
+            .expect("the carried placement");
+        assert_eq!(carried.status, ReplicaStatus::Ambiguous);
+        assert_eq!(carried.ambiguous_handles, vec![ReplicaHandle::from("8")]);
     }
 }
