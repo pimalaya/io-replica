@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-25
+
+### Fixed
+
+- **A remote content change never reached a hub-backed store.** `pull_content` drops the stale body and lowers the placement so an upgrade refetches it, but `ReplicaHub::absorb` merged the level as a maximum, so the item kept the `Full` it had reached while it still held a body, and `ReplicaUpgrade` skips whatever already reads as `Full`. The item was left claiming a body it no longer had, carrying the summary of the revision before the change, with no fetch ever derived for it: it stayed stale for good while the consumer re-downloaded it on every run without the write landing.
+
+  `ReplicaHubItem::stored_level` states what the two fields were disagreeing about: `Full` means a stored body, so an item holding none reads one rung down. `absorb` records it and `project` reports it. Recording keeps the storage from persisting the false claim; projecting is what heals a store already written that way, since an upgrade reads what `load` projects rather than the stored row, so no migration and no resync are needed. The maximum stays for every other case, along with its reason: a source that has only probed an item holds no opinion about its detail, and adopting that opinion would un-know what another source read.
+
+  Only mutable content reaches it. Mail bodies are immutable and carry no revision, so nothing ever refreshes; a CardDAV side is where it showed.
+
 ## [0.4.0] - 2026-08-24
 
 ### Added
@@ -88,7 +98,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added the std client behind the client feature: a blocking ReplicaClient servicing every yield through the consumer-implemented Storage and Remote traits.
 - Documented the at-least-once push contract (an add's link_id dedups a retry, a remove of an already-missing member reads as accepted) and the pointer-derived object refcounting the consumer maintains by diffing placement upserts and drops.
 
-[unreleased]: https://github.com/pimalaya/io-replica/compare/v0.4.0..HEAD
+[unreleased]: https://github.com/pimalaya/io-replica/compare/v0.4.1..HEAD
+[0.4.1]: https://github.com/pimalaya/io-replica/compare/v0.4.0..v0.4.1
 [0.4.0]: https://github.com/pimalaya/io-replica/compare/v0.3.0..v0.4.0
 [0.3.0]: https://github.com/pimalaya/io-replica/compare/v0.2.0..v0.3.0
 [0.2.0]: https://github.com/pimalaya/io-replica/compare/v0.1.0..v0.2.0
