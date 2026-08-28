@@ -58,9 +58,10 @@ pub trait ReplicaStorage {
     /// pointer-derived object references [`ReplicaWriteOp`] documents.
     ///
     /// Order matters because a batch may name one handle twice: a sync
-    /// clearing an ambiguity then reading the same handle as vanished
-    /// writes the cleared placement and drops it, and the drop is the
-    /// answer. A storage may not group the batch by op kind.
+    /// that resurrects a locally deleted item writes the placeholder,
+    /// pushes it, and supersedes the same handle once the remote assigns
+    /// one, and the drop is the answer. A storage may not group the
+    /// batch by op kind.
     ///
     /// The engine assumes a single writer per collection between a load
     /// and the write derived from it: a batch applied over state another

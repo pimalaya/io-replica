@@ -7,7 +7,10 @@
 //! real delta snapshots from a numeric checkpoint, with explicit vanished
 //! tracking, so incremental sync paths run end to end.
 
-use std::{collections::BTreeMap, convert::Infallible};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    convert::Infallible,
+};
 
 use io_replica::{
     change::{ReplicaChange, ReplicaChangeKind, ReplicaWriteOp},
@@ -148,6 +151,10 @@ pub struct MemRemote {
     /// whose if_match is stale; when false it behaves like an
     /// immutable-content backend and reports none.
     pub mutable: bool,
+    /// The identities this remote refuses to accept an append of, which
+    /// is how a DAV server answers `no-uid-conflict` to a resource whose
+    /// `UID` its collection already holds.
+    pub refused_appends: BTreeSet<ReplicaLinkId>,
     /// The global change counter; every mutation bumps it, and a delta
     /// snapshot serves everything past the cursor's value.
     seq: usize,
@@ -533,6 +540,15 @@ impl ReplicaRemote for MemRemote {
                     origin,
                     object,
                 } => {
+                    // the target refuses the duplicate itself, which is
+                    // the decision the engine has no basis for taking
+                    if link_id
+                        .as_ref()
+                        .is_some_and(|link| self.refused_appends.contains(link))
+                    {
+                        results.push(rejected(handle));
+                        continue;
+                    }
                     let assigned = match origin {
                         Some(o) => {
                             let item = self

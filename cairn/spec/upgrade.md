@@ -77,14 +77,29 @@ An upgrade SHALL revisit a placement whose level claims a tier it does not hold:
 - THEN it is fetched rather than skipped
 
 ### Requirement: A fetch never establishes a link the collection already holds
-Applying a fetched item SHALL NOT set a placement's `link_id` to one another placement of the same collection already carries, whether that other placement is in the same batch or only in the store. The engine identifies a placement by its collection and link id, and a source binds it with one handle, so a second placement resolving to the same identity has nowhere to live: linking it overwrites the first binding's handle, and the fact that the source holds the identity twice is lost at that write, before any later rule can act on it.
+Applying a fetched item SHALL NOT set a placement's `link_id` to one another placement of the same collection already carries, whether that other placement is in the same batch or only in the store. The engine identifies a placement by its collection and link id, and a source binds it with one handle, so a second placement resolving to the same identity cannot take the key: taking it would overwrite the first binding's handle, and the fact that the source holds two resources would be lost at that write, before any later rule could act on it.
 
-The losing handle SHALL instead be recorded on the placement that holds the identity (`ReplicaPlacement::ambiguous_handles`, persisted per source as `ReplicaSourceBinding::ambiguous_handles`), so the ambiguity survives the round trip through the storage. That is what makes the freeze below sticky, which it must be: the twin appears in exactly one enumeration, the one that discovers it, and an incremental enumeration never mentions it again.
+The second placement SHALL instead be linked under a minted key, per the requirement below. The check SHALL be made against the whole collection, not only the placements being upgraded, since a batch hydrating just the second copy would otherwise link it under the key the first already holds.
 
-A fetch that would establish an identity the batch has not already seen SHALL check it against the whole collection, not only the placements being upgraded, since a batch hydrating just the second copy would otherwise link it.
-
-#### Scenario: A second copy is recorded, not linked
+#### Scenario: A second copy is minted, not linked to the same key
 - GIVEN a collection whose placement already holds a link id
 - WHEN a fetch resolves another handle of that collection to the same link id
-- THEN the second placement stays unlinked, and the first records the second handle as ambiguous
+- THEN the first placement keeps its key and its handle, and the second is linked under a minted one
+
+### Requirement: A second copy of an identity is minted, not withheld
+A fetch resolving a placement to a link id another placement of the same collection already carries SHALL give that placement a **minted** link id (pimdir SPEC §9, `dup:<hint>#<handle>`) and link it, rather than leaving it unlinked. The minted form SHALL be derived from the hint and the placement's own handle alone, so it is deterministic: the same collection re-read from scratch mints the same key, and a rebuild carries it rather than re-deriving it.
+
+The engine identifies a placement by its collection and link id, and a source binds one identity with one handle, so two placements cannot share one key. What follows from that is which of the two gets the key, not that one of them must go without: a source holding two resources is holding two items, and an engine that stores one of them is losing data at the point where it noticed the problem.
+
+Minting SHALL be decided against the whole collection rather than the batch, through the load by link ids the upgrade already performs, since a batch hydrating only the second copy would otherwise take the key. Which copy keeps the bare hint SHALL follow from the handles rather than from the order the fetch replied in, a batch being order-independent: a mint that depended on which copy a connection pool finished first would not survive a rebuild.
+
+#### Scenario: The second copy is stored
+- GIVEN a collection whose placement already holds a link id
+- WHEN a fetch resolves another handle of that collection to the same link id
+- THEN that placement is linked under a minted key, with its own body, meta and base
+
+#### Scenario: The mint is stable
+- GIVEN a collection whose duplicate was minted
+- WHEN the same collection is enumerated and hydrated again from an empty store
+- THEN the same handle receives the same minted key
 

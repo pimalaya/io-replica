@@ -35,7 +35,10 @@
 //! IMAP UID, a WebDAV href, a JMAP id). Many placements may point at one
 //! object, keyed across collections by a stable
 //! [`placement::ReplicaLinkId`] (a Message-ID header, a vCard or
-//! iCalendar UID), so a shared item is fetched and stored once.
+//! iCalendar UID), so a shared item is fetched and stored once. The link
+//! id is the replica's key rather than a restatement of the protocol's
+//! identity: a collection holding the same identity twice keeps both
+//! copies, the second under a key minted from the first.
 //!
 //! Each placement sits at one rung of a strict level ladder
 //! ([`placement::ReplicaLevel`]), each rung including the one below:

@@ -30,12 +30,6 @@ Identity is the only thing a handle-space change leaves intact, so it is the onl
 thing the match may key on. Matching on anything derived from a handle would
 match nothing, and matching on content would pair two copies of one body.
 
-### Requirement: An ambiguity survives a rebuild
-A placement carrying ambiguous handles SHALL keep them across a rekey.
-Renumbering two copies of one identity does not merge them, and a rebuild that
-cleared the record would resolve the freeze by forgetting why it was frozen,
-which is the write [sync](sync.md) refuses to make.
-
 ### Requirement: A rebuild's drops say the row is superseded
 Every drop a rebuild emits for a placement its own batch re-writes SHALL carry
 `ReplicaDropReason::Superseded`, never `Deleted`. The item is not going anywhere:
@@ -45,15 +39,19 @@ removal to sources nobody touched.
 
 The reason is also what licenses the rebind. A storage pins one handle per
 binding and refuses to repoint it, because a repoint is how a second copy of one
-identity used to be swallowed; a rebuild is the one case where the repoint is
-correct, and the superseded handle is what tells the two apart. The licence is
-per handle: a rebuild batch that also carries a genuine duplicate SHALL still
-have that one frozen.
+identity is swallowed; a rebuild is the one case where the repoint is correct,
+and the superseded handle is what tells the two apart. The licence is per
+handle: a rebuild batch that also carries a genuine duplicate SHALL still refuse
+that one, which keeps a renumbering from re-keying the copies onto each other.
+
+A minted key (upgrade.md) is carried like any other: the rebuild matches on it,
+so renumbering two copies of one hint does not merge them, they having never
+been one item.
 
 #### Scenario: A renumbered collection is not a duplicated one
 - GIVEN a placement bound under a handle the rebuild supersedes
 - WHEN the batch drops that handle and upserts the item under a new one
-- THEN the binding follows the new handle, reads clean, and records no ambiguity
+- THEN the binding follows the new handle, reads clean, and takes no repoint it was not licensed for
 
 ### Requirement: A rebuild is the only bump of the handle-space epoch
 The consumer SHALL commit the rebuild's write batch and the collection's epoch

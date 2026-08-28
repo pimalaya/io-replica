@@ -171,25 +171,18 @@ already placed. A known key SHALL replace another known key.
 - WHEN another source absorbs the same item with an unknown key
 - THEN the projection still carries the derived key
 
-### Requirement: An ambiguous identity is neither propagated nor deleted across sources
-A binding carrying ambiguous handles SHALL project `ReplicaStatus::Ambiguous` for that source, and the handles SHALL round-trip through `absorb`, an upsert carrying none clearing the freeze.
+### Requirement: A minted identity is an ordinary item
+A placement carrying a minted link id (upgrade.md) SHALL be subject to every rule an ordinary one is: it reconciles in both directions, it is offered to a source that lacks it as a `Created` append, its drop marks the shared item deleted, and it merges and conflicts on the ordinary rules. The engine SHALL NOT read the key's shape, and SHALL derive no rule from it.
 
-Two rules read the state across the item rather than per source, because both are cross-source: an identity any source holds twice SHALL NOT be offered as a `Created` append to a source that lacks it, and a drop of it SHALL NOT mark the shared item deleted. The copy that vanished says nothing about the one that did not, and propagating on that reading removes the only copy on a source nobody touched.
+Withholding it would mean the engine deciding which of two copies a user is allowed to have on the other side, which is the judgement it does not have. A target that refuses the duplicate says so itself, with a protocol-level refusal (CardDAV `no-uid-conflict`, CalDAV `no-uid-conflict`), and that refusal is a rejected push the consumer reports. Liberal in what is read, strict in what is produced: nothing is invented on the way out, and nothing is silently dropped either.
 
-The freeze is per source otherwise: in a two-sided store one side may hold the duplicate while the other holds the identity once, and that side keeps syncing.
-
-#### Scenario: One source holds it twice, the other once
-- GIVEN an item bound to two sources, ambiguous on one
-- WHEN the hub projects each source
-- THEN the ambiguous side reads `Ambiguous` and the other reads as it otherwise would
-
-#### Scenario: A drop from the ambiguous side propagates nothing
-- GIVEN that item
-- WHEN the ambiguous source drops its bound handle as deleted
-- THEN the shared item is not marked deleted and the other source is untouched
+#### Scenario: Both copies reach the other source
+- GIVEN two items of one collection sharing a hint, one keyed bare and one minted
+- WHEN a source that holds neither is reconciled
+- THEN both are offered as appends, and a refusal of either is reported as a rejected push
 
 ### Requirement: A hub projection states only what its source decides
-The three placements the hub projects (a bound member, a tombstone for one deleted elsewhere, a create for one this source lacks) SHALL be built from one projection carrying the item's shared content, each settling only what the source's binding decides: the status it reads as, its base, its conflict revision, the handles it cannot resolve.
+The three placements the hub projects (a bound member, a tombstone for one deleted elsewhere, a create for one this source lacks) SHALL be built from one projection carrying the item's shared content, each settling only what the source's binding decides: the status it reads as, its base, its conflict revision.
 
 Stating the shared content once is what makes a field added to `ReplicaPlacement` a change in one place: three hand-written projections make forgetting one a silent wrong answer rather than a compile error.
 

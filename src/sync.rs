@@ -379,12 +379,7 @@ impl ReplicaSync {
         items.dedup_by(|a, b| a.handle == b.handle);
 
         let vanished: BTreeSet<ReplicaHandle> = vanished.into_iter().collect();
-        let mut local = mem::take(&mut self.local);
-
-        // NOTE: before anything is merged, so a placement the source no
-        // longer holds twice reconciles in this same run rather than
-        // waiting for an enumeration that may never list it again.
-        self.thaw(&mut local, &items, &vanished, complete);
+        let local = mem::take(&mut self.local);
 
         self.merging = Some(Merge {
             join: Join::new(local, items),
@@ -446,55 +441,6 @@ impl ReplicaSync {
         }
     }
 
-    /// Drops the ambiguous handles this snapshot shows the source no longer
-    /// holds, and unfreezes a placement that has none left.
-    ///
-    /// The engine never sees an identity in an enumeration, only
-    /// handles: a complete snapshot that omits a recorded handle, or a
-    /// delta that reports it vanished, is the source saying that copy is
-    /// gone. A delta that merely does not mention it clears nothing.
-    ///
-    /// Once the last one goes the placement lands `Clean` and reconciles
-    /// in this same run, picking up the changes it slept through.
-    fn thaw(
-        &mut self,
-        local: &mut BTreeMap<ReplicaHandle, ReplicaPlacement>,
-        remote: &[ReplicaRemoteItem],
-        vanished: &BTreeSet<ReplicaHandle>,
-        complete: bool,
-    ) {
-        let mut thawed = Vec::new();
-
-        for placement in local.values_mut() {
-            if placement.ambiguous_handles.is_empty() {
-                continue;
-            }
-
-            let before = placement.ambiguous_handles.len();
-            placement.ambiguous_handles.retain(|handle| match complete {
-                true => remote.binary_search_by(|i| i.handle.cmp(handle)).is_ok(),
-                false => !vanished.contains(handle),
-            });
-            if placement.ambiguous_handles.len() == before {
-                continue;
-            }
-
-            if placement.ambiguous_handles.is_empty() {
-                placement.status = ReplicaStatus::Clean;
-            }
-            thawed.push(placement.clone());
-        }
-
-        for placement in thawed {
-            debug!(
-                "identity of {} holds {} other handles",
-                placement.handle.as_str(),
-                placement.ambiguous_handles.len(),
-            );
-            self.writes.push(ReplicaWriteOp::UpsertPlacement(placement));
-        }
-    }
-
     /// Three-way merges one candidate, writing the resolved placement and
     /// returning a push when the local side won.
     fn merge(&mut self, candidate: Candidate) -> Option<ReplicaChangeKind> {
@@ -503,21 +449,6 @@ impl ReplicaSync {
             local,
             remote: remote_item,
         } = candidate;
-
-        // NOTE: the source holds this identity more than once, so which
-        // copy a change refers to cannot be decided. In particular the
-        // absence of this handle from a complete snapshot is not read as
-        // the item being gone: the source still holds another copy.
-        if local
-            .as_ref()
-            .is_some_and(|p| p.status == ReplicaStatus::Ambiguous)
-        {
-            trace!(
-                "{} holds an ambiguous identity, deriving nothing",
-                handle.as_str()
-            );
-            return None;
-        }
 
         let based = local.as_ref().map(|p| p.base.is_some()).unwrap_or(false);
 
@@ -836,7 +767,6 @@ impl ReplicaSync {
             conflict_revision: None,
             base: None,
             origin: None,
-            ambiguous_handles: Vec::new(),
         };
         self.writes.push(ReplicaWriteOp::UpsertPlacement(dup));
     }
@@ -976,7 +906,6 @@ impl ReplicaSync {
                 object: None,
             }),
             origin: None,
-            ambiguous_handles: Vec::new(),
         };
         self.writes.push(ReplicaWriteOp::UpsertPlacement(placement));
     }
@@ -1459,7 +1388,6 @@ mod tests {
                 collection: "sent".into(),
                 handle: ReplicaHandle::from("9"),
             }),
-            ambiguous_handles: Vec::new(),
         }
     }
 
@@ -1481,7 +1409,6 @@ mod tests {
                 object: None,
             }),
             origin: None,
-            ambiguous_handles: Vec::new(),
         }
     }
 

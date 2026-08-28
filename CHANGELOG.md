@@ -9,8 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`ReplicaStatus::Ambiguous`, plus `ambiguous_handles` on `ReplicaPlacement` and `ReplicaSourceBinding`**: an identity one collection holds twice, which the engine refuses to resolve and refuses to act on. A status variant rather than a flag, so every rule that matches the enum has to say what it does with an identity that cannot be resolved.
-
 - `ReplicaLoadScope`, carried by `ReplicaYield::WantsLoad` and by `ReplicaStorage::load`: a mutation now reads the one placement it edits (an `Add`, the rows holding its link id) and an upgrade the handles it raises, instead of the whole collection. The scope is a floor rather than a ceiling, so a storage that ignores it stays correct.
 - `ReplicaDropReason`, carried by `ReplicaWriteOp::DropPlacement`: whether the item itself is gone, or only this row of it.
 - `ReplicaPlacement::staged_edit`, the single reading of "there is a local content edit here", replacing six hand-rolled predicates that disagreed about the status guard and about what a missing base means.
@@ -35,7 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `ReplicaLoadScope::Link` becomes `Links`, taking several: the reads that ask about an identity rather than a location have to see every row claiming it.
 - **No coroutine resumes once it has completed**, where only `ReplicaSync` refused before. The four others handed back a default output, which is exactly what a run that genuinely did nothing returns, so a driver with a loop bug was told it had succeeded.
-- `ReplicaMutateError` keeps its three real variants and composes the shared `ReplicaArgError` as `Arg`.
+- `ReplicaMutateError` keeps its two real variants and composes the shared `ReplicaArgError` as `Arg`.
 - **A forbidden remove now reverts the tombstone rather than holding it**, following the new `ReplicaDeletePolicy` default. `delete: ReplicaDeletePolicy::Keep` restores the old behaviour, and now applies to a read-only source too, which never had it.
 - The hub projects its three placements (bound, tombstone, create) from one `ReplicaHubItem::project`, each settling only what the source binding decides. A field added to `ReplicaPlacement` is one edit rather than three, where forgetting one was a silently wrong projection rather than a compile error.
 
@@ -46,11 +44,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **A rebuilt spine bet on the order its batch was applied in.** `rekey` dropped every old handle before upserting the new spine, so a new handle space reusing an old handle, and an unmatched staged edit resurrected under the handle it already had, each put a drop and an upsert of one key in a batch whose contract promised only atomicity. It now drops only the handles no upsert of the same batch writes. The contract is stated as well: a batch is applied in order, and a storage may not group it by op kind, because a sync legitimately writes a placement whose ambiguity cleared and then drops the same handle it reads as vanished.
+- **A rebuilt spine bet on the order its batch was applied in.** `rekey` dropped every old handle before upserting the new spine, so a new handle space reusing an old handle, and an unmatched staged edit resurrected under the handle it already had, each put a drop and an upsert of one key in a batch whose contract promised only atomicity. It now drops only the handles no upsert of the same batch writes. The contract is stated as well: a batch is applied in order, and a storage may not group it by op kind, because a sync legitimately writes a placeholder it then supersedes under the handle the remote assigned.
 
 - **A collection holding one identity twice lost mail on a side nobody touched.** A placement is identified by its collection and link id and a source binds it with one handle, so a second copy of one `Message-ID` (a double delivery, a retried `APPEND`, a restore, a migration) had nowhere to live: the fetch that resolved it silently repointed the first binding, and the evidence was gone at that write. Deleting the bound copy then propagated a delete that removed the only copy on another source, while the source that reported it still held the message.
 
-  Such an identity is now frozen rather than guessed: the losing handle is recorded on the placement that holds it, which reads as `Ambiguous`, and the engine derives nothing for it in either direction, including reading its absence from a complete snapshot as a delete. The record is what makes the freeze survive: the twin appears in exactly one enumeration, and an incremental one never mentions it again. An enumeration reporting the identity once again clears it and syncing resumes.
+  The second copy now gets an item of its own. A fetch resolving a placement to a link id another placement of the collection already carries links it under a **minted** key instead, `dup:` plus the identity hint plus `#` plus the placement's own handle, so both copies are stored, listed, hydrated and reconciled like any other member. The mint is derived from the hint and the handle alone, which makes it deterministic: a store rebuilt from scratch reproduces the same key, and a rekey carries it as it carries any other. Nothing reads the key's shape, so a minted item propagates, deletes, merges and conflicts on the ordinary rules; a target refusing the duplicate answers with a rejected push, which the engine already models.
+
+  The check is made against the whole collection rather than the batch, since a batch hydrating only the second copy would otherwise take the key. Only a source's own copy is minted: a locally authored create colliding with a stored identity is still refused.
 
 - **A move delivered the item to the target twice.** Both halves of a move can deliver on their own, the target's create by copying from its origin and the source's tombstone by relocating the member, so syncing the target first left the server holding the copy *and* the relocation. Both now recognise what the other did through the link id, and an item whose link id is not resolved yet stages the source half alone, since it has no such key. Neither half could simply be dropped: the create is what makes a move work through a hub, whose bindings carry no origin, and the relocation is what keeps a never-fetched item from being deleted before its copy can run.
 

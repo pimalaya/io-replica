@@ -488,3 +488,77 @@ fn one_source_over_the_hub_matches_the_plain_store() {
 
     assert_eq!(hub_report, plain_report);
 }
+
+/// One source holding an identity twice offers both copies to a source
+/// that holds neither: two resources are two members, and which of them
+/// a user may have on the other side is not the engine's judgement.
+#[test]
+fn both_copies_of_an_identity_reach_the_other_source() {
+    let mut mirror = Mirror::new();
+    mirror
+        .a
+        .remote_mut()
+        .seed("inbox", "a1", "msg-a", &[], b"the meeting");
+    mirror
+        .a
+        .remote_mut()
+        .seed("inbox", "a2", "msg-a", &[], b"another meeting");
+
+    mirror.quiesce(ReplicaSyncOptions::default());
+
+    assert_eq!(
+        mirror.bindings(),
+        [
+            ("dup:msg-a#a2".to_string(), vec!["a".into(), "b".into()]),
+            ("msg-a".to_string(), vec!["a".into(), "b".into()]),
+        ],
+        "two items, each bound to both sources",
+    );
+    assert_eq!(mirror.server('a').len(), 2, "the source keeps both");
+    assert_eq!(
+        mirror.server('b').len(),
+        2,
+        "and both are appended to the other: {:?}",
+        mirror.server('b'),
+    );
+}
+
+/// A target that refuses the duplicate says so itself, and the refusal
+/// costs neither copy: the rejected push is retried, and the two items
+/// stay exactly as the source holds them.
+#[test]
+fn a_refused_duplicate_leaves_both_items_intact() {
+    let mut mirror = Mirror::new();
+    mirror
+        .a
+        .remote_mut()
+        .seed("inbox", "a1", "msg-a", &[], b"the meeting");
+    mirror
+        .a
+        .remote_mut()
+        .seed("inbox", "a2", "msg-a", &[], b"another meeting");
+    // b's server enforces the uniqueness both DAV protocols require
+    mirror
+        .b
+        .remote_mut()
+        .refused_appends
+        .insert(ReplicaLinkId::from("dup:msg-a#a2"));
+
+    mirror.quiesce(ReplicaSyncOptions::default());
+
+    assert_eq!(
+        mirror.server('b'),
+        ["app-1"],
+        "b took the copy it can hold and refused the other",
+    );
+    assert_eq!(mirror.server('a').len(), 2, "a still holds both");
+    assert_eq!(
+        mirror.bindings(),
+        [
+            ("dup:msg-a#a2".to_string(), vec!["a".to_string()]),
+            ("msg-a".to_string(), vec!["a".into(), "b".into()]),
+        ],
+        "the refused copy is still an item, bound to the source that has it",
+    );
+    assert_eq!(mirror.deleted("dup:msg-a#a2"), Some(false));
+}

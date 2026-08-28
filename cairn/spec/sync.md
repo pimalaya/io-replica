@@ -146,38 +146,6 @@ The duplicate a `KeepBoth` resolution stages SHALL carry an identity derived fro
 ### Requirement: A push is counted when it matched
 `ReplicaSyncReport::pushed` SHALL count the changes this run derived and the remote accepted, not the results the consumer reported: a result naming a handle nobody pushed, or naming one twice, cannot inflate it.
 
-### Requirement: An ambiguous identity derives nothing
-A placement carrying ambiguous handles SHALL read as `ReplicaStatus::Ambiguous`, and the engine SHALL derive no change for it in either direction while it does: no push of any kind on any axis, no vanish-delete, no staged mutation, and no cross-source propagation.
-
-Its absence from a complete snapshot in particular SHALL NOT be read as the item being gone from that source: the source demonstrably holds another copy of the identity, and deleting on that reading is what removes the only copy on a source nobody touched.
-
-The rule is *derive nothing* rather than *pick a copy* because the engine has no basis for choosing which copy a change belongs to, and choosing wrongly destroys mail. A frozen item is mirrored zero times rather than once, which is the cost of not guessing.
-
-**The freeze is one item wide, and SHALL NOT halt anything.** A run meeting one SHALL reconcile the rest of the collection normally, in both directions, and SHALL complete; a staged mutation against a frozen placement SHALL be refused as that mutation rather than as the run, so a queued one parks and the drain carries on. The engine reports the ambiguity and skips the item, and what to do about it is the user's: which copy to keep is a judgement the engine does not have and a schedule it does not control.
-
-Scoping is what makes deriving nothing an acceptable answer at all. The same rule applied a batch or a collection wide would strand a mailbox on one double delivery, which is a worse outcome than the mispairing the freeze exists to prevent, and it would be one the user could not clear without the engine's help.
-
-#### Scenario: A frozen item does not stop its neighbours
-- GIVEN a collection holding one frozen identity beside ordinary members
-- WHEN it is synced with remote and local changes on both
-- THEN the ordinary members pull and push as usual, and the frozen one derives nothing
-
-#### Scenario: An ambiguous placement is never deleted by a vanish
-- GIVEN an ambiguous placement bound to a source
-- WHEN a complete snapshot of that source omits its handle
-- THEN no delete is derived, on that source or on any other holding the identity
-
-### Requirement: An ambiguity clears when the source resolves it
-A complete snapshot that omits a recorded ambiguous handle, or a delta that reports it vanished, SHALL drop that handle: the source is saying that copy is gone. A delta that merely does not mention it says nothing and clears nothing. A placement left with no ambiguous handles lands `Clean` and reconciles in that same run, so what it slept through is picked up rather than waiting for an enumeration that may never list it again.
-
-A rekey SHALL carry the state over a handle-space change: renumbering the copies does not merge them.
-
-#### Scenario: Resolving the duplicate resumes the sync
-- GIVEN an ambiguous placement
-- WHEN an enumeration reports the identity under a single handle
-- THEN the ambiguous handles are cleared and the placement reconciles normally
-
-
 ### Requirement: A run records its pushes in bounded chunks
 A sync SHALL push its derived changes in bounded chunks, yielding the writes a chunk produced before the next chunk is pushed: one `WantsPush` per chunk, each followed by the `WantsWrite` recording its outcomes. The bound is the engine's (`ReplicaSync::PUSH_CHUNK`), not a consumer option, because what it bounds is a crash window rather than throughput.
 

@@ -153,11 +153,6 @@ pub enum ReplicaMutateError {
     /// An `Add` names a link id a live placement already holds.
     #[error("Replica MUTATE failed: link id already present: {0}")]
     LinkExists(String),
-    /// The targeted placement holds an identity its source holds twice,
-    /// so which copy the edit belongs to cannot be decided. Nothing is
-    /// staged until the source holds the identity once again.
-    #[error("Replica MUTATE failed: ambiguous identity at handle {0}")]
-    Ambiguous(String),
     /// The driver broke the coroutine contract.
     #[error(transparent)]
     Arg(#[from] ReplicaArgError),
@@ -312,7 +307,6 @@ impl ReplicaMutate {
             conflict_revision: None,
             base: None,
             origin,
-            ambiguous_handles: Vec::new(),
         }
     }
 
@@ -347,7 +341,6 @@ impl ReplicaMutate {
             conflict_revision: None,
             base: None,
             origin: None,
-            ambiguous_handles: Vec::new(),
         };
         vec![
             ReplicaWriteOp::StoreObject {
@@ -399,14 +392,6 @@ impl ReplicaCoroutine for ReplicaMutate {
                         let err = ReplicaMutateError::UnknownHandle(handle.as_str().into());
                         return ReplicaCoroutineState::Complete(Err(err));
                     };
-                    // NOTE: the source holds this identity more than
-                    // once, so staging the edit would attach it to
-                    // whichever copy happens to be bound and the sync
-                    // would push it as if it were the only one.
-                    if placement.status == ReplicaStatus::Ambiguous {
-                        let err = ReplicaMutateError::Ambiguous(handle.as_str().into());
-                        return ReplicaCoroutineState::Complete(Err(err));
-                    }
                     self.writes(placement)
                 };
 
@@ -469,7 +454,6 @@ mod tests {
                     object: None,
                 }),
                 origin: None,
-                ambiguous_handles: Vec::new(),
             }],
             checkpoint: None,
         }

@@ -53,15 +53,6 @@ pub struct ReplicaSourceBinding {
     /// conflicted, what a resolver fetches and merges against. `None`
     /// when not conflicted, or when the remote reports no revision.
     pub conflict_revision: Option<String>,
-    /// The other handles this source holds the item's identity under,
-    /// empty in the ordinary case.
-    ///
-    /// The identity-axis twin of [`conflicted`](Self::conflicted), and
-    /// per source for the same reason: one side may hold the duplicate
-    /// and the other not. A binding carrying any projects
-    /// [`ReplicaStatus::Ambiguous`], which the engine derives nothing
-    /// for.
-    pub ambiguous_handles: Vec<ReplicaHandle>,
 }
 
 /// How the hub resolves a cross-source content conflict, both sources
@@ -134,8 +125,8 @@ impl ReplicaHubItem {
     ///
     /// The shared half of a projection, the same for every source: the
     /// content the hub holds, at the level it can honestly claim. What a
-    /// binding decides (status, base, conflict revision, unresolved
-    /// handles) is settled by the caller.
+    /// binding decides (status, base, conflict revision) is settled by
+    /// the caller.
     fn project(
         &self,
         collection: &ReplicaCollectionId,
@@ -155,20 +146,7 @@ impl ReplicaHubItem {
             conflict_revision: None,
             base: None,
             origin: None,
-            ambiguous_handles: Vec::new(),
         }
-    }
-
-    /// Whether any source holds this identity under more than one handle.
-    ///
-    /// Per-source state read across the item, because the two rules it
-    /// gates are cross-source: an identity one source cannot resolve is
-    /// neither offered to a source that lacks it, nor deleted everywhere
-    /// on that source's word.
-    pub fn is_ambiguous(&self) -> bool {
-        self.sources
-            .values()
-            .any(|binding| !binding.ambiguous_handles.is_empty())
     }
 }
 
@@ -210,11 +188,6 @@ impl ReplicaHub {
                 (false, Some(binding)) => {
                     out.push(self.bound_placement(collection, link, item, binding));
                 }
-                // NOTE: an identity some source holds twice is not
-                // offered to one that lacks it: the engine cannot say
-                // which copy the append would be, and that is how a
-                // duplicate spreads.
-                (false, None) if item.is_ambiguous() => {}
                 (false, None) => {
                     if let Some(created) = self.created_placement(collection, link, item) {
                         out.push(created);
@@ -238,13 +211,7 @@ impl ReplicaHub {
             .base
             .as_ref()
             .is_some_and(|b| b.flags == item.flags && b.object == item.object);
-        let status = if !binding.ambiguous_handles.is_empty() {
-            // NOTE: this source holds the identity more than once, so
-            // which copy a change refers to cannot be decided. It
-            // outranks every other reading, conflict included, until the
-            // source reports the identity once again.
-            ReplicaStatus::Ambiguous
-        } else if binding.conflicted {
+        let status = if binding.conflicted {
             // NOTE: an unresolved conflict outranks the base comparison.
             // Downgrading it to Dirty would re-derive the push the merge
             // already rejected, re-marking the same conflict every run
@@ -260,7 +227,6 @@ impl ReplicaHub {
         placement.status = status;
         placement.conflict_revision = binding.conflict_revision.clone();
         placement.base = binding.base.clone();
-        placement.ambiguous_handles = binding.ambiguous_handles.clone();
         placement
     }
 
@@ -396,10 +362,6 @@ impl ReplicaHub {
             handle: placement.handle.clone(),
             base: placement.base.clone(),
             conflicted,
-            // NOTE: the identity axis travels as data rather than as a
-            // status: a projection reads these back into `Ambiguous`,
-            // and an upsert carrying none clears the freeze.
-            ambiguous_handles: placement.ambiguous_handles.clone(),
             conflict_revision: conflicted
                 .then(|| placement.conflict_revision.clone())
                 .flatten(),
@@ -469,11 +431,8 @@ impl ReplicaHub {
             if bound_here {
                 // NOTE: only a genuine delete propagates. A superseded
                 // row is a handle the same batch replaces, and reading
-                // it as a delete would push a Remove nobody asked for;
-                // nor does a drop from a source holding the identity
-                // twice, where the copy that vanished says nothing about
-                // the one that did not.
-                let genuine = reason == ReplicaDropReason::Deleted && !item.is_ambiguous();
+                // it as a delete would push a Remove nobody asked for.
+                let genuine = reason == ReplicaDropReason::Deleted;
                 item.deleted |= genuine;
                 item.sources.remove(source);
             }
@@ -513,7 +472,6 @@ mod tests {
                 base: Some(base(flags)),
                 conflicted: false,
                 conflict_revision: None,
-                ambiguous_handles: Vec::new(),
             },
         );
         let item = ReplicaHubItem {
@@ -550,9 +508,45 @@ mod tests {
                     base: Some(base(flags)),
                     conflicted: false,
                     conflict_revision: None,
-                    ambiguous_handles: Vec::new(),
                 },
             );
+    }
+
+    /// Gives `link` a body on left's base as well as on the item, so it
+    /// projects `Full` and reads clean against that source.
+    fn hydrate_left(hub: &mut ReplicaHub, link: &str) {
+        let item = hub.items.get_mut(&ReplicaLinkId::from(link)).unwrap();
+        item.object = Some(ReplicaHash::from("body"));
+        item.level = ReplicaLevel::Full;
+        for binding in item.sources.values_mut() {
+            if let Some(base) = &mut binding.base {
+                base.object = Some(ReplicaHash::from("body"));
+            }
+        }
+    }
+
+    /// The key the upgrade mints for left's second copy of `m1`.
+    fn minted_link() -> ReplicaLinkId {
+        ReplicaLinkId::from("dup:m1#l2")
+    }
+
+    /// Adds left's second copy of `m1` as the separate item the upgrade
+    /// mints for it: its own key, its own handle, its own body.
+    fn mint_on_left(hub: &mut ReplicaHub) {
+        let mut copy = hub.items.get(&ReplicaLinkId::from("m1")).unwrap().clone();
+        copy.sources = [(
+            ReplicaSourceId::from("left"),
+            ReplicaSourceBinding {
+                handle: ReplicaHandle::from("l2"),
+                base: Some(base(&["seen"])),
+                conflicted: false,
+                conflict_revision: None,
+            },
+        )]
+        .into_iter()
+        .collect();
+        hub.items.insert(minted_link(), copy);
+        hydrate_left(hub, minted_link().as_str());
     }
 
     #[test]
@@ -571,7 +565,6 @@ mod tests {
                     base: Some(base(&["seen"])),
                     conflicted: false,
                     conflict_revision: None,
-                    ambiguous_handles: Vec::new(),
                 },
             );
 
@@ -600,7 +593,6 @@ mod tests {
                     base: Some(base(&[])),
                     conflicted: false,
                     conflict_revision: None,
-                    ambiguous_handles: Vec::new(),
                 },
             );
 
@@ -663,7 +655,6 @@ mod tests {
                     base: Some(base(&["seen"])),
                     conflicted: false,
                     conflict_revision: None,
-                    ambiguous_handles: Vec::new(),
                 },
             );
 
@@ -682,73 +673,79 @@ mod tests {
     }
 
     #[test]
-    fn an_ambiguous_binding_projects_ambiguous_and_propagates_nothing() {
-        // the ambiguity is per source, so right keeps syncing while left
-        // is frozen, and the item is not offered to a source lacking it
+    fn a_minted_copy_is_offered_to_a_source_that_holds_neither() {
+        // the hub reads no shape into a key, so the second copy of an
+        // identity is a member like the first and travels like one
         let mut hub = hub_with_left(&["seen"]);
-        bind_right(&mut hub, &["seen"]);
-        let item = hub.items.get_mut(&ReplicaLinkId::from("m1")).unwrap();
-        // a body both sources agree on, so only the ambiguity can make
-        // either read as anything but Clean
-        item.object = Some(ReplicaHash::from("body"));
-        for binding in item.sources.values_mut() {
-            if let Some(base) = &mut binding.base {
-                base.object = Some(ReplicaHash::from("body"));
-            }
-        }
-        item.sources
-            .get_mut(&ReplicaSourceId::from("left"))
-            .unwrap()
-            .ambiguous_handles = alloc::vec![ReplicaHandle::from("l2")];
+        hydrate_left(&mut hub, "m1");
+        mint_on_left(&mut hub);
 
-        let left = placements(&hub, "left");
-        assert_eq!(left[0].status, ReplicaStatus::Ambiguous);
+        let phone = placements(&hub, "phone");
+        assert_eq!(phone.len(), 2, "both copies are offered: {phone:?}");
+        for placement in &phone {
+            assert_eq!(placement.status, ReplicaStatus::Created);
+            assert_eq!(placement.object, Some(ReplicaHash::from("body")));
+        }
         assert_eq!(
-            left[0].ambiguous_handles,
-            alloc::vec![ReplicaHandle::from("l2")],
-            "the handles travel to the source that has to stay frozen",
-        );
-        assert_eq!(
-            placements(&hub, "right")[0].status,
-            ReplicaStatus::Clean,
-            "the other source is unaffected: the ambiguity is per source",
-        );
-        assert!(
-            placements(&hub, "phone").is_empty(),
-            "an identity the engine cannot resolve is not offered to a third \
-             source: it would be appending a copy it cannot account for",
+            placements(&hub, "left").len(),
+            2,
+            "and the source holding both projects both",
         );
     }
 
     #[test]
-    fn an_ambiguous_binding_blocks_a_cross_source_delete() {
-        // left's bound copy vanishes while left still holds the identity,
-        // which must not remove the only copy on right
+    fn a_drop_of_a_minted_copy_deletes_only_that_copy() {
+        // the two copies are two items, so removing one says nothing
+        // about the other: the delete propagates for the copy that went
+        // and for no other
         let mut hub = hub_with_left(&["seen"]);
+        hydrate_left(&mut hub, "m1");
+        mint_on_left(&mut hub);
+        // right holds both copies too, so left's drop is a removal to
+        // propagate rather than the last binding going
         bind_right(&mut hub, &["seen"]);
-        hub.items
-            .get_mut(&ReplicaLinkId::from("m1"))
-            .unwrap()
-            .sources
-            .get_mut(&ReplicaSourceId::from("left"))
-            .unwrap()
-            .ambiguous_handles = alloc::vec![ReplicaHandle::from("l2")];
+        hub.items.get_mut(&minted_link()).unwrap().sources.insert(
+            ReplicaSourceId::from("right"),
+            ReplicaSourceBinding {
+                handle: ReplicaHandle::from("r2"),
+                base: Some(base(&["seen"])),
+                conflicted: false,
+                conflict_revision: None,
+            },
+        );
 
         hub.absorb(
             &ReplicaSourceId::from("left"),
             &[ReplicaWriteOp::DropPlacement {
                 collection: "inbox".into(),
-                handle: ReplicaHandle::from("l1"),
+                handle: ReplicaHandle::from("l2"),
                 reason: ReplicaDropReason::Deleted,
             }],
         );
 
-        let item = hub.items.get(&ReplicaLinkId::from("m1")).expect("kept");
-        assert!(
-            !item.deleted,
-            "a source that holds the identity twice has not shown it is gone",
+        let minted = hub.items.get(&minted_link()).expect("kept");
+        assert!(minted.deleted, "the copy that vanished is gone everywhere");
+        let bare = hub.items.get(&ReplicaLinkId::from("m1")).expect("kept");
+        assert!(!bare.deleted, "the copy nobody touched is untouched");
+
+        let right = placements(&hub, "right");
+        let status = |handle: &str| {
+            right
+                .iter()
+                .find(|p| p.handle.as_str() == handle)
+                .expect("right projects both copies")
+                .status
+        };
+        assert_eq!(
+            status("r2"),
+            ReplicaStatus::Tombstone,
+            "right removes the copy that went",
         );
-        assert_eq!(placements(&hub, "right")[0].status, ReplicaStatus::Clean);
+        assert_ne!(
+            status("r1"),
+            ReplicaStatus::Tombstone,
+            "and keeps the one that did not",
+        );
     }
 
     #[test]
@@ -888,7 +885,6 @@ mod tests {
             conflict_revision: None,
             base: Some(base(&["seen", "flagged"])),
             origin: None,
-            ambiguous_handles: Vec::new(),
         };
         hub.absorb(
             &ReplicaSourceId::from("left"),
@@ -926,7 +922,6 @@ mod tests {
             }),
             conflicted: false,
             conflict_revision: None,
-            ambiguous_handles: Vec::new(),
         };
         let mut sources = BTreeMap::new();
         sources.insert(ReplicaSourceId::from("left"), based("l1"));
@@ -967,7 +962,6 @@ mod tests {
                 object: Some(ReplicaHash::from(object)),
             }),
             origin: None,
-            ambiguous_handles: Vec::new(),
         })
     }
 
@@ -1087,7 +1081,6 @@ mod tests {
                 object: Some(ReplicaHash::from("o0")),
             }),
             origin: None,
-            ambiguous_handles: Vec::new(),
         })
     }
 
@@ -1246,7 +1239,6 @@ mod sort_key_tests {
             conflict_revision: None,
             base: None,
             origin: None,
-            ambiguous_handles: Vec::new(),
         })
     }
 
@@ -1322,7 +1314,6 @@ mod flags_tests {
             conflict_revision: None,
             base: None,
             origin: None,
-            ambiguous_handles: Vec::new(),
         })
     }
 
@@ -1388,7 +1379,6 @@ mod stored_level_tests {
                 object: base.map(ReplicaHash::from),
             }),
             origin: None,
-            ambiguous_handles: Vec::new(),
         })
     }
 

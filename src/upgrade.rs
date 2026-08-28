@@ -6,10 +6,16 @@
 //! with no network round-trip. One body is therefore stored for an item
 //! appearing in several collections, which is what backs the unified
 //! across-collections view.
+//!
+//! It is also where identity is settled, since a fetch is what reads
+//! one. A collection cannot hold two placements under one link id, so a
+//! second copy of an identity is linked under a key minted from it
+//! rather than left unlinked: a source holding two resources holds two
+//! items, whatever its protocol says about uniqueness.
 
 use core::mem;
 
-use alloc::{collections::BTreeMap, vec::Vec};
+use alloc::{collections::BTreeMap, string::String, vec::Vec};
 
 use log::{debug, trace};
 
@@ -18,7 +24,7 @@ use crate::{
     collection::ReplicaCollectionId,
     coroutine::*,
     object::ReplicaObject,
-    placement::{ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaPlacement, ReplicaStatus},
+    placement::{ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaPlacement},
     remote::{ReplicaFetchedBody, ReplicaFetchedItem, ReplicaTier},
     storage::ReplicaLoadScope,
 };
@@ -71,41 +77,6 @@ impl ReplicaUpgrade {
             ops: Vec::new(),
             report: ReplicaUpgradeReport::default(),
             state: State::Start,
-        }
-    }
-
-    /// Records each losing handle on the placement holding its identity,
-    /// which is what freezes it: a placement carrying ambiguous handles
-    /// reads as [`ReplicaStatus::Ambiguous`] and derives nothing.
-    ///
-    /// The record has to make the freeze sticky: the second copy appears
-    /// in exactly one enumeration, and an incremental one never mentions
-    /// it again.
-    fn freeze(&mut self, ambiguous: Vec<(ReplicaHandle, ReplicaHandle)>) {
-        let mut by_holder: BTreeMap<ReplicaHandle, Vec<ReplicaHandle>> = BTreeMap::new();
-        for (holder, lost) in ambiguous {
-            by_holder.entry(holder).or_default().push(lost);
-        }
-
-        for (holder, lost) in by_holder {
-            // NOTE: patch whatever this batch already staged, so a holder
-            // fetched in the same batch keeps its new body.
-            let staged = self.ops.iter_mut().find_map(|op| match op {
-                ReplicaWriteOp::UpsertPlacement(p) if p.handle == holder => Some(p),
-                _ => None,
-            });
-
-            match staged {
-                Some(placement) => mark_ambiguous(placement, lost),
-                None => {
-                    let Some(placement) = self.placements.get(&holder) else {
-                        continue;
-                    };
-                    let mut patched = placement.clone();
-                    mark_ambiguous(&mut patched, lost);
-                    self.ops.push(ReplicaWriteOp::UpsertPlacement(patched));
-                }
-            }
         }
     }
 
@@ -318,11 +289,6 @@ impl ReplicaUpgrade {
     fn write_fetched(
         &mut self,
     ) -> ReplicaCoroutineState<ReplicaYield, <Self as ReplicaCoroutine>::Return> {
-        // NOTE: (holder, losing handle) pairs, applied after the loop so
-        // a holder that also appears in the batch is patched once, with
-        // every handle it lost.
-        let mut ambiguous: Vec<(ReplicaHandle, ReplicaHandle)> = Vec::new();
-
         // NOTE: who holds each identity, seeded from the collection and
         // extended as this batch resolves more. Both copies of a
         // duplicate are commonly fetched together and neither is linked
@@ -333,7 +299,16 @@ impl ReplicaUpgrade {
             .filter_map(|p| Some((p.link_id.clone()?, p.handle.clone())))
             .collect();
 
-        for item in mem::take(&mut self.fetched) {
+        // NOTE: which copy of a duplicate keeps the bare hint decides
+        // what the other one is minted as, and a fetch batch carries no
+        // order: a consumer servicing it across a connection pool
+        // reports in whatever order the pool finished. Claiming in
+        // handle order is what makes the mint the same key on a store
+        // rebuilt from scratch.
+        let mut fetched = mem::take(&mut self.fetched);
+        fetched.sort_by(|a, b| a.handle.cmp(&b.handle));
+
+        for item in fetched {
             let Some(placement) = self.placements.get(&item.handle) else {
                 continue;
             };
@@ -347,15 +322,14 @@ impl ReplicaUpgrade {
                 // NOTE: nor a link another placement already holds:
                 // linking the second copy overwrites the first binding's
                 // handle, destroying the evidence that the source holds
-                // the identity twice. The losing handle is recorded on
-                // the holder instead.
-                match claimed.get(&item.link_id) {
-                    Some(holder) => ambiguous.push((holder.clone(), item.handle.clone())),
-                    None => {
-                        claimed.insert(item.link_id.clone(), item.handle.clone());
-                        patched.link_id = Some(item.link_id);
-                    }
-                }
+                // the identity twice. The second copy takes a minted key
+                // instead, which makes it an item like any other.
+                let link_id = match claimed.contains_key(&item.link_id) {
+                    true => mint(&item.link_id, &item.handle),
+                    false => item.link_id.clone(),
+                };
+                claimed.insert(link_id.clone(), item.handle.clone());
+                patched.link_id = Some(link_id);
             }
             patched.meta = Some(item.meta);
             // NOTE: unlike the link id, the key is refreshed on every
@@ -407,8 +381,6 @@ impl ReplicaUpgrade {
             self.report.upgraded += 1;
         }
 
-        self.freeze(ambiguous);
-
         debug!("write {} storage ops", self.ops.len());
         self.state = State::PendingWrite;
         let ops = mem::take(&mut self.ops);
@@ -416,16 +388,25 @@ impl ReplicaUpgrade {
     }
 }
 
-/// Freezes a placement on the identity axis: it holds an identity the
-/// source reports under `lost` too, so which copy a change refers to
-/// cannot be decided and the engine derives nothing for it.
-fn mark_ambiguous(placement: &mut ReplicaPlacement, lost: Vec<ReplicaHandle>) {
-    for handle in lost {
-        if !placement.ambiguous_handles.contains(&handle) {
-            placement.ambiguous_handles.push(handle);
-        }
-    }
-    placement.status = ReplicaStatus::Ambiguous;
+/// Mints the link id of a second copy: `dup:`, the identity hint the
+/// fetch resolved, `#`, and the placement's own handle verbatim.
+///
+/// The form is fixed by the store format (pimdir SPEC §9) and
+/// three implementations have to agree on it, so it is spelled out here
+/// rather than composed. No digest: this crate hashes nothing, the key
+/// is opaque and never parsed back, and keeping the handle in it makes
+/// the copy traceable to the resource it came from.
+///
+/// Deriving it from the hint and the handle alone is what makes it
+/// deterministic: the same collection read again from an empty store
+/// mints the same key, so a rebuilt replica converges on the rows it had
+/// rather than on a second set of duplicates.
+fn mint(hint: &ReplicaLinkId, handle: &ReplicaHandle) -> ReplicaLinkId {
+    let mut key = String::from("dup:");
+    key.push_str(hint.as_str());
+    key.push('#');
+    key.push_str(handle.as_str());
+    ReplicaLinkId(key)
 }
 
 /// Whether the placement's content is mutable, which the last-synced
@@ -479,7 +460,6 @@ mod tests {
             conflict_revision: None,
             base: None,
             origin: None,
-            ambiguous_handles: Vec::new(),
         }
     }
 
@@ -721,6 +701,129 @@ mod tests {
             placement.link_id,
             Some(ReplicaLinkId::from("mid:resolved")),
             "a probed item takes the fetched link"
+        );
+    }
+
+    /// The link ids the upgrade wrote, by handle.
+    fn links(ops: &[ReplicaWriteOp]) -> BTreeMap<&str, Option<&str>> {
+        ops.iter()
+            .filter_map(|op| match op {
+                ReplicaWriteOp::UpsertPlacement(p) => {
+                    Some((p.handle.as_str(), p.link_id.as_ref().map(|l| l.as_str())))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A meta upgrade of `handles`, fetched as all resolving to `link`,
+    /// checked against `stored` and returning the write batch.
+    fn upgrade_twins(
+        handles: &[&str],
+        link: &str,
+        loaded: Vec<ReplicaPlacement>,
+        stored: Vec<ReplicaPlacement>,
+    ) -> Vec<ReplicaWriteOp> {
+        crate::testlog::init();
+        let requested = handles.iter().copied().map(ReplicaHandle::from).collect();
+        let mut up = ReplicaUpgrade::new("inbox", requested, ReplicaTier::Meta);
+        let _ = up.resume(None);
+        let _ = up.resume(Some(ReplicaArg::Load(ReplicaLoaded {
+            placements: loaded,
+            checkpoint: None,
+        })));
+
+        let items = handles
+            .iter()
+            .map(|handle| ReplicaFetchedItem {
+                sort_key: Default::default(),
+                handle: ReplicaHandle::from(*handle),
+                link_id: ReplicaLinkId::from(link),
+                meta: ReplicaMeta("hdr".into()),
+                body: None,
+                revision: None,
+            })
+            .collect();
+
+        // an already-linked placement resolves no fresh identity, so the
+        // upgrade writes without checking the collection at all
+        let ops = match up.resume(Some(ReplicaArg::Fetch(items))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => Some(ops),
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad {
+                scope: ReplicaLoadScope::Links(_),
+                ..
+            }) => None,
+            state => panic!("expected WantsWrite or a link check, got {state:?}"),
+        };
+
+        match ops {
+            Some(ops) => ops,
+            None => match up.resume(Some(ReplicaArg::Load(ReplicaLoaded {
+                placements: stored,
+                checkpoint: None,
+            }))) {
+                ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
+                state => panic!("expected WantsWrite, got {state:?}"),
+            },
+        }
+    }
+
+    #[test]
+    fn a_second_copy_of_one_identity_is_minted() {
+        // both copies are hydrated by one batch and neither is linked
+        // yet, so the claim is tracked as the batch resolves it
+        let ops = upgrade_twins(
+            &["u1", "u2"],
+            "m1",
+            vec![
+                probed("u1", None, ReplicaLevel::Probed),
+                probed("u2", None, ReplicaLevel::Probed),
+            ],
+            Vec::new(),
+        );
+
+        assert_eq!(
+            links(&ops),
+            BTreeMap::from([("u1", Some("m1")), ("u2", Some("dup:m1#u2"))]),
+            "the first copy keeps the hint, the second is minted from it \
+             and its own handle",
+        );
+    }
+
+    #[test]
+    fn the_mint_is_decided_against_the_collection_not_the_batch() {
+        // only the second copy is hydrated here, so the holder is known
+        // from the link check alone
+        let ops = upgrade_twins(
+            &["u2"],
+            "m1",
+            vec![probed("u2", None, ReplicaLevel::Probed)],
+            vec![probed("u1", Some("m1"), ReplicaLevel::Meta)],
+        );
+
+        assert_eq!(
+            links(&ops),
+            BTreeMap::from([("u2", Some("dup:m1#u2"))]),
+            "a batch that never names the holder still mints",
+        );
+    }
+
+    #[test]
+    fn a_minted_copy_is_not_minted_again() {
+        // the same handle re-fetched keeps the key it was given: a fetch
+        // establishes a link only for a placement that has none, so the
+        // mint happens once and the copy keeps its identity for good
+        let ops = upgrade_twins(
+            &["u2"],
+            "m1",
+            vec![probed("u2", Some("dup:m1#u2"), ReplicaLevel::Probed)],
+            vec![probed("u1", Some("m1"), ReplicaLevel::Meta)],
+        );
+
+        assert_eq!(
+            links(&ops),
+            BTreeMap::from([("u2", Some("dup:m1#u2"))]),
+            "no dup:dup:m1#u2#u2",
         );
     }
 

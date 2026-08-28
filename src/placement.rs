@@ -10,7 +10,6 @@
 use alloc::{
     collections::BTreeSet,
     string::{String, ToString},
-    vec::Vec,
 };
 
 use crate::{collection::ReplicaCollectionId, object::ReplicaHash};
@@ -187,19 +186,6 @@ pub enum ReplicaStatus {
     /// yet. Its [`ReplicaPlacement::handle`] is a provisional placeholder
     /// until the push reconciles it to the server-assigned one.
     Created,
-    /// The source holds this identity under more than one handle, so
-    /// which copy a change belongs to cannot be decided. The
-    /// identity-axis twin of [`Conflict`](Self::Conflict): the engine
-    /// derives nothing for it, in either direction, until the source
-    /// holds the identity once again.
-    ///
-    /// A placement is identified by its collection and link id, and a
-    /// source binds it with one handle, so a second copy has nowhere to
-    /// live. Guessing which copy a delete refers to destroys mail: the
-    /// delete propagates to every other source and removes the only copy
-    /// there while the source still holds the message. Deriving nothing
-    /// mirrors the item zero times instead of once.
-    Ambiguous,
 }
 
 /// Where a pending create's content already lives, so the push can reuse a
@@ -272,16 +258,6 @@ pub struct ReplicaPlacement {
     /// For a [`ReplicaStatus::Created`] placement, where its body already
     /// lives so the push can copy or move it; `None` for an append.
     pub origin: Option<ReplicaOrigin>,
-    /// The other handles the source holds this identity under, empty in
-    /// the ordinary case: what makes the placement
-    /// [`Ambiguous`](ReplicaStatus::Ambiguous), and what a later
-    /// enumeration clears as those handles stop being reported.
-    ///
-    /// Recorded rather than inferred, because the evidence appears in
-    /// exactly one enumeration: an incremental one never mentions the
-    /// second copy again, so an unpersisted freeze forgets on the next
-    /// run and the item goes back to being deletable.
-    pub ambiguous_handles: Vec<ReplicaHandle>,
 }
 
 impl ReplicaPlacement {

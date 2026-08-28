@@ -1,10 +1,11 @@
-//! An identity one collection holds twice is frozen, never guessed.
+//! An identity one collection holds twice is two items, never one.
 //!
 //! A placement is identified by its collection and link id, and a source
-//! binds it with one handle, so a second copy of one identity has nowhere
-//! to live. Pairing one copy and leaving the other invisible makes a
-//! delete of the bound one propagate and remove the only copy on a side
-//! the user never touched.
+//! binds it with one handle, so the second copy cannot take the key the
+//! first holds. What follows from that is which copy gets the hint, not
+//! that the other goes without: a source holding two resources holds two
+//! items, and a replica storing one of them loses data at the point
+//! where it noticed the problem.
 
 // NOTE: shared across test targets; not every target uses every helper
 #[allow(dead_code)]
@@ -12,243 +13,183 @@ mod common;
 
 use io_replica::{
     client::ReplicaClient,
-    placement::{ReplicaHandle, ReplicaStatus},
+    mutate::ReplicaMutation,
+    placement::{ReplicaFlags, ReplicaHandle, ReplicaLinkId, ReplicaStatus},
     remote::ReplicaTier,
     sync::ReplicaSyncOptions,
 };
 
 use crate::common::{MemRemote, MemStorage};
 
-/// A collection holding one message twice: two handles, one `Message-ID`.
-fn twin_client() -> ReplicaClient<MemStorage, MemRemote> {
-    let body = b"From: a\r\nMessage-ID: <msg-a>\r\n\r\nbody\r\n";
+/// The two resources a Posteo calendar was found holding: one `UID`,
+/// two hrefs, two genuinely different bodies.
+const FIRST: &[u8] = b"From: a\r\nMessage-ID: <msg-a>\r\n\r\nthe meeting\r\n";
+const SECOND: &[u8] = b"From: a\r\nMessage-ID: <msg-a>\r\n\r\nanother meeting\r\n";
 
+/// The key the second copy is minted under: `dup:`, the hint, `#`, and
+/// the handle the source holds it at.
+const MINTED: &str = "dup:msg-a#u2";
+
+/// A collection holding one identity twice: two handles, one hint.
+fn twin_client() -> ReplicaClient<MemStorage, MemRemote> {
     let mut remote = MemRemote::default();
-    remote.seed("inbox", "u1", "msg-a", &[], body);
-    remote.seed("inbox", "u2", "msg-a", &[], body);
+    remote.seed("inbox", "u1", "msg-a", &[], FIRST);
+    remote.seed("inbox", "u2", "msg-a", &[], SECOND);
 
     ReplicaClient::new(MemStorage::default(), remote)
 }
 
-fn hydrate(client: &mut ReplicaClient<MemStorage, MemRemote>) {
-    client
-        .upgrade(
-            "inbox",
-            vec![ReplicaHandle::from("u1"), ReplicaHandle::from("u2")],
-            ReplicaTier::Meta,
-        )
-        .unwrap();
+/// Syncs the collection and hydrates both copies, bodies included.
+fn hydrate(client: &mut ReplicaClient<MemStorage, MemRemote>, handles: [&str; 2]) {
+    client.sync("inbox", full()).unwrap();
+    let handles = handles.iter().copied().map(ReplicaHandle::from).collect();
+    client.upgrade("inbox", handles, ReplicaTier::Full).unwrap();
 }
 
-/// The placement of `collection` whose status is `Ambiguous`, if any.
-fn ambiguous(client: &ReplicaClient<MemStorage, MemRemote>) -> Vec<String> {
-    client
-        .storage()
-        .placements
-        .values()
-        .filter(|p| p.status == ReplicaStatus::Ambiguous)
-        .map(|p| p.handle.as_str().to_string())
-        .collect()
+/// A run enumerating the whole collection, which is what a DAV server
+/// implementing no `sync-collection` leaves a consumer doing.
+fn full() -> ReplicaSyncOptions {
+    ReplicaSyncOptions {
+        full: true,
+        ..Default::default()
+    }
+}
+
+fn link(client: &ReplicaClient<MemStorage, MemRemote>, handle: &str) -> Option<ReplicaLinkId> {
+    client.storage().placement("inbox", handle).link_id.clone()
 }
 
 #[test]
-fn a_second_copy_is_recorded_rather_than_linked() {
+fn a_second_copy_is_minted_and_stored_with_its_own_body() {
     let mut client = twin_client();
-    client.sync("inbox", ReplicaSyncOptions::default()).unwrap();
-    hydrate(&mut client);
+    hydrate(&mut client, ["u1", "u2"]);
 
     let first = client.storage().placement("inbox", "u1");
     let second = client.storage().placement("inbox", "u2");
 
-    assert!(
-        first.link_id.is_some(),
+    assert_eq!(
+        first.link_id,
+        Some(ReplicaLinkId::from("msg-a")),
         "the first copy keeps the identity it resolved",
     );
-    assert!(
-        second.link_id.is_none(),
-        "the second has nowhere to live: linking it would overwrite the first \
-         binding's handle and lose the fact that the source holds it twice",
-    );
     assert_eq!(
-        first
-            .ambiguous_handles
-            .iter()
-            .map(|h| h.as_str())
-            .collect::<Vec<_>>(),
-        ["u2"],
-        "the losing handle is recorded, so the freeze survives the round trip",
+        second.link_id,
+        Some(ReplicaLinkId::from(MINTED)),
+        "and the second is minted from the hint and its own handle",
     );
-    assert_eq!(first.status, ReplicaStatus::Ambiguous);
-}
 
-#[test]
-fn an_ambiguous_placement_is_never_deleted_by_a_vanish() {
-    // deleting the bound copy must not propagate a delete that removes
-    // the only copy on the other side
-    let mut client = twin_client();
-    let opts = ReplicaSyncOptions::default();
-    client.sync("inbox", opts).unwrap();
-    hydrate(&mut client);
-
-    // the bound copy is expunged; the source still holds the other one
-    client.remote_mut().remove("inbox", "u1");
-    let report = client.sync("inbox", opts).unwrap();
-
+    let object = second.object.clone().expect("the second copy has a body");
+    assert_ne!(first.object, second.object, "two resources, two bodies");
     assert_eq!(
-        report.pulled, 0,
-        "no vanish is derived: the source demonstrably holds the identity still",
-    );
-    assert!(
         client
             .storage()
-            .placements
-            .contains_key(&("inbox".into(), ReplicaHandle::from("u1"))),
-        "the frozen placement survives the vanish",
+            .objects
+            .get(&object)
+            .map(|(_, b)| b.clone()),
+        Some(SECOND.to_vec()),
+        "the body the user would otherwise never see is stored",
     );
+    assert_eq!(second.status, ReplicaStatus::Clean, "an ordinary item");
 }
 
 #[test]
-fn an_ambiguous_placement_derives_no_push() {
-    let mut client = twin_client();
-    let opts = ReplicaSyncOptions::default();
-    client.sync("inbox", opts).unwrap();
-    hydrate(&mut client);
+fn the_mint_is_stable_across_a_fresh_store() {
+    let mut first = twin_client();
+    hydrate(&mut first, ["u1", "u2"]);
 
-    // a flag change the engine cannot attribute to either copy
-    client.remote_mut().set_flags("inbox", "u1", &["seen"]);
-    let report = client.sync("inbox", opts).unwrap();
+    // the same collection read again from nothing, hydrated in the other
+    // order: a fetch batch is order-independent, so the mint may not
+    // depend on which copy the consumer happened to return first
+    let mut second = twin_client();
+    hydrate(&mut second, ["u2", "u1"]);
 
-    assert_eq!(report.pushed, 0);
-    assert_eq!(report.pulled, 0, "nothing is derived in either direction");
-    assert_eq!(ambiguous(&client), ["u1"], "still frozen");
+    assert_eq!(link(&first, "u1"), link(&second, "u1"));
+    assert_eq!(link(&first, "u2"), link(&second, "u2"));
+    assert_eq!(link(&second, "u2"), Some(ReplicaLinkId::from(MINTED)));
 }
 
 #[test]
-fn resolving_the_duplicate_resumes_the_sync() {
+fn the_second_copy_is_fetched_once_and_kept() {
+    // the defect this replaces: a server with no incremental enumeration
+    // listed the twin on every run, its body was fetched to resolve its
+    // identity, the claim was lost again, and the bytes were left
+    // unreferenced. Four downloads and four orphan blobs per sync
     let mut client = twin_client();
-    let opts = ReplicaSyncOptions::default();
-    client.sync("inbox", opts).unwrap();
-    hydrate(&mut client);
-    assert_eq!(ambiguous(&client), ["u1"]);
+    hydrate(&mut client, ["u1", "u2"]);
+    let fetched = client.remote().full_fetches.len();
 
-    // the user deletes the duplicate, so the source holds the identity
-    // once again
-    client.remote_mut().remove("inbox", "u2");
-    client.sync("inbox", opts).unwrap();
-
-    assert!(ambiguous(&client).is_empty(), "the freeze clears itself");
-    assert_eq!(
-        client.storage().placement("inbox", "u1").status,
-        ReplicaStatus::Clean,
-        "and the item resumes syncing with no further ceremony",
-    );
-}
-
-#[test]
-fn a_mutation_against_an_ambiguous_placement_is_refused() {
-    use io_replica::{client::ReplicaClientError, mutate::ReplicaMutation};
-
-    let mut client = twin_client();
-    client.sync("inbox", ReplicaSyncOptions::default()).unwrap();
-    hydrate(&mut client);
-
-    let err = client
-        .mutate(
-            "inbox",
-            ReplicaMutation::SetFlags {
-                handle: ReplicaHandle::from("u1"),
-                flags: io_replica::placement::ReplicaFlags::from_iter(["seen"]),
-            },
-        )
-        .unwrap_err();
-
-    assert!(
-        matches!(err, ReplicaClientError::Coroutine(_)),
-        "staging would attach the edit to whichever copy happens to be bound",
-    );
-}
-
-#[test]
-fn the_freeze_survives_a_run_that_never_mentions_the_twin() {
-    // an incremental enumeration mentions the twin exactly once, in the
-    // run that discovers it, so an unpersisted freeze forgets and the
-    // item goes back to being deletable
-    let mut client = twin_client();
-    let opts = ReplicaSyncOptions::default();
-    client.sync("inbox", opts).unwrap();
-    hydrate(&mut client);
-
-    // several delta runs later, nothing having mentioned the twin
     for _ in 0..3 {
-        client.sync("inbox", opts).unwrap();
+        client.sync("inbox", full()).unwrap();
     }
 
-    assert_eq!(ambiguous(&client), ["u1"], "still frozen");
+    assert_eq!(
+        client.remote().full_fetches.len(),
+        fetched,
+        "a complete enumeration re-lists the twin and re-fetches nothing",
+    );
+    assert_eq!(link(&client, "u2"), Some(ReplicaLinkId::from(MINTED)));
+    assert_eq!(client.storage().objects.len(), 2, "no orphan bodies");
+}
 
+#[test]
+fn a_vanish_removes_the_copy_that_went_and_no_other() {
+    let mut client = twin_client();
+    hydrate(&mut client, ["u1", "u2"]);
+
+    // the copy holding the bare hint is expunged; the other one is not
     client.remote_mut().remove("inbox", "u1");
-    client.sync("inbox", opts).unwrap();
+    client.sync("inbox", full()).unwrap();
+
     assert!(
-        client
+        !client
             .storage()
             .placements
             .contains_key(&("inbox".into(), ReplicaHandle::from("u1"))),
-        "and still not deletable on the word of one vanished copy",
+        "the copy the source dropped is gone",
+    );
+    assert_eq!(
+        link(&client, "u2"),
+        Some(ReplicaLinkId::from(MINTED)),
+        "and the survivor keeps the key it was minted under: re-canonicalising \
+         it would change an identity a consumer has already shown",
     );
 }
 
-/// The freeze is one item wide.
-///
-/// Refusing to guess costs the frozen item its sync and must cost nothing
-/// else: the run carries on over the rest of the collection, in both
-/// directions, and the duplicate is a warning rather than a halt.
-///
-/// A rule that derives nothing is only safe while the nothing is scoped:
-/// applied a batch or a collection wide it would strand a mailbox on one
-/// double delivery, a worse outcome than the mispairing it prevents.
 #[test]
-fn a_frozen_item_does_not_stop_the_collection() {
+fn each_copy_reconciles_on_its_own() {
     let mut client = twin_client();
-    let opts = ReplicaSyncOptions::default();
+    hydrate(&mut client, ["u1", "u2"]);
 
-    // an ordinary neighbour, seeded beside the twins
-    client.remote_mut().seed(
-        "inbox",
-        "u3",
-        "msg-b",
-        &[],
-        b"From: a\r\nMessage-ID: <msg-b>\r\n\r\nother\r\n",
-    );
-
-    client.sync("inbox", opts).unwrap();
-    hydrate(&mut client);
-    assert_eq!(ambiguous(&client), ["u1"], "the twins froze");
-
-    // remote changes on both axes, one touching the frozen identity and
-    // one the neighbour
+    // one flag pulled from the remote, one pushed to it, one per copy
     client.remote_mut().set_flags("inbox", "u1", &["seen"]);
-    client.remote_mut().set_flags("inbox", "u3", &["seen"]);
-    let report = client.sync("inbox", opts).unwrap();
-
-    assert_eq!(report.pulled, 1, "the neighbour pulled, the twins did not");
-    assert_eq!(
-        client.storage().placement("inbox", "u3").flags,
-        io_replica::placement::ReplicaFlags::from_iter(["seen"]),
-        "the neighbour took the remote flag",
-    );
-    assert_eq!(ambiguous(&client), ["u1"], "and the twins are still frozen");
-
-    // a local change on the neighbour still pushes, past the frozen item
     client
         .mutate(
             "inbox",
-            io_replica::mutate::ReplicaMutation::SetFlags {
-                handle: ReplicaHandle::from("u3"),
-                flags: io_replica::placement::ReplicaFlags::from_iter(["seen", "flagged"]),
+            ReplicaMutation::SetFlags {
+                handle: ReplicaHandle::from("u2"),
+                flags: ReplicaFlags::from_iter(["flagged"]),
             },
         )
         .unwrap();
-    let report = client.sync("inbox", opts).unwrap();
+    let report = client.sync("inbox", full()).unwrap();
 
-    assert_eq!(report.pushed, 1, "the neighbour's edit reached the remote");
-    assert_eq!(ambiguous(&client), ["u1"]);
+    assert_eq!(report.pulled, 1);
+    assert_eq!(report.pushed, 1);
+    assert!(
+        client
+            .storage()
+            .placement("inbox", "u1")
+            .flags
+            .contains("seen"),
+        "the remote change reached the copy it names",
+    );
+    assert!(
+        client.remote().flags_of("inbox", "u2").contains("flagged"),
+        "and the staged edit reached the other, addressed as the one \
+         item it is",
+    );
+    assert!(
+        !client.remote().flags_of("inbox", "u1").contains("flagged"),
+        "neither change crossed over to the other copy",
+    );
 }

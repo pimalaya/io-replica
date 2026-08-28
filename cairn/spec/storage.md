@@ -115,7 +115,7 @@ The scope is a floor, not a ceiling: a storage SHALL return at least the placeme
 - THEN it is served only the placement it names, and still produces the same writes
 
 ### Requirement: A write batch is applied in order
-`ReplicaStorage::write` SHALL apply the ops in the order they are listed, and atomically. Ordering is what a batch naming one handle twice rests on, which the engine does emit: a sync that clears an ambiguity and then reads the same handle as vanished writes the cleared placement and then drops it, and the drop is the answer.
+`ReplicaStorage::write` SHALL apply the ops in the order they are listed, and atomically. Ordering is what a batch naming one handle twice rests on, which the engine does emit: a sync that resurrects a locally deleted item writes the placeholder, pushes it, and supersedes the same handle once the remote assigns one, and the drop is the answer.
 
 A storage MAY NOT group the batch by op kind, or otherwise reorder it: what looks like an independent set of rows is not one.
 
