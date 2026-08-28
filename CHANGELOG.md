@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `coroutine::ReplicaArgError`, the one error a driver that breaks the coroutine contract gets, replacing the four per-verb enums that said it identically.
 - `ReplicaDeletePolicy` on `ReplicaSyncOptions`: what becomes of a local delete the source will not take, `Revert` (the default, mirroring the source) or `Keep` (holding the tombstone for a later run). One answer for both refusals, so `ReplicaPushRights::none()` and `push = false` finally agree on it.
 - `ReplicaSync::PUSH_CHUNK` and `ReplicaSync::WRITE_CHUNK`, the number of changes one push chunk holds and the number of writes one batch holds.
+- `ReplicaSourceBinding::shared_object`, the shared body a source last reconciled against, which is the base of the cross-source merge. A storage persisting the binding persists it too, and until it does the sync base stands in for it.
+- `ReplicaPlacement::conflict_object` and `ReplicaSourceBinding::conflict_object`, the remote body a `Manual` conflict diverged from, recorded beside the revision it names so a resolver reads base, local and remote from the store instead of fetching one of them. It is set and cleared with `conflict_revision`, and dropped in the same write that advances it. The engine fetches nothing: a conflicted placement holding none is the request, and the upgrade pass answers it.
 
 ### Changed
 
@@ -36,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ReplicaMutateError` keeps its two real variants and composes the shared `ReplicaArgError` as `Arg`.
 - **A forbidden remove now reverts the tombstone rather than holding it**, following the new `ReplicaDeletePolicy` default. `delete: ReplicaDeletePolicy::Keep` restores the old behaviour, and now applies to a read-only source too, which never had it.
 - The hub projects its three placements (bound, tombstone, create) from one `ReplicaHubItem::project`, each settling only what the source binding decides. A field added to `ReplicaPlacement` is one edit rather than three, where forgetting one was a silently wrong projection rather than a compile error.
+- **A `Full` upgrade revisits a conflicted placement holding no `conflict_object`**, which the level rule alone skipped: it reads as `Full` and holds a body, just not the one it lacks. The fetched body lands on `conflict_object`, never on the placement's own object, and such a placement is fetched rather than linked from the object store, as a revision-carrying one already was.
 
 ### Removed
 
@@ -63,6 +66,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A keep-both duplicate could not be identified.** It carried no link id and a constant handle suffix, so a retried add had no idempotency key, a storage sharing items by link could not hold it, and a second resolution overwrote the first. Both are derived from the forked body now: the duplicate is a new item, not another copy of the one it forked from.
 
 - **A derived content push suppressed the flag merge for that item.** It self-healed only because the recorded checkpoint is the pre-push one, so a concurrent remote flag change stayed invisible, and emitted no event, until some later run happened to list the item again. The flag axis always runs now and withholds only its own push, so one handle still yields at most one change.
+
+- **A source disagreed with itself, and its second edit was dropped.** The hub read a cross-source divergence off the base the source last synced with its own remote, which an unpushed edit of that very source leaves behind just as another source folding in does. A second offline edit was therefore filed as a conflict and never pushed anywhere, with one source bound and no second source in the store, and the edit resolving a conflicted binding was dropped the same way: the merged body never became the item's body, so the next run pushed the unmerged one over the remote it was merged against. `ReplicaSourceBinding::shared_object` records the shared body a source last reconciled against, giving each axis its own base, and the cross-source comparison is made against it. A genuine divergence between two sources conflicts exactly as before.
 
 ## [0.4.2] - 2026-08-25
 

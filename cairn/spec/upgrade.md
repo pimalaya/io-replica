@@ -103,3 +103,12 @@ Minting SHALL be decided against the whole collection rather than the batch, thr
 - WHEN the same collection is enumerated and hydrated again from an empty store
 - THEN the same handle receives the same minted key
 
+### Requirement: An upgrade supplies a conflict's diverging body
+An upgrade SHALL revisit a conflicted placement that holds no `conflict_object`, and SHALL apply the fetched body to `conflict_object` rather than to the placement's own object. The two are different questions about the same handle: the placement's object is what the local side holds, and the conflict object is what the remote holds instead, so a fetch answering one SHALL NOT be read as answering the other.
+
+Such a placement SHALL be fetched rather than linked from the object store, for the reason a revision-carrying one is: a link id says two copies are the same item, and the conflict is about the bytes the remote alone holds.
+
+#### Scenario: A conflicted placement without its diverging body
+- GIVEN a conflicted placement holding a local body and no conflict object
+- WHEN it is upgraded
+- THEN the fetched body lands as the conflict object and the local body is untouched

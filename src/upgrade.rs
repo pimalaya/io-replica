@@ -24,7 +24,7 @@ use crate::{
     collection::ReplicaCollectionId,
     coroutine::*,
     object::ReplicaObject,
-    placement::{ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaPlacement},
+    placement::{ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaPlacement, ReplicaStatus},
     remote::{ReplicaFetchedBody, ReplicaFetchedItem, ReplicaTier},
     storage::ReplicaLoadScope,
 };
@@ -85,13 +85,20 @@ impl ReplicaUpgrade {
     /// The level is a claim and the payload is the fact, so a row
     /// reading as high enough while holding nothing is upgraded again;
     /// nothing else revisits what already reads as reached.
+    ///
+    /// A conflicted placement is asked a different question: its own
+    /// body is the local side of a divergence, which no fetch supplies,
+    /// so what it still needs is the body the remote holds instead.
     fn pending_handles(&self) -> Vec<ReplicaHandle> {
         self.handles
             .iter()
             .filter(|h| match self.placements.get(h) {
                 Some(p) => match self.tier {
                     ReplicaTier::Meta => p.level < ReplicaLevel::Meta || p.meta.is_none(),
-                    ReplicaTier::Full => p.level < ReplicaLevel::Full || p.object.is_none(),
+                    ReplicaTier::Full => match is_conflicted(p) {
+                        true => p.conflict_object.is_none(),
+                        false => p.level < ReplicaLevel::Full || p.object.is_none(),
+                    },
                 },
                 None => false,
             })
@@ -146,7 +153,7 @@ impl ReplicaCoroutine for ReplicaUpgrade {
                         let links: Vec<_> = pending
                             .iter()
                             .filter_map(|h| self.placements.get(h))
-                            .filter(|p| !is_mutable(p))
+                            .filter(|p| !is_mutable(p) && !is_conflicted(p))
                             .filter_map(|p| p.link_id.clone())
                             .collect();
 
@@ -178,7 +185,7 @@ impl ReplicaCoroutine for ReplicaUpgrade {
                     let hit = placement
                         .link_id
                         .as_ref()
-                        .filter(|_| !is_mutable(placement))
+                        .filter(|_| !is_mutable(placement) && !is_conflicted(placement))
                         .and_then(|link| known.get(link).cloned());
 
                     match hit {
@@ -313,6 +320,29 @@ impl ReplicaUpgrade {
                 continue;
             };
             let mut patched = placement.clone();
+
+            if self.tier == ReplicaTier::Full && is_conflicted(&patched) {
+                // NOTE: the fetch answers what the remote holds instead
+                // of the local body, which is another question about the
+                // same handle: everything but the conflict object
+                // describes the local side, and stays as it is.
+                let Some(body) = item.body else {
+                    continue;
+                };
+                let (object, bytes) = stored_body(body);
+                let hash = object.hash.clone();
+
+                self.ops.push(ReplicaWriteOp::StoreObject {
+                    object,
+                    body: bytes,
+                });
+                patched.conflict_object = Some(hash);
+                self.ops.push(ReplicaWriteOp::UpsertPlacement(patched));
+                self.report.fetched += 1;
+                self.report.upgraded += 1;
+                continue;
+            }
+
             // NOTE: a fetch establishes the link only for a not-yet-
             // linked item, never re-identifying a linked one. Two tiers
             // can disagree on the link, an ENVELOPE reporting a
@@ -341,22 +371,11 @@ impl ReplicaUpgrade {
                 (ReplicaTier::Full, Some(body)) => {
                     // NOTE: a body already streamed into the consumer's
                     // blob store carries no bytes in the store op.
-                    let (object, store_body) = match body {
-                        ReplicaFetchedBody::Inline { hash, bytes } => {
-                            let object = ReplicaObject {
-                                hash,
-                                size: bytes.len(),
-                            };
-                            (object, Some(bytes))
-                        }
-                        ReplicaFetchedBody::Persisted { hash, size } => {
-                            (ReplicaObject { hash, size }, None)
-                        }
-                    };
+                    let (object, bytes) = stored_body(body);
                     let hash = object.hash.clone();
                     self.ops.push(ReplicaWriteOp::StoreObject {
                         object,
-                        body: store_body,
+                        body: bytes,
                     });
 
                     // NOTE: the stored object is the remote content as
@@ -409,6 +428,34 @@ fn mint(hint: &ReplicaLinkId, handle: &ReplicaHandle) -> ReplicaLinkId {
     ReplicaLinkId(key)
 }
 
+/// Splits a fetched body into the object to record and the bytes to
+/// store, which a consumer that streamed the body into its own blob
+/// store has already written.
+fn stored_body(body: ReplicaFetchedBody) -> (ReplicaObject, Option<Vec<u8>>) {
+    match body {
+        ReplicaFetchedBody::Inline { hash, bytes } => {
+            let object = ReplicaObject {
+                hash,
+                size: bytes.len(),
+            };
+
+            (object, Some(bytes))
+        }
+        ReplicaFetchedBody::Persisted { hash, size } => (ReplicaObject { hash, size }, None),
+    }
+}
+
+/// Whether the placement holds the local side of a divergence, so a
+/// fetch of it answers what the remote holds instead rather than what
+/// the placement itself holds.
+///
+/// Such a placement is fetched rather than linked from the store, for
+/// the reason a mutable one is: a link id says two copies are the same
+/// item, and the conflict is about bytes the remote alone has.
+fn is_conflicted(placement: &ReplicaPlacement) -> bool {
+    placement.status == ReplicaStatus::Conflict
+}
+
 /// Whether the placement's content is mutable, which the last-synced
 /// revision is the mark of: only a source rewriting a body in place has
 /// one.
@@ -458,6 +505,7 @@ mod tests {
             flags: ReplicaFlags::default(),
             status: ReplicaStatus::Clean,
             conflict_revision: None,
+            conflict_object: None,
             base: None,
             origin: None,
         }
@@ -1242,5 +1290,108 @@ mod tests {
             }
             state => panic!("expected WantsFetch, got {state:?}"),
         }
+    }
+
+    /// A conflicted placement: a based, mutable card holding the local
+    /// side of a divergence and the revision the remote holds instead.
+    fn conflicted(conflict_object: Option<&str>) -> ReplicaPlacement {
+        let mut placement = based("card-1.vcf", "uid:card-1", Some("etag-1"));
+        placement.object = Some(ReplicaHash::from("h-local"));
+        placement.level = ReplicaLevel::Full;
+        placement.status = ReplicaStatus::Conflict;
+        placement.conflict_revision = Some(String::from("etag-2"));
+        placement.conflict_object = conflict_object.map(ReplicaHash::from);
+        placement
+    }
+
+    /// Runs a `Full` upgrade of one placement up to its first yield
+    /// after the load.
+    fn upgrade_full(
+        placement: ReplicaPlacement,
+    ) -> (
+        ReplicaUpgrade,
+        ReplicaCoroutineState<ReplicaYield, Result<ReplicaUpgradeReport, ReplicaArgError>>,
+    ) {
+        let handle = placement.handle.clone();
+        let loaded = ReplicaLoaded {
+            placements: vec![placement],
+            checkpoint: None,
+        };
+        let mut up = ReplicaUpgrade::new("inbox", vec![handle], ReplicaTier::Full);
+        let _ = up.resume(None);
+        let state = up.resume(Some(ReplicaArg::Load(loaded)));
+
+        (up, state)
+    }
+
+    #[test]
+    fn a_conflicted_placement_asks_for_the_diverging_body() {
+        // it reads as Full and holds a body, so the level rule would
+        // skip it; what it is missing is the other body, the one the
+        // remote holds instead, and only a fetch supplies that
+        let (_up, state) = upgrade_full(conflicted(None));
+
+        match state {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsFetch { handles, tier, .. }) => {
+                assert_eq!(tier, ReplicaTier::Full);
+                assert_eq!(handles, vec![ReplicaHandle::from("card-1.vcf")]);
+            }
+            state => panic!("expected WantsFetch, got {state:?}"),
+        }
+
+        // and once it holds one, the question is answered
+        let (_up, state) = upgrade_full(conflicted(Some("h-remote")));
+
+        match state {
+            ReplicaCoroutineState::Complete(Ok(report)) => assert_eq!(report.fetched, 0),
+            state => panic!("expected Complete(Ok), got {state:?}"),
+        }
+    }
+
+    #[test]
+    fn a_fetched_body_lands_as_the_conflict_object() {
+        // the placement's object is what the local side holds and the
+        // conflict object what the remote holds instead: a fetch answers
+        // the second question, and reading it as the first would drop
+        // the local edit the conflict exists to protect
+        let (mut up, _state) = upgrade_full(conflicted(None));
+
+        let items = vec![ReplicaFetchedItem {
+            handle: ReplicaHandle::from("card-1.vcf"),
+            link_id: ReplicaLinkId::from("uid:card-1"),
+            meta: ReplicaMeta(String::from("remote")),
+            sort_key: Default::default(),
+            body: Some(ReplicaFetchedBody::Inline {
+                hash: ReplicaHash::from("h-remote"),
+                bytes: b"remote".to_vec(),
+            }),
+            revision: Some(String::from("etag-2")),
+        }];
+
+        let ops = match up.resume(Some(ReplicaArg::Fetch(items))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+        let ReplicaWriteOp::UpsertPlacement(placement) = &ops[1] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[1]);
+        };
+
+        assert_eq!(
+            placement.conflict_object,
+            Some(ReplicaHash::from("h-remote"))
+        );
+        assert_eq!(
+            placement.object,
+            Some(ReplicaHash::from("h-local")),
+            "the local side of the divergence is untouched"
+        );
+        assert_eq!(
+            placement
+                .base
+                .as_ref()
+                .and_then(|base| base.revision.clone()),
+            Some(String::from("etag-1")),
+            "nor does the fetch rebase what it never merged"
+        );
     }
 }

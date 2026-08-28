@@ -80,7 +80,8 @@
 //! An edit beats a delete in both directions: a remote update resurrects
 //! a local tombstone, and a local staged edit survives a remote delete as
 //! a pending create. Diverging content is marked conflicted, carrying the
-//! observed remote revision, for the consumer to resolve with an edit.
+//! observed remote revision and the body at it, so the consumer resolves
+//! it with an edit and without a round trip of its own.
 //!
 //! A push is always confirmed before local state is rewritten: the merge
 //! stashes the derived change and waits for the remote outcome, rebasing

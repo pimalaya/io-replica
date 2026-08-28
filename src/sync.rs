@@ -535,6 +535,7 @@ impl ReplicaSync {
                     let mut resurrected = local;
                     resurrected.status = ReplicaStatus::Created;
                     resurrected.conflict_revision = None;
+                    resurrected.conflict_object = None;
                     resurrected.base = None;
                     resurrected.origin = None;
                     self.writes
@@ -635,14 +636,7 @@ impl ReplicaSync {
             // on flags alone, which would strand the two bodies apart
             // and loop every sync without reconciling the content.
             if local.object.is_some() && item.revision.is_some() {
-                let mut conflicted = local.clone();
-                conflicted.status = ReplicaStatus::Conflict;
-                conflicted.conflict_revision = item.revision.clone();
-                self.writes
-                    .push(ReplicaWriteOp::UpsertPlacement(conflicted.clone()));
-                self.report.conflicts += 1;
-                self.emit(ReplicaEvent::Conflicted(local.handle.clone()));
-                return ContentOutcome::Rewritten(conflicted);
+                return self.mark_conflict(local, item);
             }
             return ContentOutcome::Untouched;
         };
@@ -654,6 +648,10 @@ impl ReplicaSync {
             if item.revision.is_some() && item.revision != local.conflict_revision {
                 let mut updated = local.clone();
                 updated.conflict_revision = item.revision.clone();
+                // NOTE: the stored body describes the revision it was
+                // fetched at, so it goes in the write the newer one
+                // lands in, and the upgrade pass asks anew.
+                updated.conflict_object = None;
                 self.writes
                     .push(ReplicaWriteOp::UpsertPlacement(updated.clone()));
                 return ContentOutcome::Rewritten(updated);
@@ -721,6 +719,10 @@ impl ReplicaSync {
 
     /// Marks a placement conflicted, carrying the observed remote revision for
     /// the consumer to resolve against.
+    ///
+    /// The diverging body is marked wanted rather than taken, the engine
+    /// fetching nothing itself: a conflict holding no conflict object is
+    /// the request, and the upgrade pass is what answers it.
     fn mark_conflict(
         &mut self,
         local: &ReplicaPlacement,
@@ -729,6 +731,7 @@ impl ReplicaSync {
         let mut conflicted = local.clone();
         conflicted.status = ReplicaStatus::Conflict;
         conflicted.conflict_revision = item.revision.clone();
+        conflicted.conflict_object = None;
         self.writes
             .push(ReplicaWriteOp::UpsertPlacement(conflicted.clone()));
         self.report.conflicts += 1;
@@ -765,6 +768,7 @@ impl ReplicaSync {
             flags: local.flags.clone(),
             status: ReplicaStatus::Created,
             conflict_revision: None,
+            conflict_object: None,
             base: None,
             origin: None,
         };
@@ -900,6 +904,7 @@ impl ReplicaSync {
             flags: item.flags.clone(),
             status: ReplicaStatus::Clean,
             conflict_revision: None,
+            conflict_object: None,
             base: Some(ReplicaBase {
                 flags: item.flags.clone(),
                 revision: item.revision.clone(),
@@ -1383,6 +1388,7 @@ mod tests {
             flags: ReplicaFlags::default(),
             status: ReplicaStatus::Created,
             conflict_revision: None,
+            conflict_object: None,
             base: None,
             origin: Some(ReplicaOrigin {
                 collection: "sent".into(),
@@ -1403,6 +1409,7 @@ mod tests {
             flags: ReplicaFlags::from_iter(flags.iter().copied()),
             status: ReplicaStatus::Clean,
             conflict_revision: None,
+            conflict_object: None,
             base: Some(ReplicaBase {
                 flags: ReplicaFlags::from_iter(flags.iter().copied()),
                 revision: None,
@@ -2719,7 +2726,9 @@ mod tests {
     #[test]
     fn divergent_content_edits_conflict() {
         // the conflict mark carries the observed remote revision, the
-        // local body survives, and nothing is pushed or refreshed
+        // local body survives, and nothing is pushed or refreshed. The
+        // diverging body is marked wanted rather than taken: the engine
+        // fetches nothing, so the upgrade pass is what supplies it
         let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
         let (pushes, writes, report) =
             run(&mut sync, vec![edited("1")], vec![remote_rev("1", "r2")]);
@@ -2730,6 +2739,10 @@ mod tests {
         let conflicted = upserted(&writes, "1").expect("a conflicted placement");
         assert_eq!(conflicted.status, ReplicaStatus::Conflict);
         assert_eq!(conflicted.conflict_revision.as_deref(), Some("r2"));
+        assert_eq!(
+            conflicted.conflict_object, None,
+            "the diverging body is wanted, not taken"
+        );
         assert_eq!(
             conflicted.object,
             Some(ReplicaHash::from("h2")),
@@ -2803,6 +2816,51 @@ mod tests {
             Some(ReplicaHash::from("h2")),
             "the edit survives"
         );
+    }
+
+    #[test]
+    fn a_conflict_whose_remote_moved_drops_its_stored_body() {
+        // the stored body describes the revision recorded beside it, so
+        // it goes in the write the newer revision lands in: a resolver
+        // merging against it would show a version the remote dropped
+        let mut placement = edited("1");
+        placement.status = ReplicaStatus::Conflict;
+        placement.conflict_revision = Some("r2".into());
+        placement.conflict_object = Some(ReplicaHash::from("h-r2"));
+
+        let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
+        let (_pushes, writes, _report) =
+            run(&mut sync, vec![placement], vec![remote_rev("1", "r3")]);
+
+        let tracked = upserted(&writes, "1").expect("an updated placement");
+        assert_eq!(tracked.conflict_revision.as_deref(), Some("r3"));
+        assert_eq!(
+            tracked.conflict_object, None,
+            "the body of the revision that moved is asked for anew"
+        );
+    }
+
+    #[test]
+    fn an_immutable_backend_records_no_conflict_at_all() {
+        // no revision means no content signal on either side, so the
+        // conflict axis never fires and neither half of the pair is ever
+        // written
+        let mut placement = edited("1");
+        let base = placement.base.as_mut().expect("a base");
+        base.revision = None;
+
+        let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
+        let (_pushes, writes, report) = run(&mut sync, vec![placement], vec![remote("1", &[])]);
+
+        assert_eq!(report.conflicts, 0);
+        for write in &writes {
+            let ReplicaWriteOp::UpsertPlacement(placement) = write else {
+                continue;
+            };
+            assert_ne!(placement.status, ReplicaStatus::Conflict);
+            assert_eq!(placement.conflict_revision, None);
+            assert_eq!(placement.conflict_object, None);
+        }
     }
 
     #[test]

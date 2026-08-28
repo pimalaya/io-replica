@@ -253,6 +253,20 @@ pub struct ReplicaPlacement {
     /// marked [`ReplicaStatus::Conflict`], what the consumer resolves
     /// against. `None` otherwise.
     pub conflict_revision: Option<String>,
+    /// The remote body at the revision `conflict_revision` names, so
+    /// the divergence reads from the store rather than from the remote:
+    /// a resolver holding the base, the local body and this one needs
+    /// no credentials, no backend and no network.
+    ///
+    /// It shares the lifetime of `conflict_revision`, set with it,
+    /// cleared with it on resolution, and dropped with it whenever a
+    /// later sync observes a newer revision, a body outliving the
+    /// revision recorded beside it describing a version the remote no
+    /// longer holds. The engine fetches nothing, so marking the conflict
+    /// only marks the body wanted and the upgrade pass supplies it: a
+    /// conflict holding `None` here is visible and listable, and
+    /// resolvable once the body lands.
+    pub conflict_object: Option<ReplicaHash>,
     /// The last-synced base; `None` until first reconciled.
     pub base: Option<ReplicaBase>,
     /// For a [`ReplicaStatus::Created`] placement, where its body already

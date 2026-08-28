@@ -24,7 +24,7 @@ This library is composed of 2 layers:
 - **Three-way sync**: reconcile local and remote changes against a stored base, so edits made offline survive the next sync instead of being silently overwritten.
 - **Deduplication**: an item present in several collections is fetched and stored once, giving a unified cross-collection view for free.
 - **Partial cache**: cache only what you need, whether identifiers, list summaries or full bodies, and still tell deleted apart from not-yet-cached safely.
-- **Conflict handling**: flags merge without ever conflicting; diverging content is kept on both sides for you to resolve.
+- **Conflict handling**: flags merge without ever conflicting; diverging content is kept on both sides, bodies included, so resolving it needs no network of its own.
 - **I/O-free coroutines**: no_std state machines holding the whole replica logic, resumable from any blocking, async or in-memory harness.
 - **Blocking driver**: a reference driver servicing the storage and remote seams through two traits you implement, always available since it performs no I/O of its own.
 

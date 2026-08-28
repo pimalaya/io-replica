@@ -219,6 +219,7 @@ impl ReplicaMutate {
                 // against.
                 if source.status == ReplicaStatus::Conflict {
                     let revision = source.conflict_revision.take();
+                    source.conflict_object = None;
                     if let (Some(base), Some(revision)) = (source.base.as_mut(), revision) {
                         base.revision = Some(revision);
                     }
@@ -305,6 +306,7 @@ impl ReplicaMutate {
             flags: source.flags.clone(),
             status: ReplicaStatus::Created,
             conflict_revision: None,
+            conflict_object: None,
             base: None,
             origin,
         }
@@ -339,6 +341,7 @@ impl ReplicaMutate {
             flags: flags.clone(),
             status: ReplicaStatus::Created,
             conflict_revision: None,
+            conflict_object: None,
             base: None,
             origin: None,
         };
@@ -447,6 +450,7 @@ mod tests {
                 meta: None,
                 flags: ReplicaFlags::default(),
                 conflict_revision: None,
+                conflict_object: None,
                 status: ReplicaStatus::Clean,
                 base: Some(ReplicaBase {
                     flags: ReplicaFlags::default(),
@@ -797,7 +801,9 @@ mod tests {
     #[test]
     fn edit_resolves_a_conflict() {
         // the base adopts the remote revision observed at conflict time,
-        // gating the resolving push on the state it was merged against
+        // gating the resolving push on the state it was merged against,
+        // and the recorded pair goes with it: the divergence the edit
+        // settles has no reader left
         use crate::object::{ReplicaHash, ReplicaObject};
 
         let mutation = ReplicaMutation::Edit {
@@ -816,6 +822,7 @@ mod tests {
         let mut loaded = loaded("1");
         loaded.placements[0].status = ReplicaStatus::Conflict;
         loaded.placements[0].conflict_revision = Some("r2".into());
+        loaded.placements[0].conflict_object = Some(ReplicaHash::from("h-remote"));
 
         let ops = match mutate.resume(Some(ReplicaArg::Load(loaded))) {
             ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
@@ -827,6 +834,10 @@ mod tests {
 
         assert_eq!(p.status, ReplicaStatus::Dirty);
         assert_eq!(p.conflict_revision, None);
+        assert_eq!(
+            p.conflict_object, None,
+            "the diverging body is dropped with the revision it named"
+        );
         let base = p.base.as_ref().expect("a base");
         assert_eq!(base.revision.as_deref(), Some("r2"));
     }

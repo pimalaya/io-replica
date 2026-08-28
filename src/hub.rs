@@ -50,9 +50,31 @@ pub struct ReplicaSourceBinding {
     /// edit needs no explicit resolution call.
     pub conflicted: bool,
     /// The remote revision observed when this binding was marked
-    /// conflicted, what a resolver fetches and merges against. `None`
-    /// when not conflicted, or when the remote reports no revision.
+    /// conflicted, what a resolver merges against. `None` when not
+    /// conflicted, or when the remote reports no revision.
     pub conflict_revision: Option<String>,
+    /// The remote body at that revision, so a resolver reads the
+    /// divergence from the store rather than from the source. `None`
+    /// until the upgrade pass supplies it, and dropped whenever the
+    /// revision beside it moves.
+    ///
+    /// Persisted with the binding because that is what a storage keeps
+    /// per source: the projection hands it back to the placement, and
+    /// an absorb records whatever the placement holds.
+    pub conflict_object: Option<ReplicaHash>,
+    /// The shared body this source last reconciled against, which is
+    /// the base of the cross-source merge.
+    ///
+    /// The second axis needs a base of its own. [`base`](Self::base) is
+    /// what this source last agreed with its own remote, and only a
+    /// sync moves it, so a body this source folded into the hub and has
+    /// not pushed yet leaves it behind the shared one. Read as the
+    /// cross-source base it would make the source disagree with itself,
+    /// and its next edit would be dropped as a conflict.
+    ///
+    /// `None` until this source has folded once, where the sync base
+    /// stands in for it.
+    pub shared_object: Option<ReplicaHash>,
 }
 
 /// How the hub resolves a cross-source content conflict, both sources
@@ -144,6 +166,7 @@ impl ReplicaHubItem {
             flags: self.flags.clone(),
             status: ReplicaStatus::Clean,
             conflict_revision: None,
+            conflict_object: None,
             base: None,
             origin: None,
         }
@@ -226,6 +249,7 @@ impl ReplicaHub {
         let mut placement = item.project(collection, link, binding.handle.clone());
         placement.status = status;
         placement.conflict_revision = binding.conflict_revision.clone();
+        placement.conflict_object = binding.conflict_object.clone();
         placement.base = binding.base.clone();
         placement
     }
@@ -313,9 +337,14 @@ impl ReplicaHub {
         // cleared: the kept content lets edit-beats-delete resurrect it
         // if the source's server changed it.
         if placement.status == ReplicaStatus::Tombstone {
+            let agreed = item
+                .sources
+                .get(source)
+                .and_then(|binding| binding.shared_object.clone());
+
             item.deleted = true;
             item.sources
-                .insert(source.clone(), Self::binding_of(placement));
+                .insert(source.clone(), Self::binding_of(placement, agreed));
             return;
         }
 
@@ -344,19 +373,28 @@ impl ReplicaHub {
 
         item.level = item.stored_level();
 
+        // NOTE: the reconcile has settled the shared body, so this
+        // source has now agreed with whatever it left, adopted or not.
+        let agreed = item.object.clone();
+
         item.sources
-            .insert(source.clone(), Self::binding_of(placement));
+            .insert(source.clone(), Self::binding_of(placement, agreed));
     }
 
-    /// The binding an upsert leaves for its source: its handle and base,
-    /// plus whether this source's own sync is stuck on a conflict.
+    /// The binding an upsert leaves for its source: its handle, its two
+    /// bases (the one it last synced with its remote and the shared body
+    /// it last reconciled against), plus whether this source's own sync
+    /// is stuck on a conflict.
     ///
     /// Recording the conflict is what makes the round trip faithful: the
     /// merge leaves an unresolved conflict alone, so a projection
     /// reporting it as `Dirty` would re-derive the rejected push every
     /// run. Any other status clears it, which is how a resolving edit
     /// ends the conflict without a dedicated call.
-    fn binding_of(placement: &ReplicaPlacement) -> ReplicaSourceBinding {
+    fn binding_of(
+        placement: &ReplicaPlacement,
+        shared_object: Option<ReplicaHash>,
+    ) -> ReplicaSourceBinding {
         let conflicted = placement.status == ReplicaStatus::Conflict;
         ReplicaSourceBinding {
             handle: placement.handle.clone(),
@@ -365,32 +403,43 @@ impl ReplicaHub {
             conflict_revision: conflicted
                 .then(|| placement.conflict_revision.clone())
                 .flatten(),
+            conflict_object: conflicted
+                .then(|| placement.conflict_object.clone())
+                .flatten(),
+            shared_object,
         }
     }
 
     /// Reconciles the shared body against an incoming upsert. A clean
     /// fast-forward adopts the body; a divergence resolves by policy.
+    ///
+    /// Each axis is measured against its own base. The source changed
+    /// its body when the upsert differs from what it last synced with
+    /// its own remote, and another source moved the shared body when the
+    /// item differs from what this source last reconciled against. A
+    /// source is therefore never in conflict with a body it folded in
+    /// itself, however far behind its remote it is.
     fn reconcile_content(
         item: &mut ReplicaHubItem,
         source: &ReplicaSourceId,
         placement: &ReplicaPlacement,
         policy: ReplicaHubConflict,
     ) {
-        let prev = item
-            .sources
-            .get(source)
+        let binding = item.sources.get(source);
+        let prev = binding
             .and_then(|b| b.base.as_ref())
             .and_then(|b| b.object.clone());
+        let agreed = binding
+            .and_then(|b| b.shared_object.clone())
+            .or_else(|| prev.clone());
         let shared = item.object.clone();
         let incoming = placement.object.clone();
 
         let source_edited = incoming != prev;
-        let hub_moved = shared != prev;
-        let diverged = source_edited
-            && hub_moved
-            && incoming != shared
-            && incoming.is_some()
-            && shared.is_some();
+        let hub_moved = shared != agreed;
+        let body_changed = incoming != shared;
+        let diverged =
+            source_edited && hub_moved && body_changed && incoming.is_some() && shared.is_some();
 
         if diverged {
             match policy {
@@ -408,13 +457,14 @@ impl ReplicaHub {
                     item.conflict_object = None;
                 }
             }
-        } else if source_edited && !hub_moved {
+        } else if source_edited && !hub_moved && body_changed {
             item.object = incoming;
             item.conflicted = false;
             item.conflict_object = None;
         }
-        // NOTE: else the source is unchanged or behind the hub, so the
-        // shared body stays and the next projection pushes it.
+        // NOTE: else the source carries the shared body already, or is
+        // behind the hub, so the shared body stays and the next
+        // projection pushes it.
     }
 
     fn absorb_drop(
@@ -472,6 +522,8 @@ mod tests {
                 base: Some(base(flags)),
                 conflicted: false,
                 conflict_revision: None,
+                conflict_object: None,
+                shared_object: None,
             },
         );
         let item = ReplicaHubItem {
@@ -508,6 +560,8 @@ mod tests {
                     base: Some(base(flags)),
                     conflicted: false,
                     conflict_revision: None,
+                    conflict_object: None,
+                    shared_object: None,
                 },
             );
     }
@@ -522,6 +576,7 @@ mod tests {
             if let Some(base) = &mut binding.base {
                 base.object = Some(ReplicaHash::from("body"));
             }
+            binding.shared_object = Some(ReplicaHash::from("body"));
         }
     }
 
@@ -541,6 +596,8 @@ mod tests {
                 base: Some(base(&["seen"])),
                 conflicted: false,
                 conflict_revision: None,
+                conflict_object: None,
+                shared_object: None,
             },
         )]
         .into_iter()
@@ -565,6 +622,8 @@ mod tests {
                     base: Some(base(&["seen"])),
                     conflicted: false,
                     conflict_revision: None,
+                    conflict_object: None,
+                    shared_object: None,
                 },
             );
 
@@ -593,6 +652,8 @@ mod tests {
                     base: Some(base(&[])),
                     conflicted: false,
                     conflict_revision: None,
+                    conflict_object: None,
+                    shared_object: None,
                 },
             );
 
@@ -655,6 +716,8 @@ mod tests {
                     base: Some(base(&["seen"])),
                     conflicted: false,
                     conflict_revision: None,
+                    conflict_object: None,
+                    shared_object: None,
                 },
             );
 
@@ -711,6 +774,8 @@ mod tests {
                 base: Some(base(&["seen"])),
                 conflicted: false,
                 conflict_revision: None,
+                conflict_object: None,
+                shared_object: None,
             },
         );
 
@@ -883,6 +948,7 @@ mod tests {
             flags: ReplicaFlags::from_iter(["seen", "flagged"]),
             status: ReplicaStatus::Clean,
             conflict_revision: None,
+            conflict_object: None,
             base: Some(base(&["seen", "flagged"])),
             origin: None,
         };
@@ -922,6 +988,8 @@ mod tests {
             }),
             conflicted: false,
             conflict_revision: None,
+            conflict_object: None,
+            shared_object: Some(ReplicaHash::from("o0")),
         };
         let mut sources = BTreeMap::new();
         sources.insert(ReplicaSourceId::from("left"), based("l1"));
@@ -956,6 +1024,7 @@ mod tests {
             flags: ReplicaFlags::default(),
             status: ReplicaStatus::Clean,
             conflict_revision: None,
+            conflict_object: None,
             base: Some(ReplicaBase {
                 flags: ReplicaFlags::default(),
                 revision: Some("r1".into()),
@@ -965,7 +1034,24 @@ mod tests {
         })
     }
 
-    fn shared_object(hub: &ReplicaHub) -> Option<ReplicaHash> {
+    /// An offline edit of the shared item from `handle`, which is the
+    /// shape a local mutation leaves: the new body against the base last
+    /// synced with the source's own remote, which an edit never moves.
+    fn edited_upsert(handle: &str, object: &str) -> ReplicaWriteOp {
+        let ReplicaWriteOp::UpsertPlacement(mut placement) = content_upsert(handle, object) else {
+            unreachable!()
+        };
+
+        placement.status = ReplicaStatus::Dirty;
+        placement.base = Some(ReplicaBase {
+            flags: ReplicaFlags::default(),
+            revision: Some("r0".into()),
+            object: Some(ReplicaHash::from("o0")),
+        });
+        ReplicaWriteOp::UpsertPlacement(placement)
+    }
+
+    fn item_object(hub: &ReplicaHub) -> Option<ReplicaHash> {
         hub.items
             .get(&ReplicaLinkId::from("m1"))
             .unwrap()
@@ -982,12 +1068,65 @@ mod tests {
             &ReplicaSourceId::from("left"),
             &[content_upsert("l1", "oa")],
         );
-        assert_eq!(shared_object(&hub), Some(ReplicaHash::from("oa")));
+        assert_eq!(item_object(&hub), Some(ReplicaHash::from("oa")));
         assert!(
             !hub.items
                 .get(&ReplicaLinkId::from("m1"))
                 .unwrap()
                 .conflicted
+        );
+    }
+
+    #[test]
+    fn a_second_offline_edit_is_not_a_divergence() {
+        // one source bound and no second source anywhere: the first edit
+        // moves the shared body ahead of the sync base, which is the gap
+        // another source folding in leaves, and the second edit arriving
+        // over it must not read as the two disagreeing
+        let mut hub = content_hub(ReplicaHubConflict::Manual);
+        let left = ReplicaSourceId::from("left");
+        hub.items
+            .get_mut(&ReplicaLinkId::from("m1"))
+            .unwrap()
+            .sources
+            .remove(&ReplicaSourceId::from("right"));
+
+        hub.absorb(&left, &[edited_upsert("l1", "o1")]);
+        hub.absorb(&left, &[edited_upsert("l1", "o2")]);
+
+        let item = hub.items.get(&ReplicaLinkId::from("m1")).unwrap();
+        assert_eq!(
+            item.object,
+            Some(ReplicaHash::from("o2")),
+            "the second edit is the shared body"
+        );
+        assert!(!item.conflicted, "a source cannot disagree with itself");
+        assert_eq!(item.conflict_object, None, "so nothing diverges from it");
+    }
+
+    #[test]
+    fn a_divergence_between_unpushed_edits_still_conflicts() {
+        // the two edits leave the same gap between base and shared body
+        // that a source's own second edit does, and telling one from the
+        // other is the whole point: this one is two sources disagreeing
+        let mut hub = content_hub(ReplicaHubConflict::Manual);
+        hub.absorb(&ReplicaSourceId::from("left"), &[edited_upsert("l1", "oa")]);
+        hub.absorb(
+            &ReplicaSourceId::from("right"),
+            &[edited_upsert("r1", "ob")],
+        );
+
+        let item = hub.items.get(&ReplicaLinkId::from("m1")).unwrap();
+        assert!(item.conflicted, "the divergence is detected");
+        assert_eq!(
+            item.object,
+            Some(ReplicaHash::from("oa")),
+            "the shared body is kept"
+        );
+        assert_eq!(
+            item.conflict_object,
+            Some(ReplicaHash::from("ob")),
+            "and the diverging one preserved"
         );
     }
 
@@ -1062,7 +1201,8 @@ mod tests {
     }
 
     /// A conflicted upsert for the shared item from `handle`, carrying
-    /// the local body and the remote revision the merge observed.
+    /// the local body, the remote revision the merge observed and the
+    /// diverging body an upgrade supplied for it.
     fn conflicted_upsert(handle: &str, object: &str, revision: &str) -> ReplicaWriteOp {
         ReplicaWriteOp::UpsertPlacement(ReplicaPlacement {
             sort_key: Default::default(),
@@ -1075,6 +1215,7 @@ mod tests {
             flags: ReplicaFlags::default(),
             status: ReplicaStatus::Conflict,
             conflict_revision: Some(revision.into()),
+            conflict_object: Some(ReplicaHash::from("o-remote")),
             base: Some(ReplicaBase {
                 flags: ReplicaFlags::default(),
                 revision: Some("r0".into()),
@@ -1085,11 +1226,12 @@ mod tests {
     }
 
     #[test]
-    fn a_conflicted_placement_round_trips_with_its_revision() {
+    fn a_conflicted_placement_round_trips_with_its_diverging_body() {
         // the merge marks a placement Conflict and records the remote
-        // revision it saw, and both must come back out: read back as
-        // Dirty, the engine would re-derive the rejected push and
-        // re-conflict on every run without converging
+        // revision it saw and the body at it, and all three must come
+        // back out: read back as Dirty, the engine would re-derive the
+        // rejected push and re-conflict on every run without converging,
+        // and a lost body would send the resolver to the network
         let mut hub = content_hub(ReplicaHubConflict::Manual);
         hub.absorb(
             &ReplicaSourceId::from("left"),
@@ -1100,9 +1242,19 @@ mod tests {
         assert_eq!(projected.len(), 1);
         assert_eq!(projected[0].status, ReplicaStatus::Conflict);
         assert_eq!(
+            projected[0].object,
+            Some(ReplicaHash::from("o-local")),
+            "the local side of the divergence is the shared body"
+        );
+        assert_eq!(
             projected[0].conflict_revision.as_deref(),
             Some("r-remote"),
             "the observed remote revision is what a resolver merges against"
+        );
+        assert_eq!(
+            projected[0].conflict_object,
+            Some(ReplicaHash::from("o-remote")),
+            "the diverging body comes back with the revision it describes"
         );
     }
 
@@ -1138,13 +1290,24 @@ mod tests {
         hub.absorb(&left, &[conflicted_upsert("l1", "o-local", "r-remote")]);
         assert_eq!(placements(&hub, "left")[0].status, ReplicaStatus::Conflict);
 
-        hub.absorb(&left, &[content_upsert("l1", "o-merged")]);
+        hub.absorb(&left, &[edited_upsert("l1", "o-merged")]);
 
-        let binding = hub.items[&ReplicaLinkId::from("m1")].sources[&left].clone();
+        let item = hub.items[&ReplicaLinkId::from("m1")].clone();
+        assert_eq!(
+            item.object,
+            Some(ReplicaHash::from("o-merged")),
+            "the merged body is the shared body, or the next run pushes the unmerged one"
+        );
+
+        let binding = item.sources[&left].clone();
         assert!(!binding.conflicted);
         assert_eq!(
             binding.conflict_revision, None,
             "a resolved binding must not carry a stale revision forward"
+        );
+        assert_eq!(
+            binding.conflict_object, None,
+            "nor the body that revision named"
         );
         assert_ne!(placements(&hub, "left")[0].status, ReplicaStatus::Conflict);
     }
@@ -1209,9 +1372,39 @@ mod tests {
         tombstone.status = ReplicaStatus::Tombstone;
         hub.absorb(&left, &[ReplicaWriteOp::UpsertPlacement(tombstone)]);
 
-        let binding = hub.items[&ReplicaLinkId::from("m1")].sources[&left].clone();
+        let item = hub.items[&ReplicaLinkId::from("m1")].clone();
+        assert_eq!(
+            item.object,
+            Some(ReplicaHash::from("o-local")),
+            "a staged delete adopts no content"
+        );
+
+        let binding = item.sources[&left].clone();
         assert!(!binding.conflicted);
         assert_eq!(binding.conflict_revision, None);
+        assert_eq!(binding.conflict_object, None);
+    }
+
+    #[test]
+    fn a_tombstone_does_not_move_the_agreement_point() {
+        // a staged delete adopts no body, so it says nothing about what
+        // its source agreed with: reading it as agreement would have
+        // right's later edit fast-forward over left's body
+        let mut hub = content_hub(ReplicaHubConflict::Manual);
+        let right = ReplicaSourceId::from("right");
+        hub.absorb(&ReplicaSourceId::from("left"), &[edited_upsert("l1", "oa")]);
+
+        let ReplicaWriteOp::UpsertPlacement(mut tombstone) = edited_upsert("r1", "o0") else {
+            unreachable!()
+        };
+        tombstone.status = ReplicaStatus::Tombstone;
+        hub.absorb(&right, &[ReplicaWriteOp::UpsertPlacement(tombstone)]);
+        hub.absorb(&right, &[edited_upsert("r1", "ob")]);
+
+        let item = hub.items.get(&ReplicaLinkId::from("m1")).unwrap();
+        assert!(item.conflicted, "right never saw left's body");
+        assert_eq!(item.object, Some(ReplicaHash::from("oa")));
+        assert_eq!(item.conflict_object, Some(ReplicaHash::from("ob")));
     }
 }
 
@@ -1237,6 +1430,7 @@ mod sort_key_tests {
             flags: ReplicaFlags::default(),
             status: ReplicaStatus::Clean,
             conflict_revision: None,
+            conflict_object: None,
             base: None,
             origin: None,
         })
@@ -1312,6 +1506,7 @@ mod flags_tests {
             flags,
             status: ReplicaStatus::Clean,
             conflict_revision: None,
+            conflict_object: None,
             base: None,
             origin: None,
         })
@@ -1373,6 +1568,7 @@ mod stored_level_tests {
             flags: ReplicaFlags::default(),
             status: ReplicaStatus::Clean,
             conflict_revision: None,
+            conflict_object: None,
             base: Some(ReplicaBase {
                 flags: ReplicaFlags::default(),
                 revision: None,

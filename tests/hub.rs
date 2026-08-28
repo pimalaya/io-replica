@@ -21,6 +21,7 @@ use io_replica::{
     client::{ReplicaClient, ReplicaStorage},
     collection::{ReplicaCheckpoint, ReplicaCollectionId},
     hub::{ReplicaHub, ReplicaSourceId},
+    mutate::ReplicaMutation,
     object::{ReplicaHash, ReplicaObject},
     placement::{ReplicaHandle, ReplicaLinkId, ReplicaPlacement, ReplicaStatus},
     remote::ReplicaTier,
@@ -28,7 +29,7 @@ use io_replica::{
     sync::{ReplicaDeletePolicy, ReplicaPushRights, ReplicaSyncOptions},
 };
 
-use crate::common::{MemRemote, MemStorage};
+use crate::common::{MemRemote, MemStorage, hash};
 
 /// The shared store behind every source: one hub, one object store, and a
 /// checkpoint per source.
@@ -202,6 +203,42 @@ impl Mirror {
                 .collect();
             client.upgrade("inbox", handles, ReplicaTier::Full).unwrap();
         }
+    }
+
+    /// The body the hub holds for `link`, which is what every source is
+    /// converging on.
+    fn shared_body(&self, link: &str) -> Option<Vec<u8>> {
+        let shared = self.shared.borrow();
+        let item = shared.hub.items.get(&ReplicaLinkId::from(link))?;
+        let object = item.object.as_ref()?;
+        shared.objects.get(object).map(|(_, body)| body.clone())
+    }
+
+    /// Whether the hub reads the item as a cross-source divergence.
+    fn conflicted(&self, link: &str) -> bool {
+        self.shared
+            .borrow()
+            .hub
+            .items
+            .get(&ReplicaLinkId::from(link))
+            .is_some_and(|item| item.conflicted)
+    }
+
+    /// The body a source's server holds for its only member, which the
+    /// fake remote records as the pushed object rather than as bytes.
+    fn object_on(&self, source: char) -> Option<ReplicaHash> {
+        let remote = match source {
+            'a' => self.a.remote(),
+            _ => self.b.remote(),
+        };
+        let stored = remote
+            .items
+            .get(&"inbox".into())
+            .and_then(|c| c.values().next())?;
+
+        Some(ReplicaHash::from(
+            String::from_utf8(stored.body.clone()).expect("a pushed object"),
+        ))
     }
 
     /// Whether the hub knows the item was deleted on some source.
@@ -561,4 +598,121 @@ fn a_refused_duplicate_leaves_both_items_intact() {
         "the refused copy is still an item, bound to the source that has it",
     );
     assert_eq!(mirror.deleted("dup:msg-a#a2"), Some(false));
+}
+
+/// A local edit of `handle` on one source, which is what a consumer's
+/// editor stages: the body is stored and the placement repointed at it,
+/// its base left where the last sync put it.
+fn edit(client: &mut ReplicaClient<SourceStore, MemRemote>, handle: &str, body: &[u8]) {
+    let object = ReplicaObject {
+        hash: hash(body),
+        size: body.len(),
+    };
+
+    client
+        .mutate(
+            "inbox",
+            ReplicaMutation::Edit {
+                handle: ReplicaHandle::from(handle),
+                object,
+                body: body.to_vec(),
+                meta: None,
+                sort_key: None,
+            },
+        )
+        .unwrap();
+}
+
+/// A source editing twice before it has pushed once is not two sources
+/// disagreeing, and the hub holds the body written last.
+///
+/// The first edit moves the shared body ahead of the base the source
+/// last synced with its own server, which is the gap another source
+/// folding in leaves. Read as that gap, the second edit is filed as a
+/// divergence and never pushed anywhere.
+#[test]
+fn a_second_offline_edit_reaches_the_shared_item() {
+    let mut mirror = Mirror::new();
+    mirror.a.remote_mut().mutable = true;
+    mirror.b.remote_mut().mutable = true;
+    mirror
+        .a
+        .remote_mut()
+        .seed("inbox", "a1", "msg-a", &[], b"the meeting");
+    mirror.quiesce(ReplicaSyncOptions::default());
+
+    edit(&mut mirror.a, "a1", b"the meeting, moved");
+    edit(&mut mirror.a, "a1", b"the meeting, moved again");
+
+    assert_eq!(
+        mirror.shared_body("msg-a").as_deref(),
+        Some(&b"the meeting, moved again"[..]),
+        "the newest edit is the shared body",
+    );
+    assert!(!mirror.conflicted("msg-a"), "one source, so no divergence");
+
+    mirror.quiesce(ReplicaSyncOptions::default());
+
+    for source in ['a', 'b'] {
+        assert_eq!(
+            mirror.object_on(source),
+            Some(hash(b"the meeting, moved again")),
+            "both servers hold the newest edit",
+        );
+    }
+}
+
+/// The edit that resolves a conflicted binding becomes the shared body,
+/// so the run that follows pushes the merge.
+///
+/// Dropping it is worse than losing an edit: the item keeps the body the
+/// merge replaced, and the next push sends that body over the remote the
+/// merge was made against.
+#[test]
+fn a_resolving_edit_is_what_gets_pushed() {
+    let mut mirror = Mirror::new();
+    mirror.a.remote_mut().mutable = true;
+    mirror.b.remote_mut().mutable = true;
+    mirror
+        .a
+        .remote_mut()
+        .seed("inbox", "a1", "msg-a", &[], b"the meeting");
+    mirror.quiesce(ReplicaSyncOptions::default());
+
+    edit(&mut mirror.a, "a1", b"the meeting, moved");
+    mirror
+        .a
+        .remote_mut()
+        .edit("inbox", "a1", b"the meeting, cancelled");
+    mirror
+        .a
+        .sync("inbox", ReplicaSyncOptions::default())
+        .unwrap();
+
+    let conflicted = mirror
+        .a
+        .open("inbox")
+        .unwrap()
+        .placements
+        .iter()
+        .any(|p| p.status == ReplicaStatus::Conflict);
+    assert!(conflicted, "the source and its own server diverged");
+
+    edit(&mut mirror.a, "a1", b"the meeting, moved and cancelled");
+
+    assert_eq!(
+        mirror.shared_body("msg-a").as_deref(),
+        Some(&b"the meeting, moved and cancelled"[..]),
+        "the merged body is the shared body",
+    );
+
+    mirror.quiesce(ReplicaSyncOptions::default());
+
+    for source in ['a', 'b'] {
+        assert_eq!(
+            mirror.object_on(source),
+            Some(hash(b"the meeting, moved and cancelled")),
+            "and the merge is what every server ends up with",
+        );
+    }
 }

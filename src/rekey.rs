@@ -140,6 +140,7 @@ impl ReplicaRekey {
                 let mut resurrected = placement.clone();
                 resurrected.status = ReplicaStatus::Created;
                 resurrected.conflict_revision = None;
+                resurrected.conflict_object = None;
                 resurrected.base = None;
                 resurrected.origin = None;
                 written.insert(resurrected.handle.clone());
@@ -211,6 +212,14 @@ impl ReplicaRekey {
             None
         };
 
+        // NOTE: the stored diverging body describes the revision
+        // recorded beside it, so a rekey observing a newer one drops it
+        // and the upgrade pass asks anew.
+        let conflict_object = match conflict_revision == old.conflict_revision {
+            true => old.conflict_object.clone(),
+            false => None,
+        };
+
         ReplicaPlacement {
             collection: self.collection.clone(),
             handle: item.handle.clone(),
@@ -226,6 +235,7 @@ impl ReplicaRekey {
             flags,
             status,
             conflict_revision,
+            conflict_object,
             base: Some(ReplicaBase {
                 flags: item.flags.clone(),
                 revision: item.revision.clone(),
@@ -257,6 +267,7 @@ impl ReplicaRekey {
             flags: item.flags.clone(),
             status: ReplicaStatus::Clean,
             conflict_revision: None,
+            conflict_object: None,
             base: Some(ReplicaBase {
                 flags: item.flags.clone(),
                 revision: item.revision.clone(),
@@ -385,6 +396,7 @@ mod tests {
             flags: ReplicaFlags::from_iter(flags.iter().copied()),
             status: ReplicaStatus::Clean,
             conflict_revision: None,
+            conflict_object: None,
             base: Some(ReplicaBase {
                 flags: ReplicaFlags::from_iter(flags.iter().copied()),
                 revision: None,

@@ -77,12 +77,16 @@ report's counters summarise them.
 `ReplicaSyncOptions` SHALL carry a `ReplicaConflictPolicy` (`Manual`,
 `PreferLocal`, `PreferRemote`, `KeepBoth`; default `Manual`) applied when content
 diverges on both sides of a based placement. `Manual` marks the placement
-conflicted and waits for the consumer's edit. `PreferRemote` drops the local
-edit and pulls the remote. `PreferLocal` pushes the local body as an `Update`
-gated on the *observed* remote revision (overwriting the current remote), and
-falls back to `Manual` when the source may not push content. `KeepBoth` pulls the
-remote into the placement and stages the local body as a fresh `Created` member
-so neither version is lost. A base-less create-collision is always kept as a
+conflicted and waits for the consumer's edit, recording the observed remote
+revision as `conflict_revision` and the diverging remote body as
+`conflict_object` beside it, so waiting for that edit does not oblige the
+consumer to fetch. `PreferRemote` drops the local edit and pulls the remote.
+`PreferLocal` pushes the local body as an `Update` gated on the *observed*
+remote revision (overwriting the current remote), and falls back to `Manual`
+when the source may not push content. `KeepBoth` pulls the remote into the
+placement and stages the local body as a fresh `Created` member so neither
+version is lost. The three deciding policies settle within the run and record
+neither half of the pair. A base-less create-collision is always kept as a
 conflict regardless of the policy. Immutable-content backends report no revision
 and so never reach a content conflict.
 
@@ -219,3 +223,22 @@ A source bound to a hub SHALL be given `Keep`. Reverting states that this source
 - GIVEN a tombstoned placement the source still holds
 - WHEN it is synced with `push = false`, and again with `rights.remove = false`
 - THEN both follow the same policy: reverted by default, held under `Keep`
+
+### Requirement: A conflict keeps the body it diverged from
+A placement marked conflicted SHALL carry `conflict_object`, the remote body at the revision `conflict_revision` names, so the divergence can be read without asking the remote for it. Both SHALL be set together, cleared together on resolution, and dropped together when the tracked revision moves: a body that outlives the revision recorded beside it describes a version the server no longer holds, and a resolver trusting it would merge against a phantom.
+
+The engine fetches nothing, so the body is requested rather than taken: marking a conflict marks the body wanted and the [upgrade](upgrade.md) pass supplies it. A conflict whose body has not yet landed is visible and unresolvable, as a probed placement holding no body is visible and unreadable.
+
+Storing it is what lets resolution leave the process that found it. A resolver holding base, local and remote needs no credentials, no backend and no network, and a conflict between two hand-edited bodies is decided by a human long after the run that found it.
+
+The hub round-trips both halves through `ReplicaSourceBinding`, on the per-source axis and independently of the cross-source `ReplicaHubItem::conflict_object`.
+
+#### Scenario: The diverging body is stored, not refetched by the resolver
+- GIVEN a based placement edited locally and changed on the remote, `conflict = Manual`
+- WHEN the collection is synced and the wanted body is supplied
+- THEN the placement holds the remote body beside the observed revision, and base, local and remote are all readable from the store
+
+#### Scenario: A remote that moves again invalidates the stored body
+- GIVEN an unresolved conflict whose stored body matches its recorded revision
+- WHEN a later sync observes a newer remote revision
+- THEN the recorded revision advances and the stored body is dropped in the same write
