@@ -2841,6 +2841,54 @@ mod tests {
     }
 
     #[test]
+    fn a_resolution_keeping_the_ancestor_pushes_it() {
+        // the resolution rebased the base onto the remote state it
+        // settled, so the ancestor it kept differs from it and pushes,
+        // gated on the revision the decision was taken against
+        let mut placement = edited("1");
+        placement.object = Some(ReplicaHash::from("h-base"));
+        let base = placement.base.as_mut().expect("a base");
+        base.revision = Some("r2".into());
+        base.object = Some(ReplicaHash::from("h-remote"));
+
+        let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
+        let (pushes, _writes, report) =
+            run(&mut sync, vec![placement], vec![remote_rev("1", "r2")]);
+
+        assert_eq!(report.conflicts, 0);
+        match &pushes.expect("a push")[0].kind {
+            ReplicaChangeKind::Update {
+                object, if_match, ..
+            } => {
+                assert_eq!(object, &ReplicaHash::from("h-base"));
+                assert_eq!(if_match.as_deref(), Some("r2"));
+            }
+            other => panic!("expected an Update push, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_resolution_taking_the_remote_body_settles_clean() {
+        // adopting the remote wholesale leaves nothing either side owes
+        // the other, so the run derives no push and the placement lands
+        // clean rather than dirty for good
+        let mut placement = edited("1");
+        placement.object = Some(ReplicaHash::from("h-remote"));
+        let base = placement.base.as_mut().expect("a base");
+        base.revision = Some("r2".into());
+        base.object = Some(ReplicaHash::from("h-remote"));
+
+        let mut sync = ReplicaSync::new("inbox", ReplicaSyncOptions::default());
+        let (pushes, writes, report) = run(&mut sync, vec![placement], vec![remote_rev("1", "r2")]);
+
+        assert!(pushes.is_none(), "the remote holds the decision already");
+        assert_eq!(report.conflicts, 0);
+        let settled = upserted(&writes, "1").expect("a settled placement");
+        assert_eq!(settled.status, ReplicaStatus::Clean);
+        assert_eq!(settled.object, Some(ReplicaHash::from("h-remote")));
+    }
+
+    #[test]
     fn an_immutable_backend_records_no_conflict_at_all() {
         // no revision means no content signal on either side, so the
         // conflict axis never fires and neither half of the pair is ever

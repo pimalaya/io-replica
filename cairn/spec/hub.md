@@ -139,6 +139,13 @@ source folding in also leaves, and reading the two as one drops the source's nex
 edit: a second offline edit under `Manual`, or the edit that resolves a
 conflicted binding, whose merged body would then never be pushed.
 
+An upsert leaving a conflicted binding SHALL count as the source having changed
+its body whatever body it carries, read from the status rather than from the
+body alone. A resolution keeping the ancestor of the divergence restates the
+source's own sync base, so comparing bodies reads it as the source having said
+nothing, and the hub would keep the body the resolution discarded and hand every
+source a decision nobody took.
+
 Flags are unaffected (element-wise, never conflicting), and immutable-content
 backends mint a new link id per body and never reach this path.
 
@@ -161,6 +168,11 @@ backends mint a new link id per body and never reach this path.
 - GIVEN a conflicted binding whose local body the hub holds as the shared one
 - WHEN the merged body is absorbed as an ordinary edit
 - THEN it becomes the shared body, so the next run pushes the merge rather than the body it replaced
+
+#### Scenario: A resolution restating the source's sync base
+- GIVEN the same binding, resolved by keeping the body both sides forked from
+- WHEN that edit is absorbed
+- THEN the ancestor becomes the shared body, the source having spoken even though its body is the one it last synced
 
 ### Requirement: A per-source content conflict round-trips through the hub
 `ReplicaSourceBinding` SHALL carry a `conflicted` flag and a
@@ -226,6 +238,16 @@ Withholding it would mean the engine deciding which of two copies a user is allo
 The three placements the hub projects (a bound member, a tombstone for one deleted elsewhere, a create for one this source lacks) SHALL be built from one projection carrying the item's shared content, each settling only what the source's binding decides: the status it reads as, its base, its conflict revision.
 
 Stating the shared content once is what makes a field added to `ReplicaPlacement` a change in one place: three hand-written projections make forgetting one a silent wrong answer rather than a compile error.
+
+### Requirement: A binding with no base is a pending create
+`ReplicaHub::project` SHALL read a bound item whose binding holds no base as `ReplicaStatus::Created`, on the same condition `created_placement` applies to an unbound one: the hub holds the body. A binding's base is what its source last reconciled with its own remote, so a binding without one has never reached that source and the item is still the create it was staged as.
+
+Without it the hub cannot represent a persisted create at all. `absorb` binds every live upsert whatever its status, and the merge derives an add for a `Created` placement alone, so a create written through a hub-backed store is neither pushed nor dropped on any run after the first: a locally-authored item never leaves the machine, and the `Created` placement an edit-beats-delete resurrection writes is refused by the next pass, which loses the edit.
+
+#### Scenario: A locally-authored create reaches its own source
+- GIVEN a source over a hub-backed store staging an `Add`
+- WHEN the store is written and the source's placements projected again
+- THEN the placement reads `Created`, and the next sync appends it to that source's own remote
 
 ### Requirement: A hub-backed store owns the rows the hub cannot key
 `ReplicaHub::absorb` SHALL ignore an upserted placement carrying no link id, because the hub keys items by link id and has nowhere to put one. Every row a sync pulls is such a placement: an enumeration yields handles, and the link id lands on the first meta fetch.

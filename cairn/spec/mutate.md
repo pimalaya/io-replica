@@ -23,10 +23,14 @@ on the next sync:
 - `Remove` — tombstone a placement, kept until synced. Absorbed as a staged
   delete (the item is marked deleted, its binding kept), so the next sync pushes
   the remove.
-- `Edit` — store a new body and repoint the placement at it (full level, dirty),
-  keeping the base so the next sync derives the push; editing a conflicted
-  placement resolves it, the base adopting the remote revision observed at
-  conflict time.
+- `Edit` — store a new body and repoint the placement at it (full level),
+  keeping the base so the next sync derives the push. An edit whose object is
+  the one the base already holds stages nothing and SHALL leave the status where
+  it found it, `ReplicaPlacement::staged_edit` being the single reading of
+  "there is a local content edit here"; every other edit marks the placement
+  dirty. Editing a conflicted placement resolves it whatever body it carries,
+  the base adopting the remote state observed at conflict time, both halves of
+  it (see below).
 - `Copy` — stage a `Created` placement in a target under a caller-supplied
   `placeholder`, carrying the source origin; the source is untouched.
 - `Move` — stage a `Created` placement in the target under a caller-supplied
@@ -58,3 +62,25 @@ when a live (non-tombstone) placement already holds `link_id`; a tombstoned
 terms as its optional summary: absent keeps the stored key. An edit that changes
 what the key is derived from has to say so, or the item stays where it was in
 the list.
+
+### Requirement: A resolution is measured against the remote it settled
+The base an `Edit` resolving a conflict leaves SHALL be the remote state the resolution was merged against: `conflict_revision` as the base revision **and** `conflict_object` as the base object. A conflicted placement holding no base SHALL be given one from the same pair, its own resolution being where the two sides first agree.
+
+Adopting the revision alone leaves the pair contradicting itself, the base claiming a revision its object was never the content of, and the sync's local-side signal is the object: a placement points at a body its base does not hold. A resolution keeping the ancestor of the divergence therefore read as nothing to push, while the adopted revision read as nothing to pull, so the decision never left the machine and the flag pass rebased the divergence away. Keeping the ancestor is the ordinary three-way merge answer, and the resolving tools offer it outright.
+
+The four ways to resolve then fall out of the one comparison: keeping the local body, the ancestor, or a merge of the resolver's own pushes an `Update` gated on the recorded revision, and adopting the remote body wholesale owes no push and settles clean on the next run. The base is also the ancestor a later conflict is merged against, which is right for the same reason: after a resolution, the last state the two sides shared is the remote state the decision was taken against.
+
+#### Scenario: Keeping the ancestor
+- GIVEN a conflicted placement resolved with the body its base holds
+- WHEN the collection is synced
+- THEN an `Update` carrying that body is pushed, gated on the revision recorded at conflict time
+
+#### Scenario: Taking the remote body
+- GIVEN a conflicted placement resolved with the recorded diverging body
+- WHEN the collection is synced
+- THEN nothing is pushed and the placement lands clean
+
+#### Scenario: A resolution with no base
+- GIVEN a create-collision conflict, which has no base
+- WHEN it is resolved with an edit
+- THEN the placement is based on the recorded revision and body, and the next sync pushes the resolution instead of re-marking the conflict

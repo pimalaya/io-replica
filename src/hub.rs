@@ -240,6 +240,15 @@ impl ReplicaHub {
             // already rejected, re-marking the same conflict every run
             // without ever converging.
             ReplicaStatus::Conflict
+        } else if binding.base.is_none() && item.object.is_some() {
+            // NOTE: a binding with no base has never been reconciled
+            // with this source's own remote, so the item is not there:
+            // this copy is the pending create it was staged as, and only
+            // a `Created` placement makes the merge derive the add. A
+            // storage that binds every upsert persists every create
+            // through here, so reading one back as dirty strands it, the
+            // create arm refusing it on every run after.
+            ReplicaStatus::Created
         } else if in_sync {
             ReplicaStatus::Clean
         } else {
@@ -435,7 +444,16 @@ impl ReplicaHub {
         let shared = item.object.clone();
         let incoming = placement.object.clone();
 
-        let source_edited = incoming != prev;
+        // NOTE: a source leaving a conflict has spoken whatever body it
+        // carries, the same rule the placement's own status follows. Its
+        // resolution may restate the body it last synced, which is what
+        // keeping the ancestor of the divergence is, and reading that as
+        // "this source changed nothing" would keep the body the
+        // resolution discarded and hand every source a decision nobody
+        // took.
+        let resolving = binding.is_some_and(|binding| binding.conflicted)
+            && placement.status != ReplicaStatus::Conflict;
+        let source_edited = incoming != prev || resolving;
         let hub_moved = shared != agreed;
         let body_changed = incoming != shared;
         let diverged =
@@ -1128,6 +1146,48 @@ mod tests {
             Some(ReplicaHash::from("ob")),
             "and the diverging one preserved"
         );
+    }
+
+    #[test]
+    fn a_resolution_keeping_the_ancestor_moves_the_shared_body() {
+        // a source resolving its own conflict by keeping the body both
+        // sides forked from restates its sync base, so the incoming body
+        // alone says nothing: read as "this source changed nothing" the
+        // hub keeps the body the resolution discarded, and every source
+        // is handed a decision the user did not take
+        let mut hub = content_hub(ReplicaHubConflict::Manual);
+        let left = ReplicaSourceId::from("left");
+        hub.absorb(&left, &[edited_upsert("l1", "oa")]);
+
+        // the source's own sync found its remote diverged at r2
+        let ReplicaWriteOp::UpsertPlacement(mut conflicted) = edited_upsert("l1", "oa") else {
+            unreachable!()
+        };
+        conflicted.status = ReplicaStatus::Conflict;
+        conflicted.conflict_revision = Some("r2".into());
+        conflicted.conflict_object = Some(ReplicaHash::from("ox"));
+        hub.absorb(&left, &[ReplicaWriteOp::UpsertPlacement(conflicted)]);
+
+        // resolved by keeping "o0", the ancestor: the base adopts the
+        // remote state it was merged against, as `mutate` leaves it
+        let ReplicaWriteOp::UpsertPlacement(mut resolved) = content_upsert("l1", "o0") else {
+            unreachable!()
+        };
+        resolved.status = ReplicaStatus::Dirty;
+        resolved.base = Some(ReplicaBase {
+            flags: ReplicaFlags::default(),
+            revision: Some("r2".into()),
+            object: Some(ReplicaHash::from("ox")),
+        });
+        hub.absorb(&left, &[ReplicaWriteOp::UpsertPlacement(resolved)]);
+
+        let item = hub.items.get(&ReplicaLinkId::from("m1")).unwrap();
+        assert_eq!(
+            item.object,
+            Some(ReplicaHash::from("o0")),
+            "the shared body is the one the resolution kept",
+        );
+        assert!(!item.conflicted);
     }
 
     #[test]

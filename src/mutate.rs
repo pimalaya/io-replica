@@ -2,8 +2,9 @@
 //!
 //! Loads the target placement, applies the change in memory, marks it
 //! dirty or tombstone, and writes it back. The base is left untouched so
-//! the next sync derives the pending push; reconciliation is
-//! [`crate::sync`]'s job.
+//! the next sync derives the pending push, the one exception being a
+//! resolution, which rebases it onto the remote state it settled;
+//! reconciliation is [`crate::sync`]'s job.
 
 use alloc::{string::String, vec, vec::Vec};
 
@@ -16,8 +17,8 @@ use crate::{
     coroutine::*,
     object::ReplicaObject,
     placement::{
-        ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta, ReplicaOrigin,
-        ReplicaPlacement, ReplicaSortKey, ReplicaStatus,
+        ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta,
+        ReplicaOrigin, ReplicaPlacement, ReplicaSortKey, ReplicaStatus,
     },
     storage::ReplicaLoadScope,
 };
@@ -42,10 +43,14 @@ pub enum ReplicaMutation {
     /// Replace a placement's body with locally edited content: the new
     /// object is stored and the placement repointed at it and marked
     /// dirty, its base keeping the previously synced body so the next
-    /// sync derives the push. Editing a conflicted placement resolves
-    /// it: the remote revision observed at conflict time becomes the new
-    /// base revision, conditioning the resolving push on the remote
-    /// state it was merged against.
+    /// sync derives the push.
+    ///
+    /// Editing a conflicted placement resolves it, and the base becomes
+    /// the remote state the resolution was merged against: the revision
+    /// observed at conflict time and the body recorded beside it. The
+    /// resolving push is thus conditioned on that revision, and measured
+    /// against that body, so keeping the ancestor of the divergence is a
+    /// decision the remote hears like any other.
     Edit {
         /// The placement to update.
         handle: ReplicaHandle,
@@ -214,18 +219,38 @@ impl ReplicaMutate {
                     source.sort_key = sort_key.clone();
                 }
 
-                // NOTE: editing a conflict is its resolution: the base
-                // adopts the remote revision the resolution was merged
-                // against.
-                if source.status == ReplicaStatus::Conflict {
+                // NOTE: editing a conflict is its resolution, and the
+                // base becomes the remote state it was merged against,
+                // both halves of it. Adopting the revision alone leaves
+                // the pair contradicting itself, the base claiming a
+                // revision its object was never the content of, and the
+                // sync compares against the object: a resolution keeping
+                // the ancestor would read as nothing to push. A conflict
+                // with no base is given one, its own resolution being
+                // where the two sides first agree.
+                let resolving = source.status == ReplicaStatus::Conflict;
+                if resolving {
                     let revision = source.conflict_revision.take();
-                    source.conflict_object = None;
-                    if let (Some(base), Some(revision)) = (source.base.as_mut(), revision) {
-                        base.revision = Some(revision);
-                    }
+                    let settled = source.conflict_object.take();
+                    let base = source.base.get_or_insert_with(|| ReplicaBase {
+                        flags: source.flags.clone(),
+                        revision: None,
+                        object: None,
+                    });
+                    base.revision = revision;
+                    base.object = settled;
                 }
 
-                if source.status != ReplicaStatus::Created {
+                // NOTE: an edit restating the synced body stages nothing,
+                // so it leaves the status where it found it: a placement
+                // whose `staged_edit` reads `None` must not claim a
+                // pending content push. A resolution is dirty either
+                // way, the divergence it settles being the change.
+                let staged = source
+                    .base
+                    .as_ref()
+                    .is_none_or(|base| base.object.as_ref() != Some(&object.hash));
+                if source.status != ReplicaStatus::Created && (staged || resolving) {
                     source.status = ReplicaStatus::Dirty;
                 }
 
@@ -767,6 +792,176 @@ mod tests {
         assert_eq!(p.object, Some(ReplicaHash::from("h2")));
         assert_eq!(p.level, ReplicaLevel::Full);
         assert!(p.base.is_some(), "base must be preserved for sync");
+    }
+
+    #[test]
+    fn an_edit_restating_the_synced_body_stages_nothing() {
+        // the placement already points at that body, so there is no push
+        // to pend: a dirty here would be one `staged_edit` reads as
+        // absent, and the status is the only thing left saying otherwise
+        use crate::object::{ReplicaHash, ReplicaObject};
+
+        let mutation = ReplicaMutation::Edit {
+            sort_key: Default::default(),
+            handle: ReplicaHandle::from("1"),
+            object: ReplicaObject {
+                hash: ReplicaHash::from("h1"),
+                size: 4,
+            },
+            body: b"body".to_vec(),
+            meta: None,
+        };
+        let mut mutate = ReplicaMutate::new("inbox", mutation);
+        let _ = mutate.resume(None);
+
+        let mut loaded = loaded("1");
+        loaded.placements[0].object = Some(ReplicaHash::from("h1"));
+        loaded.placements[0].level = ReplicaLevel::Full;
+        loaded.placements[0].base.as_mut().expect("a base").object = Some(ReplicaHash::from("h1"));
+
+        let ops = match mutate.resume(Some(ReplicaArg::Load(loaded))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+        let ReplicaWriteOp::UpsertPlacement(p) = &ops[1] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[1]);
+        };
+        assert_eq!(p.status, ReplicaStatus::Clean);
+        assert_eq!(p.staged_edit(), None, "the status agrees with the reading");
+    }
+
+    #[test]
+    fn resolving_a_conflict_with_the_base_body_still_pushes() {
+        // discarding both diverging bodies for the shared ancestor is a
+        // decision the remote has to hear, so the resolution is dirty
+        // even though it restates the base
+        use crate::object::{ReplicaHash, ReplicaObject};
+
+        let mutation = ReplicaMutation::Edit {
+            sort_key: Default::default(),
+            handle: ReplicaHandle::from("1"),
+            object: ReplicaObject {
+                hash: ReplicaHash::from("h1"),
+                size: 4,
+            },
+            body: b"body".to_vec(),
+            meta: None,
+        };
+        let mut mutate = ReplicaMutate::new("inbox", mutation);
+        let _ = mutate.resume(None);
+
+        let mut loaded = loaded("1");
+        loaded.placements[0].status = ReplicaStatus::Conflict;
+        loaded.placements[0].object = Some(ReplicaHash::from("h2"));
+        loaded.placements[0].level = ReplicaLevel::Full;
+        loaded.placements[0].conflict_revision = Some("r2".into());
+        loaded.placements[0].conflict_object = Some(ReplicaHash::from("h-remote"));
+        loaded.placements[0].base.as_mut().expect("a base").object = Some(ReplicaHash::from("h1"));
+
+        let ops = match mutate.resume(Some(ReplicaArg::Load(loaded))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+        let ReplicaWriteOp::UpsertPlacement(p) = &ops[1] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[1]);
+        };
+        assert_eq!(p.status, ReplicaStatus::Dirty);
+        assert_eq!(p.conflict_revision, None);
+        assert_eq!(p.conflict_object, None);
+    }
+
+    #[test]
+    fn a_resolution_adopts_the_whole_remote_state_into_the_base() {
+        // the base a resolution leaves is the remote state it was merged
+        // against: half of it, the revision without the body, claims a
+        // revision the base object was never the content of, and the
+        // next sync then reads a resolution keeping the ancestor as
+        // nothing to push
+        use crate::object::{ReplicaHash, ReplicaObject};
+
+        let mutation = ReplicaMutation::Edit {
+            sort_key: Default::default(),
+            handle: ReplicaHandle::from("1"),
+            object: ReplicaObject {
+                hash: ReplicaHash::from("h-base"),
+                size: 4,
+            },
+            body: b"base".to_vec(),
+            meta: None,
+        };
+        let mut mutate = ReplicaMutate::new("inbox", mutation);
+        let _ = mutate.resume(None);
+
+        let mut loaded = loaded("1");
+        loaded.placements[0].status = ReplicaStatus::Conflict;
+        loaded.placements[0].object = Some(ReplicaHash::from("h-local"));
+        loaded.placements[0].level = ReplicaLevel::Full;
+        loaded.placements[0].conflict_revision = Some("r2".into());
+        loaded.placements[0].conflict_object = Some(ReplicaHash::from("h-remote"));
+        let base = loaded.placements[0].base.as_mut().expect("a base");
+        base.revision = Some("r1".into());
+        base.object = Some(ReplicaHash::from("h-base"));
+
+        let ops = match mutate.resume(Some(ReplicaArg::Load(loaded))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+        let ReplicaWriteOp::UpsertPlacement(p) = &ops[1] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[1]);
+        };
+        let base = p.base.as_ref().expect("a base");
+        assert_eq!(base.revision.as_deref(), Some("r2"));
+        assert_eq!(
+            base.object,
+            Some(ReplicaHash::from("h-remote")),
+            "the base object is the body the adopted revision names",
+        );
+        assert_eq!(
+            p.staged_edit(),
+            Some(&ReplicaHash::from("h-base")),
+            "so the ancestor the resolution kept is a body to push",
+        );
+    }
+
+    #[test]
+    fn a_resolution_gives_a_base_less_conflict_a_base() {
+        // a create-collision conflicts with no ancestor to merge
+        // against, and a resolution leaving it base-less is re-marked
+        // conflicted by every sync after, its body never pushed
+        use crate::object::{ReplicaHash, ReplicaObject};
+
+        let mutation = ReplicaMutation::Edit {
+            sort_key: Default::default(),
+            handle: ReplicaHandle::from("1"),
+            object: ReplicaObject {
+                hash: ReplicaHash::from("h-merged"),
+                size: 6,
+            },
+            body: b"merged".to_vec(),
+            meta: None,
+        };
+        let mut mutate = ReplicaMutate::new("inbox", mutation);
+        let _ = mutate.resume(None);
+
+        let mut loaded = loaded("1");
+        loaded.placements[0].status = ReplicaStatus::Conflict;
+        loaded.placements[0].object = Some(ReplicaHash::from("h-local"));
+        loaded.placements[0].level = ReplicaLevel::Full;
+        loaded.placements[0].conflict_revision = Some("r2".into());
+        loaded.placements[0].conflict_object = Some(ReplicaHash::from("h-remote"));
+        loaded.placements[0].base = None;
+
+        let ops = match mutate.resume(Some(ReplicaArg::Load(loaded))) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+        let ReplicaWriteOp::UpsertPlacement(p) = &ops[1] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[1]);
+        };
+        let base = p.base.as_ref().expect("the resolution establishes a base");
+        assert_eq!(base.revision.as_deref(), Some("r2"));
+        assert_eq!(base.object, Some(ReplicaHash::from("h-remote")));
+        assert_eq!(base.flags, p.flags, "nothing else is known of it");
     }
 
     #[test]

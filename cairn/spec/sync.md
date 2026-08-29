@@ -237,7 +237,7 @@ A source bound to a hub SHALL be given `Keep`. Reverting states that this source
 - THEN both follow the same policy: reverted by default, held under `Keep`
 
 ### Requirement: A conflict keeps the body it diverged from
-A placement marked conflicted SHALL carry `conflict_object`, the remote body at the revision `conflict_revision` names, so the divergence can be read without asking the remote for it. Both SHALL be set together, cleared together on resolution, and dropped together when the tracked revision moves: a body that outlives the revision recorded beside it describes a version the server no longer holds, and a resolver trusting it would merge against a phantom.
+A placement marked conflicted SHALL carry `conflict_object`, the remote body at the revision `conflict_revision` names, so the divergence can be read without asking the remote for it. Both SHALL be set together, taken together into the base when an edit resolves the conflict (see [mutate](mutate.md)), and dropped together when the tracked revision moves: a body that outlives the revision recorded beside it describes a version the server no longer holds, and a resolver trusting it would merge against a phantom.
 
 The engine fetches nothing, so the body is requested rather than taken: marking a conflict marks the body wanted and the [upgrade](upgrade.md) pass supplies it. A conflict whose body has not yet landed is visible and unresolvable, as a probed placement holding no body is visible and unreadable.
 

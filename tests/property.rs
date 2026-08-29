@@ -186,6 +186,9 @@ proptest! {
         let mut client = ReplicaClient::new(MemStorage::default(), MemRemote::default());
         client.remote_mut().seed("inbox", "m1", "l1", &[], b"one");
         client.remote_mut().seed("inbox", "m2", "l2", &["seen"], b"two");
+        client.remote_mut().seed("inbox", "m3", "l3", &["flagged"], b"three");
+        client.remote_mut().seed("inbox", "m4", "l4", &["seen", "draft"], b"four");
+        client.remote_mut().seed("inbox", "m5", "l5", &[], b"five");
         let opts = ReplicaSyncOptions::default();
         client.sync("inbox", opts).unwrap();
 
@@ -354,21 +357,29 @@ enum MutOp {
     SyncArchive,
 }
 
+/// Weighted, not flat: a content conflict needs a local and a remote
+/// edit on the same handle with no sync between them, and at one
+/// thirteenth of the vocabulary each that state was generated in 4% of
+/// cases. The edits carry four times the weight of the ops that void a
+/// pending divergence, and `Upgrade` three, that being what asks for a
+/// conflicted item's diverging body. `Sync` stays low: a sync between
+/// the two edits reconciles one side alone and destroys the divergence,
+/// and the terminal quiescence already supplies the observing sync.
 fn arb_mut_op() -> impl Strategy<Value = MutOp> {
     prop_oneof![
-        (any::<usize>(), arb_flags()).prop_map(|(i, f)| MutOp::LocalSetFlags(i, f)),
-        any::<usize>().prop_map(MutOp::LocalRemove),
-        (any::<usize>(), any::<u8>()).prop_map(|(i, n)| MutOp::LocalEdit(i, n)),
-        any::<usize>().prop_map(MutOp::LocalCopy),
-        any::<usize>().prop_map(MutOp::LocalMove),
-        (any::<usize>(), arb_flags()).prop_map(|(i, f)| MutOp::ServerSetFlags(i, f)),
-        any::<usize>().prop_map(MutOp::ServerRemove),
-        (any::<usize>(), any::<u8>()).prop_map(|(i, n)| MutOp::ServerEdit(i, n)),
-        any::<u8>().prop_map(MutOp::ServerAdd),
-        any::<usize>().prop_map(MutOp::Upgrade),
-        Just(MutOp::Bump),
-        Just(MutOp::Sync),
-        Just(MutOp::SyncArchive),
+        1 => (any::<usize>(), arb_flags()).prop_map(|(i, f)| MutOp::LocalSetFlags(i, f)),
+        1 => any::<usize>().prop_map(MutOp::LocalRemove),
+        4 => (any::<usize>(), any::<u8>()).prop_map(|(i, n)| MutOp::LocalEdit(i, n)),
+        1 => any::<usize>().prop_map(MutOp::LocalCopy),
+        1 => any::<usize>().prop_map(MutOp::LocalMove),
+        1 => (any::<usize>(), arb_flags()).prop_map(|(i, f)| MutOp::ServerSetFlags(i, f)),
+        1 => any::<usize>().prop_map(MutOp::ServerRemove),
+        4 => (any::<usize>(), any::<u8>()).prop_map(|(i, n)| MutOp::ServerEdit(i, n)),
+        1 => any::<u8>().prop_map(MutOp::ServerAdd),
+        3 => any::<usize>().prop_map(MutOp::Upgrade),
+        1 => Just(MutOp::Bump),
+        2 => Just(MutOp::Sync),
+        1 => Just(MutOp::SyncArchive),
     ]
 }
 
@@ -445,6 +456,70 @@ fn held_object(client: &ModelClient, handle: &ReplicaHandle) -> Option<ReplicaHa
         .and_then(|p| p.object.clone())
 }
 
+/// The body a resolution keeps, one of the four answers a three-way
+/// merge UI offers: the local body, the ancestor, the remote body, or a
+/// merge of the resolver's own.
+///
+/// Picked from the handle rather than generated, so a case replays the
+/// same way and the strategy keeps its shape. Only the fourth used to be
+/// exercised, and it is the one that hides the interesting cases: the
+/// other three restate a body the store already holds, and a resolution
+/// restating the ancestor is exactly the one whose push nobody derived.
+/// A body the store does not hold (a conflict whose diverging body never
+/// landed) falls back to the merge.
+fn resolution_body(client: &ModelClient, handle: &ReplicaHandle) -> (ReplicaObject, Vec<u8>) {
+    let placement = client
+        .storage()
+        .inner
+        .placements
+        .get(&("inbox".into(), handle.clone()));
+    let stored = |hash: Option<ReplicaHash>| {
+        client
+            .storage()
+            .inner
+            .objects
+            .get(&hash?)
+            .filter(|(_, body)| !body.is_empty())
+            .cloned()
+    };
+
+    let choice = handle
+        .as_str()
+        .bytes()
+        .fold(0u8, |acc, byte| acc.wrapping_add(byte));
+    let kept = match choice % 4 {
+        0 => stored(placement.and_then(|p| p.object.clone())),
+        1 => stored(
+            placement
+                .and_then(|p| p.base.as_ref())
+                .and_then(|base| base.object.clone()),
+        ),
+        2 => stored(placement.and_then(|p| p.conflict_object.clone())),
+        _ => None,
+    };
+
+    kept.unwrap_or_else(|| {
+        let body = format!("resolved-{}", handle.as_str()).into_bytes();
+        let object = ReplicaObject {
+            hash: hash(&body),
+            size: body.len(),
+        };
+        (object, body)
+    })
+}
+
+/// The body an inbox placement pends for a push, read exactly as the
+/// engine reads it: an edit restating the body the base already holds
+/// stages nothing, so it is no intent to account for.
+fn pending_edit(client: &ModelClient, handle: &ReplicaHandle) -> Option<ReplicaHash> {
+    client
+        .storage()
+        .inner
+        .placements
+        .get(&("inbox".into(), handle.clone()))
+        .and_then(|p| p.staged_edit().cloned())
+}
+
 /// Voids the edit intents whose content a server-side change destroyed: a
 /// landed edit dies with the content it landed as, matched by body since
 /// a resurrect may have re-keyed the handle, unless a local placement
@@ -487,8 +562,14 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
     };
     let mut remote = MemRemote::default();
     remote.mutable = true;
+    // five members, not two: with two, a delete and a move empty the
+    // live set for the rest of the sequence and a fifth of every
+    // generated op finds nothing to act on
     remote.seed("inbox", "m1", "l1", &[], b"one");
     remote.seed("inbox", "m2", "l2", &["seen"], b"two");
+    remote.seed("inbox", "m3", "l3", &["flagged"], b"three");
+    remote.seed("inbox", "m4", "l4", &["seen", "draft"], b"four");
+    remote.seed("inbox", "m5", "l5", &[], b"five");
 
     let mut client = ReplicaClient::new(storage, remote);
     let opts = ReplicaSyncOptions::default();
@@ -587,7 +668,13 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
                             ledger.edits.retain(|_, staged| staged != &held);
                         }
                         void_superseded_edits(&mut ledger, &client, &server_body);
-                        ledger.edits.insert(handle, hash(&body));
+                        // an edit restating the body the placement
+                        // already synced stages nothing, so it claims
+                        // nothing: there is no content to push, and the
+                        // supersession above still stands
+                        if pending_edit(&client, &handle) == Some(hash(&body)) {
+                            ledger.edits.insert(handle, hash(&body));
+                        }
                     }
                 }
             }
@@ -802,21 +889,30 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
             break;
         }
         prop_assert!(round < 2, "conflict resolution must terminate");
+
+        // what a real resolver does first: ask for the diverging remote
+        // body, which the engine only fetches when a conflict is
+        // upgraded, so `conflict_object` is populated for the resolution
+        let _ = client.upgrade("inbox", conflicted.clone(), ReplicaTier::Full);
         for handle in conflicted {
             let held = held_object(&client, &handle);
             let server_body = server_body(&client, &handle);
-            let body = format!("resolved-{}", handle.as_str()).into_bytes();
-            let object = ReplicaObject {
-                hash: hash(&body),
-                size: body.len(),
-            };
+            let (object, body) = resolution_body(&client, &handle);
             // the resolution supersedes the conflicted edit it overwrites,
             // pending or landed
             if let Some(held) = held {
                 ledger.edits.retain(|_, staged| staged != &held);
             }
             void_superseded_edits(&mut ledger, &client, &server_body);
-            ledger.edits.insert(handle.clone(), hash(&body));
+            // a resolution claims its body whatever the placement is
+            // left holding: the decision is only taken once the remote
+            // hears it. The one exception is the resolution that adopts
+            // the remote body, which the remote holds already, and whose
+            // intent is satisfied by the run doing nothing.
+            let owed = server_body != body;
+            if owed {
+                ledger.edits.insert(handle.clone(), hash(&body));
+            }
             client
                 .mutate(
                     "inbox",
@@ -1001,10 +1097,54 @@ proptest! {
     #[test]
     fn a_crashed_write_never_loses_data(
         ops in proptest::collection::vec(arb_mut_op(), 0..20),
-        crash_after in 0usize..12,
+        // NOTE: write batches, not ops, and most ops write none: a
+        // budget of 0..12 was spent by the terminal drain rather than by
+        // the sequence in half the cases, which crashes after the last
+        // user intent instead of in the middle of one.
+        crash_after in 0usize..6,
     ) {
         check_mutable_model(ops, Some(crash_after))?;
     }
+}
+
+/// A local edit re-asserting the body the replica already synced is not
+/// a content edit: it stages nothing, so the model must not claim an
+/// intent for it and the placement must not read as a pending push.
+/// Delta-debugged from a generated failure of the mutable model.
+#[test]
+fn a_content_identical_edit_claims_nothing() {
+    check_mutable_model(
+        vec![
+            MutOp::LocalEdit(1338203356464132091, 125),
+            MutOp::Sync,
+            MutOp::LocalRemove(1892733528096728582),
+            MutOp::ServerRemove(1245933664089759521),
+            MutOp::LocalEdit(11104427113558993974, 125),
+        ],
+        None,
+    )
+    .unwrap();
+}
+
+/// A conflict resolved by keeping the body both sides forked from is a
+/// decision like any other: it has to reach the remote, which holds its
+/// own diverging body and would otherwise stay ahead of a replica that
+/// reports itself in sync. Delta-debugged from a generated failure of
+/// the mutable model, whose resolver reaches the ancestor.
+#[test]
+fn a_resolution_keeping_the_ancestor_reaches_the_remote() {
+    check_mutable_model(
+        vec![
+            MutOp::Upgrade(14210287063717275722),
+            MutOp::LocalEdit(8823440174339698637, 0),
+            MutOp::ServerRemove(2473669229220409580),
+            MutOp::LocalSetFlags(0, ReplicaFlags::from_iter(Vec::<String>::new())),
+            MutOp::Bump,
+            MutOp::ServerEdit(4132879379286324521, 0),
+        ],
+        None,
+    )
+    .unwrap();
 }
 
 /// A fake remote shared by two replicas, like one server behind two
@@ -1078,6 +1218,9 @@ proptest! {
         server.mutable = true;
         server.seed("inbox", "m1", "l1", &[], b"one");
         server.seed("inbox", "m2", "l2", &["seen"], b"two");
+        server.seed("inbox", "m3", "l3", &["flagged"], b"three");
+        server.seed("inbox", "m4", "l4", &["seen", "draft"], b"four");
+        server.seed("inbox", "m5", "l5", &[], b"five");
         let server = Rc::new(RefCell::new(server));
 
         let full_opts = ReplicaSyncOptions {
@@ -1284,6 +1427,9 @@ proptest! {
         server.mutable = true;
         server.seed("inbox", "m1", "l1", &[], b"one");
         server.seed("inbox", "m2", "l2", &["seen"], b"two");
+        server.seed("inbox", "m3", "l3", &["flagged"], b"three");
+        server.seed("inbox", "m4", "l4", &["seen", "draft"], b"four");
+        server.seed("inbox", "m5", "l5", &[], b"five");
         let server = Rc::new(RefCell::new(server));
 
         let opts = ReplicaSyncOptions::default();

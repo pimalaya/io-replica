@@ -8,14 +8,17 @@
 //! tracking, so incremental sync paths run end to end.
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
+    rc::Rc,
 };
 
 use io_replica::{
     change::{ReplicaChange, ReplicaChangeKind, ReplicaWriteOp},
     client::{ReplicaRemote, ReplicaStorage},
     collection::{ReplicaCheckpoint, ReplicaCollectionId},
+    hub::{ReplicaHub, ReplicaSourceId},
     object::{ReplicaHash, ReplicaObject},
     placement::{ReplicaFlags, ReplicaHandle, ReplicaLinkId, ReplicaMeta, ReplicaPlacement},
     remote::{
@@ -624,5 +627,114 @@ fn rejected(handle: ReplicaHandle) -> ReplicaPushResult {
         outcome: ReplicaPushOutcome::Rejected,
         assigned: None,
         revision: None,
+    }
+}
+
+/// The shared store behind every source: one hub, one object store, and a
+/// checkpoint per source.
+///
+/// The hub keys items by link id and `absorb` drops a placement with
+/// none, which every row a sync pulls is: an enumeration yields handles,
+/// and the link id lands on the first meta fetch. A hub-backed store has
+/// to hold those rows itself until they are hubbed, which is what
+/// `residual` and io-pimdir's residual list are.
+#[derive(Default)]
+pub struct HubStore {
+    pub hub: ReplicaHub,
+    /// Rows no link id has hubbed yet, keyed per source.
+    pub residual: BTreeMap<(ReplicaSourceId, ReplicaHandle), ReplicaPlacement>,
+    pub objects: BTreeMap<ReplicaHash, (ReplicaObject, Vec<u8>)>,
+    pub checkpoints: BTreeMap<(ReplicaSourceId, ReplicaCollectionId), ReplicaCheckpoint>,
+}
+
+/// One source's view of the shared store, which is what the engine syncs
+/// against: a load projects the hub for this source, a write absorbs
+/// back into it.
+pub struct SourceStore {
+    pub source: ReplicaSourceId,
+    pub shared: Rc<RefCell<HubStore>>,
+}
+
+impl ReplicaStorage for SourceStore {
+    type Error = Infallible;
+
+    fn load(
+        &self,
+        collection: &ReplicaCollectionId,
+        _scope: &ReplicaLoadScope,
+    ) -> Result<ReplicaLoaded, Infallible> {
+        let shared = self.shared.borrow();
+        let mut placements = shared.hub.project(collection, &self.source);
+        placements.extend(
+            shared
+                .residual
+                .iter()
+                .filter(|((source, _), p)| source == &self.source && &p.collection == collection)
+                .map(|(_, p)| p.clone()),
+        );
+        let checkpoint = shared
+            .checkpoints
+            .get(&(self.source.clone(), collection.clone()))
+            .cloned();
+
+        Ok(ReplicaLoaded {
+            placements,
+            checkpoint,
+        })
+    }
+
+    fn lookup_objects(
+        &self,
+        links: &[ReplicaLinkId],
+    ) -> Result<BTreeMap<ReplicaLinkId, ReplicaHash>, Infallible> {
+        let shared = self.shared.borrow();
+        let known = links
+            .iter()
+            .filter_map(|link| {
+                let item = shared.hub.items.get(link)?;
+                Some((link.clone(), item.object.clone()?))
+            })
+            .collect();
+
+        Ok(known)
+    }
+
+    fn write(&mut self, ops: Vec<ReplicaWriteOp>) -> Result<(), Infallible> {
+        let mut shared = self.shared.borrow_mut();
+
+        for op in &ops {
+            match op {
+                ReplicaWriteOp::StoreObject { object, body } => {
+                    shared.objects.insert(
+                        object.hash.clone(),
+                        (object.clone(), body.clone().unwrap_or_default()),
+                    );
+                }
+                ReplicaWriteOp::SetCheckpoint {
+                    collection,
+                    checkpoint,
+                } => {
+                    let key = (self.source.clone(), collection.clone());
+                    shared.checkpoints.insert(key, checkpoint.clone());
+                }
+                // NOTE: a row the hub cannot key is held here until a
+                // link id hubs it; one it can is the hub's.
+                ReplicaWriteOp::UpsertPlacement(placement) => {
+                    let key = (self.source.clone(), placement.handle.clone());
+                    match placement.link_id.is_some() {
+                        true => shared.residual.remove(&key),
+                        false => shared.residual.insert(key, placement.clone()),
+                    };
+                }
+                ReplicaWriteOp::DropPlacement { handle, .. } => {
+                    let key = (self.source.clone(), handle.clone());
+                    shared.residual.remove(&key);
+                }
+            }
+        }
+
+        let source = self.source.clone();
+        shared.hub.absorb(&source, &ops);
+        Ok(())
     }
 }

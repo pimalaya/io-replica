@@ -258,9 +258,9 @@ pub struct ReplicaPlacement {
     /// a resolver holding the base, the local body and this one needs
     /// no credentials, no backend and no network.
     ///
-    /// It shares the lifetime of `conflict_revision`, set with it,
-    /// cleared with it on resolution, and dropped with it whenever a
-    /// later sync observes a newer revision, a body outliving the
+    /// It shares the lifetime of `conflict_revision`, set with it, taken
+    /// with it into the base on resolution, and dropped with it whenever
+    /// a later sync observes a newer revision, a body outliving the
     /// revision recorded beside it describing a version the remote no
     /// longer holds. The engine fetches nothing, so marking the conflict
     /// only marks the body wanted and the upgrade pass supplies it: a

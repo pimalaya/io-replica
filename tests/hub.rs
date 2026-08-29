@@ -14,131 +14,19 @@
 #[allow(dead_code)]
 mod common;
 
-use std::{cell::RefCell, collections::BTreeMap, convert::Infallible, rc::Rc};
+use std::{cell::RefCell, rc::Rc};
 
 use io_replica::{
-    change::ReplicaWriteOp,
-    client::{ReplicaClient, ReplicaStorage},
-    collection::{ReplicaCheckpoint, ReplicaCollectionId},
-    hub::{ReplicaHub, ReplicaSourceId},
+    client::ReplicaClient,
+    hub::ReplicaSourceId,
     mutate::ReplicaMutation,
     object::{ReplicaHash, ReplicaObject},
-    placement::{ReplicaHandle, ReplicaLinkId, ReplicaPlacement, ReplicaStatus},
+    placement::{ReplicaHandle, ReplicaLinkId, ReplicaStatus},
     remote::ReplicaTier,
-    storage::{ReplicaLoadScope, ReplicaLoaded},
     sync::{ReplicaDeletePolicy, ReplicaPushRights, ReplicaSyncOptions},
 };
 
-use crate::common::{MemRemote, MemStorage, hash};
-
-/// The shared store behind every source: one hub, one object store, and a
-/// checkpoint per source.
-///
-/// The hub keys items by link id and `absorb` drops a placement with
-/// none, which every row a sync pulls is: an enumeration yields handles,
-/// and the link id lands on the first meta fetch. A hub-backed store has
-/// to hold those rows itself until they are hubbed, which is what
-/// `residual` and io-pimdir's residual list are.
-#[derive(Default)]
-struct HubStore {
-    hub: ReplicaHub,
-    /// Rows no link id has hubbed yet, keyed per source.
-    residual: BTreeMap<(ReplicaSourceId, ReplicaHandle), ReplicaPlacement>,
-    objects: BTreeMap<ReplicaHash, (ReplicaObject, Vec<u8>)>,
-    checkpoints: BTreeMap<(ReplicaSourceId, ReplicaCollectionId), ReplicaCheckpoint>,
-}
-
-/// One source's view of the shared store, which is what the engine syncs
-/// against: a load projects the hub for this source, a write absorbs
-/// back into it.
-struct SourceStore {
-    source: ReplicaSourceId,
-    shared: Rc<RefCell<HubStore>>,
-}
-
-impl ReplicaStorage for SourceStore {
-    type Error = Infallible;
-
-    fn load(
-        &self,
-        collection: &ReplicaCollectionId,
-        _scope: &ReplicaLoadScope,
-    ) -> Result<ReplicaLoaded, Infallible> {
-        let shared = self.shared.borrow();
-        let mut placements = shared.hub.project(collection, &self.source);
-        placements.extend(
-            shared
-                .residual
-                .iter()
-                .filter(|((source, _), p)| source == &self.source && &p.collection == collection)
-                .map(|(_, p)| p.clone()),
-        );
-        let checkpoint = shared
-            .checkpoints
-            .get(&(self.source.clone(), collection.clone()))
-            .cloned();
-
-        Ok(ReplicaLoaded {
-            placements,
-            checkpoint,
-        })
-    }
-
-    fn lookup_objects(
-        &self,
-        links: &[ReplicaLinkId],
-    ) -> Result<BTreeMap<ReplicaLinkId, ReplicaHash>, Infallible> {
-        let shared = self.shared.borrow();
-        let known = links
-            .iter()
-            .filter_map(|link| {
-                let item = shared.hub.items.get(link)?;
-                Some((link.clone(), item.object.clone()?))
-            })
-            .collect();
-
-        Ok(known)
-    }
-
-    fn write(&mut self, ops: Vec<ReplicaWriteOp>) -> Result<(), Infallible> {
-        let mut shared = self.shared.borrow_mut();
-
-        for op in &ops {
-            match op {
-                ReplicaWriteOp::StoreObject { object, body } => {
-                    shared.objects.insert(
-                        object.hash.clone(),
-                        (object.clone(), body.clone().unwrap_or_default()),
-                    );
-                }
-                ReplicaWriteOp::SetCheckpoint {
-                    collection,
-                    checkpoint,
-                } => {
-                    let key = (self.source.clone(), collection.clone());
-                    shared.checkpoints.insert(key, checkpoint.clone());
-                }
-                // NOTE: a row the hub cannot key is held here until a
-                // link id hubs it; one it can is the hub's.
-                ReplicaWriteOp::UpsertPlacement(placement) => {
-                    let key = (self.source.clone(), placement.handle.clone());
-                    match placement.link_id.is_some() {
-                        true => shared.residual.remove(&key),
-                        false => shared.residual.insert(key, placement.clone()),
-                    };
-                }
-                ReplicaWriteOp::DropPlacement { handle, .. } => {
-                    let key = (self.source.clone(), handle.clone());
-                    shared.residual.remove(&key);
-                }
-            }
-        }
-
-        let source = self.source.clone();
-        shared.hub.absorb(&source, &ops);
-        Ok(())
-    }
-}
+use crate::common::{HubStore, MemRemote, MemStorage, SourceStore, hash};
 
 /// Two sources over one hub, each with its own server.
 struct Mirror {
@@ -715,4 +603,60 @@ fn a_resolving_edit_is_what_gets_pushed() {
             "and the merge is what every server ends up with",
         );
     }
+}
+
+/// A create persisted through the hub is still a create when it is read
+/// back, so the source that authored it pushes it.
+///
+/// The hub binds every live upsert and a bound placement used to read
+/// back as `Dirty` whatever it was written as, while the merge derives an
+/// add for a `Created` one alone. The item then reached every source that
+/// held no binding for it, being offered the create, and never the one it
+/// was authored on, whose store kept the placeholder handle for good.
+#[test]
+fn a_create_persisted_through_the_hub_still_reads_as_one() {
+    let mut mirror = Mirror::new();
+    let body = b"authored on a";
+    let object = ReplicaObject {
+        hash: hash(body),
+        size: body.len(),
+    };
+    mirror
+        .a
+        .mutate(
+            "inbox",
+            ReplicaMutation::Add {
+                handle: ReplicaHandle::from("tmp-1"),
+                link_id: ReplicaLinkId::from("msg-a"),
+                flags: Default::default(),
+                object,
+                body: body.to_vec(),
+                meta: None,
+                sort_key: Default::default(),
+            },
+        )
+        .unwrap();
+
+    let projected = mirror
+        .shared
+        .borrow()
+        .hub
+        .project(&"inbox".into(), &ReplicaSourceId::from("a"));
+    assert_eq!(projected.len(), 1, "the staged create is the only member");
+    assert_eq!(
+        projected[0].status,
+        ReplicaStatus::Created,
+        "a binding with no base has never reached its source: {:?}",
+        projected[0],
+    );
+
+    mirror.quiesce(ReplicaSyncOptions::default());
+
+    assert_eq!(
+        mirror.server('a').len(),
+        1,
+        "the source it was authored on holds it: {:?}",
+        mirror.server('a'),
+    );
+    assert_eq!(mirror.server('b').len(), 1, "and so does the other");
 }
