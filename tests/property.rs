@@ -388,7 +388,7 @@ struct Ledger {
     /// Staged copies: the placeholder and the source's server link.
     copies: Vec<(ReplicaHandle, Option<ReplicaLinkId>)>,
     /// Staged moves: the source handle, its server link, and whether a
-    /// later server action on the source voided the move.
+    /// later action on the source voided the move.
     moves: Vec<(ReplicaHandle, Option<ReplicaLinkId>, bool)>,
 }
 
@@ -546,6 +546,17 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
                         void_superseded_edits(&mut ledger, &client, &server_body);
                         ledger.edits.remove(&handle);
                         ledger.flags.remove(&handle);
+
+                        // a move tombstones its source, so a source
+                        // pickable again is one the engine resurrected
+                        // and the move is no longer owed: deleting it
+                        // where the resurrection left it is a strictly
+                        // later action on the same item
+                        for staged_move in &mut ledger.moves {
+                            if staged_move.0 == handle {
+                                staged_move.2 = true;
+                            }
+                        }
                     }
                 }
             }
@@ -935,9 +946,10 @@ fn check_mutable_model(ops: Vec<MutOp>, crash_after: Option<usize>) -> Result<()
     }
 
     // ledger: a move either landed in the archive or was overridden by an
-    // edit that beat the delete, leaving the item in the inbox. A move
-    // that merely never pushed cannot hide here: a surviving tombstone
-    // would fail the all-clean assertion above.
+    // edit that beat the delete, leaving the item in the inbox, unless a
+    // later delete of the resurrected source voided it. A move that
+    // merely never pushed cannot hide here: a surviving tombstone would
+    // fail the all-clean assertion above.
     for (handle, link, voided) in &ledger.moves {
         if *voided {
             continue;

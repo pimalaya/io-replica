@@ -123,6 +123,18 @@ An item whose link id is not resolved yet has no such key, so `ReplicaMutation::
 - WHEN it is moved
 - THEN only the source tombstone is staged, and the target holds exactly one member in either sync order
 
+### Requirement: A lost push record can abandon a move
+Where a move's staged edit rides ahead of its remove, a crash between the update being serviced and the write recording it SHALL leave the move abandoned rather than half-applied: the next run enumerates a revision the tombstone's base does not name, and an enumerate carries a revision and no body, so the replayed echo is indistinguishable from a remote edit. Edit-beats-delete SHALL then win, replacing the tombstone with a fresh pull, and the member SHALL stay in the source collection, live and clean at the pushed revision.
+
+This is the conservative reading and the only one available: the alternative is deleting content on the strength of a revision the replica cannot account for. Nothing is lost either way. The edit landed, the member is where it started, and the consumer is free to stage the move again.
+
+A move carrying no staged edit is unaffected. Its remove relocates the member, so a lost push record leaves the next enumerate listing nothing for the handle, and the tombstone is dropped as a delete both sides already agree on.
+
+#### Scenario: A crash between a move's edit and its record
+- GIVEN a member with a staged content edit, moved into a target
+- WHEN the update the move pushes ahead of its remove lands and the write recording it is lost
+- THEN the next run reads the revision as a remote edit, the tombstone is replaced by a fresh pull, and the member stays in the source collection
+
 ### Requirement: A read-only source reverts a local delete
 Where `ReplicaSyncOptions::push` is false a local delete can never propagate and the replica mirrors the source, so the merge SHALL revert the tombstone rather than apply it. Applying it and waiting for a later enumerate to re-add the member only works against a complete snapshot: an incremental enumerate never lists an untouched member again, so the dropped row would never come back, leaving the replica permanently short of an item the source still holds. Reverting also keeps whatever the placement had cached.
 
