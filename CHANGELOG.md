@@ -7,75 +7,159 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-31
+
 ### Added
 
-- `ReplicaLoadScope`, carried by `ReplicaYield::WantsLoad` and by `ReplicaStorage::load`: a mutation now reads the one placement it edits (an `Add`, the rows holding its link id) and an upgrade the handles it raises, instead of the whole collection. The scope is a floor rather than a ceiling, so a storage that ignores it stays correct.
-- `ReplicaDropReason`, carried by `ReplicaWriteOp::DropPlacement`: whether the item itself is gone, or only this row of it.
-- `ReplicaPlacement::staged_edit`, the single reading of "there is a local content edit here", replacing six hand-rolled predicates that disagreed about the status guard and about what a missing base means.
+- Added `ReplicaLoadScope`, carried by `ReplicaYield::WantsLoad` and by `ReplicaStorage::load`.
 
-- `coroutine::ReplicaArgError`, the one error a driver that breaks the coroutine contract gets, replacing the four per-verb enums that said it identically.
-- `ReplicaDeletePolicy` on `ReplicaSyncOptions`: what becomes of a local delete the source will not take, `Revert` (the default, mirroring the source) or `Keep` (holding the tombstone for a later run). One answer for both refusals, so `ReplicaPushRights::none()` and `push = false` finally agree on it.
-- `ReplicaSync::PUSH_CHUNK` and `ReplicaSync::WRITE_CHUNK`, the number of changes one push chunk holds and the number of writes one batch holds.
-- `ReplicaSourceBinding::shared_object`, the shared body a source last reconciled against, which is the base of the cross-source merge. A storage persisting the binding persists it too, and until it does the sync base stands in for it.
-- `ReplicaPlacement::conflict_object` and `ReplicaSourceBinding::conflict_object`, the remote body a `Manual` conflict diverged from, recorded beside the revision it names so a resolver reads base, local and remote from the store instead of fetching one of them. It is set and cleared with `conflict_revision`, and dropped in the same write that advances it. The engine fetches nothing: a conflicted placement holding none is the request, and the upgrade pass answers it.
+  A mutation now reads the one placement it edits (an `Add`, the rows holding its link id) and an upgrade the handles it raises, instead of the whole collection. The scope is a floor rather than a ceiling, so a storage that ignores it stays correct.
+
+- Added `ReplicaDropReason`, carried by `ReplicaWriteOp::DropPlacement`: whether the item itself is gone, or only this row of it.
+
+- Added `ReplicaPlacement::staged_edit`, the single reading of "there is a local content edit here".
+
+  It replaces six hand-rolled predicates that disagreed about the status guard and about what a missing base means.
+
+- Added `coroutine::ReplicaArgError`, the one error a driver breaking the coroutine contract gets.
+
+  It replaces the four per-verb enums that said it identically.
+
+- Added `ReplicaDeletePolicy` on `ReplicaSyncOptions`: what becomes of a local delete the source will not take.
+
+  `Revert` (the default) mirrors the source, `Keep` holds the tombstone for a later run. One answer for both refusals, so `ReplicaPushRights::none()` and `push = false` finally agree on it.
+
+- Added `ReplicaSync::PUSH_CHUNK` and `ReplicaSync::WRITE_CHUNK`, the number of changes one push chunk holds and the number of writes one batch holds.
+
+- Added `ReplicaSourceBinding::shared_object`, the shared body a source last reconciled against, which is the base of the cross-source merge.
+
+  A storage persisting the binding persists it too, and until it does the sync base stands in for it.
+
+- Added `ReplicaPlacement::conflict_object` and `ReplicaSourceBinding::conflict_object`, the remote body a `Manual` conflict diverged from.
+
+  Recorded beside the revision it names, so a resolver reads base, local and remote from the store instead of fetching one of them. It is set and cleared with `conflict_revision`, and dropped in the same write that advances it. The engine fetches nothing: a conflicted placement holding none is the request, and the upgrade pass answers it.
 
 ### Changed
 
-- `ReplicaChange::Remove` carries the `link_id` its destination would receive, so a consumer relocates a moved member only while the destination does not already hold it.
-- `ReplicaSyncReport::pushed` counts the changes a run derived and the remote accepted, rather than the results the consumer reported: a result naming an unknown handle, or one twice, no longer inflates it.
+- **BREAKING** Gave `ReplicaChange` an idempotency key.
 
-- **`ReplicaChange` carries an idempotency key.** It is now the `ReplicaChangeKind` it used to be (the four verbs, unchanged) plus the `ReplicaChangeKey` naming it, derived from the collection, the handle, the kind and the target state the change makes true. A consumer that records the keys it applied recognises a replay of any kind, where only an add could be recognised before, through its `link_id`. `ReplicaChange::new` is the only way to make one, so a change cannot exist without its key, and `ReplicaChange::handle` reaches the member any kind acts on.
+  It is now the `ReplicaChangeKind` it used to be (the four verbs, unchanged) plus the `ReplicaChangeKey` naming it, derived from the collection, the handle, the kind and the target state the change makes true. A consumer that records the keys it applied recognises a replay of any kind, where only an add could be recognised before, through its `link_id`. `ReplicaChange::new` is the only way to make one, so a change cannot exist without its key, and `ReplicaChange::handle` reaches the member any kind acts on.
 
-- **A sync pushes and records in chunks**, yielding a `WantsPush` and the `WantsWrite` recording it per chunk of `ReplicaSync::PUSH_CHUNK` changes, instead of one of each per run. A crash between a serviced push and its recording write used to replay every push the run derived; it now replays only the chunk whose write never landed, and a chunk that was never reached was never pushed. A driver that assumed one push and one write per run has to loop; `ReplicaClient` already does.
-- The checkpoint lands in the last write of a run rather than in the middle of the batch, and stays the pre-push one: an intermediate chunk's write must not carry a cursor claiming its unrecorded pushes were seen.
+- **BREAKING** Made a sync push and record in chunks, one `WantsPush` and the `WantsWrite` recording it per chunk of `ReplicaSync::PUSH_CHUNK` changes, instead of one of each per run.
 
-- **The merge joins the two sides instead of copying them.** It used to build a set union of the local and remote key spaces, cloning every handle, every remote item and every placement to produce a walk over two sides that were both ordered already; it now walks them together and takes each placement, copying one only where a write takes ownership. On 100k members that pass alone cost 83 ms before the merge looked at anything, against the 225 ms the whole merge takes.
-- **A merge hands its writes over in bounded batches** of `ReplicaSync::WRITE_CHUNK`, instead of holding one write per member until the last candidate is resolved. A batch is cut between candidates and never inside one, since the writes of a single candidate (a keep-both resolution stages a member beside the placement it forked from) are consistent only together. An interrupted merge now leaves its prefix applied where it used to leave nothing, which the unmoved checkpoint makes safe to resume.
-- `ReplicaRemoteSnapshot::items` is expected sorted by handle, each handle listed once. A snapshot that arrives unsorted is sorted and a repeated handle collapsed, so a consumer that gets it wrong pays a pass rather than correctness.
+  A crash between a serviced push and its recording write used to replay every push the run derived; it now replays only the chunk whose write never landed, and a chunk that was never reached was never pushed. A driver that assumed one push and one write per run has to loop; `ReplicaClient` already does.
 
-- `ReplicaLoadScope::Link` becomes `Links`, taking several: the reads that ask about an identity rather than a location have to see every row claiming it.
-- **No coroutine resumes once it has completed**, where only `ReplicaSync` refused before. The four others handed back a default output, which is exactly what a run that genuinely did nothing returns, so a driver with a loop bug was told it had succeeded.
-- `ReplicaMutateError` keeps its two real variants and composes the shared `ReplicaArgError` as `Arg`.
-- **A forbidden remove now reverts the tombstone rather than holding it**, following the new `ReplicaDeletePolicy` default. `delete: ReplicaDeletePolicy::Keep` restores the old behaviour, and now applies to a read-only source too, which never had it.
-- The hub projects its three placements (bound, tombstone, create) from one `ReplicaHubItem::project`, each settling only what the source binding decides. A field added to `ReplicaPlacement` is one edit rather than three, where forgetting one was a silently wrong projection rather than a compile error.
-- **A `Full` upgrade revisits a conflicted placement holding no `conflict_object`**, which the level rule alone skipped: it reads as `Full` and holds a body, just not the one it lacks. The fetched body lands on `conflict_object`, never on the placement's own object, and such a placement is fetched rather than linked from the object store, as a revision-carrying one already was.
+- Moved the checkpoint into the last write of a run rather than the middle of the batch, and kept it the pre-push one.
+
+  An intermediate chunk's write must not carry a cursor claiming its unrecorded pushes were seen.
+
+- Made the merge join the two sides instead of copying them.
+
+  It used to build a set union of the local and remote key spaces, cloning every handle, every remote item and every placement to produce a walk over two sides that were both ordered already; it now walks them together and takes each placement, copying one only where a write takes ownership. On 100k members that pass alone cost 83 ms before the merge looked at anything, against the 225 ms the whole merge takes.
+
+- Made a merge hand its writes over in bounded batches of `ReplicaSync::WRITE_CHUNK`, instead of holding one write per member until the last candidate is resolved.
+
+  A batch is cut between candidates and never inside one, since the writes of a single candidate (a keep-both resolution stages a member beside the placement it forked from) are consistent only together. An interrupted merge now leaves its prefix applied where it used to leave nothing, which the unmoved checkpoint makes safe to resume.
+
+- **BREAKING** Made `ReplicaChange::Remove` carry the `link_id` its destination would receive, so a consumer relocates a moved member only while the destination does not already hold it.
+
+- Expected `ReplicaRemoteSnapshot::items` sorted by handle, each handle listed once.
+
+  A snapshot that arrives unsorted is sorted and a repeated handle collapsed, so a consumer that gets it wrong pays a pass rather than correctness.
+
+- **BREAKING** Renamed `ReplicaLoadScope::Link` to `Links`, taking several.
+
+  The reads that ask about an identity rather than a location have to see every row claiming it.
+
+- **BREAKING** Stopped every coroutine from resuming once it has completed, where only `ReplicaSync` refused before.
+
+  The four others handed back a default output, which is exactly what a run that genuinely did nothing returns, so a driver with a loop bug was told it had succeeded.
+
+- **BREAKING** Reduced `ReplicaMutateError` to its two real variants plus the shared `ReplicaArgError`, composed as `Arg`.
+
+- **BREAKING** Made a forbidden remove revert the tombstone rather than hold it, following the new `ReplicaDeletePolicy` default.
+
+  `delete: ReplicaDeletePolicy::Keep` restores the old behaviour, and now applies to a read-only source too, which never had it.
+
+- Projected the hub's three placements (bound, tombstone, create) from one `ReplicaHubItem::project`, each settling only what the source binding decides.
+
+  A field added to `ReplicaPlacement` is one edit rather than three, where forgetting one was a silently wrong projection rather than a compile error.
+
+- Made a `Full` upgrade revisit a conflicted placement holding no `conflict_object`, which the level rule alone skipped.
+
+  It reads as `Full` and holds a body, just not the one it lacks. The fetched body lands on `conflict_object`, never on the placement's own object, and such a placement is fetched rather than linked from the object store, as a revision-carrying one already was.
+
+- Counted in `ReplicaSyncReport::pushed` the changes a run derived and the remote accepted, rather than the results the consumer reported.
+
+  A result naming an unknown handle, or one twice, no longer inflates it.
 
 ### Removed
 
-- `ReplicaCollection`, referenced nowhere. Its `enumerated` flag stated an invariant the engine models nowhere: spine completeness comes off the consumer's snapshot on every run.
-- `ReplicaOpenError`, `ReplicaUpgradeError`, `ReplicaRekeyError` and `ReplicaSyncError`, four byte-identical enums differing only in the verb their message named. `coroutine::ReplicaArgError` replaces them: a driver breaking the coroutine contract is one bug, and none of those four verbs can fail on its own terms.
+- **BREAKING** Removed `ReplicaCollection`, referenced nowhere.
+
+  Its `enumerated` flag stated an invariant the engine models nowhere: spine completeness comes off the consumer's snapshot on every run.
+
+- **BREAKING** Removed `ReplicaOpenError`, `ReplicaUpgradeError`, `ReplicaRekeyError` and `ReplicaSyncError`, four byte-identical enums differing only in the verb their message named.
+
+  `coroutine::ReplicaArgError` replaces them: a driver breaking the coroutine contract is one bug, and none of those four verbs can fail on its own terms.
 
 ### Fixed
 
-- **A create the hub had bound never reached the source it was authored on.** `ReplicaHub::project` produced a `Created` placement only for an item the source holds no binding for, and `absorb` binds every live upsert whatever its status, so the first write of a pending create took a binding and every read after it answered `Dirty`. The merge derives an add for a `Created` placement alone, so the create was neither pushed nor dropped, on that run and every run after: a locally-authored item never left the machine, an edit-beats-delete resurrection written by a pass that may not push was refused by the pass that may, losing the edit, and a keep-both fork was staged and never delivered. Each ran to a successful exit with nothing reported. A binding with no base is now projected as the pending create it is, the base being what a source last reconciled with its own remote and every base-less live placement being a create.
+- Fixed a create the hub had bound never reaching the source it was authored on.
 
-- **A conflict resolved by keeping the ancestor body vanished.** Discarding both diverging bodies for the one they forked from, the ordinary three-way merge answer and the one tcard and tcal keep available by commenting the ancestor line, was accepted, reported as resolved, and pushed by nobody: the replica kept the ancestor, the remote kept its own edit, and the placement rebased clean claiming to be in sync, with nothing reported either way. The resolution left the base contradicting itself, adopting the revision observed at conflict time while discarding the body recorded beside it, so the sync read a placement pointing at the body its base held as nothing to push and the adopted revision as nothing to pull. A resolution now rebases the base onto the whole remote state it was merged against, revision and body, which is also the ancestor a later three-way merge runs against. Keeping the local body, the ancestor or a hand-merged body pushes an `Update` gated on the recorded revision, and adopting the remote body owes no push and settles clean. The same resolution through a hub kept the body it discarded and pushed that instead; an upsert leaving a conflicted binding now counts as the source having spoken whatever body it carries.
+  `ReplicaHub::project` produced a `Created` placement only for an item the source holds no binding for, and `absorb` binds every live upsert whatever its status, so the first write of a pending create took a binding and every read after it answered `Dirty`. The merge derives an add for a `Created` placement alone, so the create was neither pushed nor dropped, on that run and every run after: a locally-authored item never left the machine, an edit-beats-delete resurrection written by a pass that may not push was refused by the pass that may, losing the edit, and a keep-both fork was staged and never delivered. Each ran to a successful exit with nothing reported. A binding with no base is now projected as the pending create it is, the base being what a source last reconciled with its own remote and every base-less live placement being a create.
 
-- **Resolving a create-collision conflict re-conflicted for ever.** Such a conflict has no base, and the resolution left it with none, so the next sync marked it conflicted again and its body was never pushed. The resolution establishes the base from the state it settled, which is what the engine already claimed it did.
+- Fixed a conflict resolved by keeping the ancestor body vanishing.
 
-- **An edit restating the body the replica already synced claimed a push that did not exist.** `mutate` marked every `Edit` dirty without comparing the incoming body against the base, so re-asserting the synced content left a placement whose status said pending while `ReplicaPlacement::staged_edit`, the single reading of that fact, said nothing was staged. A consumer rendering status reported unsynced changes for a write that changed nothing, and the sync's edit-beats-delete rule, which asks `staged_edit`, dropped the placement when the source deleted the item while the status claimed otherwise. No bytes are lost in that shape, the content the placement claimed being the one the source held before deleting it. Such an edit now leaves the status where it found it; resolving a conflict stays dirty whatever body it carries.
+  Discarding both diverging bodies for the one they forked from, the ordinary three-way merge answer and the one tcard and tcal keep available by commenting the ancestor line, was accepted, reported as resolved, and pushed by nobody: the replica kept the ancestor, the remote kept its own edit, and the placement rebased clean claiming to be in sync, with nothing reported either way. The resolution left the base contradicting itself, adopting the revision observed at conflict time while discarding the body recorded beside it, so the sync read a placement pointing at the body its base held as nothing to push and the adopted revision as nothing to pull. A resolution now rebases the base onto the whole remote state it was merged against, revision and body, which is also the ancestor a later three-way merge runs against. Keeping the local body, the ancestor or a hand-merged body pushes an `Update` gated on the recorded revision, and adopting the remote body owes no push and settles clean. The same resolution through a hub kept the body it discarded and pushed that instead; an upsert leaving a conflicted binding now counts as the source having spoken whatever body it carries.
 
-- **A rebuilt spine bet on the order its batch was applied in.** `rekey` dropped every old handle before upserting the new spine, so a new handle space reusing an old handle, and an unmatched staged edit resurrected under the handle it already had, each put a drop and an upsert of one key in a batch whose contract promised only atomicity. It now drops only the handles no upsert of the same batch writes. The contract is stated as well: a batch is applied in order, and a storage may not group it by op kind, because a sync legitimately writes a placeholder it then supersedes under the handle the remote assigned.
+- Fixed a create-collision conflict re-conflicting for ever once resolved.
 
-- **A collection holding one identity twice lost mail on a side nobody touched.** A placement is identified by its collection and link id and a source binds it with one handle, so a second copy of one `Message-ID` (a double delivery, a retried `APPEND`, a restore, a migration) had nowhere to live: the fetch that resolved it silently repointed the first binding, and the evidence was gone at that write. Deleting the bound copy then propagated a delete that removed the only copy on another source, while the source that reported it still held the message.
+  Such a conflict has no base, and the resolution left it with none, so the next sync marked it conflicted again and its body was never pushed. The resolution establishes the base from the state it settled, which is what the engine already claimed it did.
 
-  The second copy now gets an item of its own. A fetch resolving a placement to a link id another placement of the collection already carries links it under a **minted** key instead, `dup:` plus the identity hint plus `#` plus the placement's own handle, so both copies are stored, listed, hydrated and reconciled like any other member. The mint is derived from the hint and the handle alone, which makes it deterministic: a store rebuilt from scratch reproduces the same key, and a rekey carries it as it carries any other. Nothing reads the key's shape, so a minted item propagates, deletes, merges and conflicts on the ordinary rules; a target refusing the duplicate answers with a rejected push, which the engine already models.
+- Fixed an edit restating the body the replica already synced claiming a push that did not exist.
+
+  `mutate` marked every `Edit` dirty without comparing the incoming body against the base, so re-asserting the synced content left a placement whose status said pending while `ReplicaPlacement::staged_edit`, the single reading of that fact, said nothing was staged. A consumer rendering status reported unsynced changes for a write that changed nothing, and the sync's edit-beats-delete rule, which asks `staged_edit`, dropped the placement when the source deleted the item while the status claimed otherwise. No bytes are lost in that shape, the content the placement claimed being the one the source held before deleting it. Such an edit now leaves the status where it found it; resolving a conflict stays dirty whatever body it carries.
+
+- Fixed a rebuilt spine betting on the order its batch was applied in.
+
+  `rekey` dropped every old handle before upserting the new spine, so a new handle space reusing an old handle, and an unmatched staged edit resurrected under the handle it already had, each put a drop and an upsert of one key in a batch whose contract promised only atomicity. It now drops only the handles no upsert of the same batch writes. The contract is stated as well: a batch is applied in order, and a storage may not group it by op kind, because a sync legitimately writes a placeholder it then supersedes under the handle the remote assigned.
+
+- Fixed a collection holding one identity twice losing mail on a side nobody touched.
+
+  A placement is identified by its collection and link id and a source binds it with one handle, so a second copy of one `Message-ID` (a double delivery, a retried `APPEND`, a restore, a migration) had nowhere to live: the fetch that resolved it silently repointed the first binding, and the evidence was gone at that write. Deleting the bound copy then propagated a delete that removed the only copy on another source, while the source that reported it still held the message.
+
+  The second copy now gets an item of its own. A fetch resolving a placement to a link id another placement of the collection already carries links it under a minted key instead, `dup:` plus the identity hint plus `#` plus the placement's own handle, so both copies are stored, listed, hydrated and reconciled like any other member. The mint is derived from the hint and the handle alone, which makes it deterministic: a store rebuilt from scratch reproduces the same key, and a rekey carries it as it carries any other. Nothing reads the key's shape, so a minted item propagates, deletes, merges and conflicts on the ordinary rules; a target refusing the duplicate answers with a rejected push, which the engine already models.
 
   The check is made against the whole collection rather than the batch, since a batch hydrating only the second copy would otherwise take the key. Only a source's own copy is minted: a locally authored create colliding with a stored identity is still refused.
 
-- **A move delivered the item to the target twice.** Both halves of a move can deliver on their own, the target's create by copying from its origin and the source's tombstone by relocating the member, so syncing the target first left the server holding the copy *and* the relocation. Both now recognise what the other did through the link id, and an item whose link id is not resolved yet stages the source half alone, since it has no such key. Neither half could simply be dropped: the create is what makes a move work through a hub, whose bindings carry no origin, and the relocation is what keeps a never-fetched item from being deleted before its copy can run.
+- Fixed a move delivering the item to the target twice.
 
-- **A read-only source's local delete was lost for good under a delta enumerate.** The delete was applied locally on the promise that the next enumerate would re-add the member, which holds only for a complete snapshot: an incremental one never lists an untouched member again, and the merge only revisits local rows that are not clean, which a dropped row is not. The tombstone is reverted instead, keeping whatever the placement had cached.
+  Both halves of a move can deliver on their own, the target's create by copying from its origin and the source's tombstone by relocating the member, so syncing the target first left the server holding the copy and the relocation. Both now recognise what the other did through the link id, and an item whose link id is not resolved yet stages the source half alone, since it has no such key. Neither half could simply be dropped: the create is what makes a move work through a hub, whose bindings carry no origin, and the relocation is what keeps a never-fetched item from being deleted before its copy can run.
 
-- **A housekeeping drop propagated as a delete to every other source.** Reconciling a provisional placeholder to its server-assigned handle, or rebuilding a spine after a UIDVALIDITY bump, drops rows without the item going anywhere, but a storage sharing one item across sources read every drop as a delete and pushed a `Remove` to sources nobody had touched. Only `ReplicaDropReason::Deleted` propagates now, which also ends rekey's reliance on the write batch being applied in list order.
+- Fixed a read-only source's local delete being lost for good under a delta enumerate.
 
-- **A placement recorded at `Full` holding no body was skipped for ever**, since nothing revisits what already reads as reached. The level is a claim and the payload is the fact, so an upgrade revisits either rung whose payload is missing. 0.4.1 fixed this for hub-backed stores only; the plain path needed a resync.
+  The delete was applied locally on the promise that the next enumerate would re-add the member, which holds only for a complete snapshot: an incremental one never lists an untouched member again, and the merge only revisits local rows that are not clean, which a dropped row is not. The tombstone is reverted instead, keeping whatever the placement had cached.
 
-- **A keep-both duplicate could not be identified.** It carried no link id and a constant handle suffix, so a retried add had no idempotency key, a storage sharing items by link could not hold it, and a second resolution overwrote the first. Both are derived from the forked body now: the duplicate is a new item, not another copy of the one it forked from.
+- Fixed a housekeeping drop propagating as a delete to every other source.
 
-- **A derived content push suppressed the flag merge for that item.** It self-healed only because the recorded checkpoint is the pre-push one, so a concurrent remote flag change stayed invisible, and emitted no event, until some later run happened to list the item again. The flag axis always runs now and withholds only its own push, so one handle still yields at most one change.
+  Reconciling a provisional placeholder to its server-assigned handle, or rebuilding a spine after a UIDVALIDITY bump, drops rows without the item going anywhere, but a storage sharing one item across sources read every drop as a delete and pushed a `Remove` to sources nobody had touched. Only `ReplicaDropReason::Deleted` propagates now, which also ends rekey's reliance on the write batch being applied in list order.
 
-- **A source disagreed with itself, and its second edit was dropped.** The hub read a cross-source divergence off the base the source last synced with its own remote, which an unpushed edit of that very source leaves behind just as another source folding in does. A second offline edit was therefore filed as a conflict and never pushed anywhere, with one source bound and no second source in the store, and the edit resolving a conflicted binding was dropped the same way: the merged body never became the item's body, so the next run pushed the unmerged one over the remote it was merged against. `ReplicaSourceBinding::shared_object` records the shared body a source last reconciled against, giving each axis its own base, and the cross-source comparison is made against it. A genuine divergence between two sources conflicts exactly as before.
+- Fixed a placement recorded at `Full` holding no body being skipped for ever, since nothing revisits what already reads as reached.
+
+  The level is a claim and the payload is the fact, so an upgrade revisits either rung whose payload is missing. 0.4.1 fixed this for hub-backed stores only; the plain path needed a resync.
+
+- Fixed a keep-both duplicate that could not be identified.
+
+  It carried no link id and a constant handle suffix, so a retried add had no idempotency key, a storage sharing items by link could not hold it, and a second resolution overwrote the first. Both are derived from the forked body now: the duplicate is a new item, not another copy of the one it forked from.
+
+- Fixed a derived content push suppressing the flag merge for that item.
+
+  It self-healed only because the recorded checkpoint is the pre-push one, so a concurrent remote flag change stayed invisible, and emitted no event, until some later run happened to list the item again. The flag axis always runs now and withholds only its own push, so one handle still yields at most one change.
+
+- Fixed a source disagreeing with itself, its second edit dropped.
+
+  The hub read a cross-source divergence off the base the source last synced with its own remote, which an unpushed edit of that very source leaves behind just as another source folding in does. A second offline edit was therefore filed as a conflict and never pushed anywhere, with one source bound and no second source in the store, and the edit resolving a conflicted binding was dropped the same way: the merged body never became the item's body, so the next run pushed the unmerged one over the remote it was merged against. `ReplicaSourceBinding::shared_object` records the shared body a source last reconciled against, giving each axis its own base, and the cross-source comparison is made against it. A genuine divergence between two sources conflicts exactly as before.
 
 ## [0.4.2] - 2026-08-25
 
@@ -178,7 +262,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added the std client behind the client feature: a blocking ReplicaClient servicing every yield through the consumer-implemented Storage and Remote traits.
 - Documented the at-least-once push contract (an add's link_id dedups a retry, a remove of an already-missing member reads as accepted) and the pointer-derived object refcounting the consumer maintains by diffing placement upserts and drops.
 
-[unreleased]: https://github.com/pimalaya/io-replica/compare/v0.4.2..HEAD
+[unreleased]: https://github.com/pimalaya/io-replica/compare/v0.5.0..HEAD
+[0.5.0]: https://github.com/pimalaya/io-replica/compare/v0.4.2..v0.5.0
 [0.4.2]: https://github.com/pimalaya/io-replica/compare/v0.4.1..v0.4.2
 [0.4.1]: https://github.com/pimalaya/io-replica/compare/v0.4.0..v0.4.1
 [0.4.0]: https://github.com/pimalaya/io-replica/compare/v0.3.0..v0.4.0
