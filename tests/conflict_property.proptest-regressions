@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d246ee2da33cd8fbb824d0dfeb1fb1970806521600d4c917945884ec7affc78c # shrinks to ops = [ServerEdit(4525027724562515347, 6104659648728112968, 0), Refuse(2589786285135012354, 1155269067154575914), Remove(0, 6404384115689265560)]
+cc e9c5a979ebe6d1fc26e30e6837f5a9f517070ddc869114afc6ee87522c0353df # shrinks to ops = [ServerEdit(3831736915844616746, 1076778119647842565, 0), Edit(0, 5679424036076250143, 0), Sync(10993640530883609402), Resolve(12523906884151533938, 3226032260933019929, 0)]

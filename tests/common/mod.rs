@@ -702,6 +702,29 @@ impl ReplicaStorage for SourceStore {
     fn write(&mut self, ops: Vec<ReplicaWriteOp>) -> Result<(), Infallible> {
         let mut shared = self.shared.borrow_mut();
 
+        // NOTE: an unlinked upsert of a handle this source is already
+        // bound to is that item pulled again, a remote edit resurrecting
+        // a tombstone being the way there. A store holding the
+        // handle-to-link map keys it back rather than filing a second
+        // row beside the binding, `load` never returning one handle
+        // twice.
+        let ops: Vec<ReplicaWriteOp> = ops
+            .into_iter()
+            .map(|op| match op {
+                ReplicaWriteOp::UpsertPlacement(mut placement) if placement.link_id.is_none() => {
+                    placement.link_id = shared.hub.items.iter().find_map(|(link, item)| {
+                        let bound = item
+                            .sources
+                            .get(&self.source)
+                            .is_some_and(|binding| binding.handle == placement.handle);
+                        bound.then(|| link.clone())
+                    });
+                    ReplicaWriteOp::UpsertPlacement(placement)
+                }
+                op => op,
+            })
+            .collect();
+
         for op in &ops {
             match op {
                 ReplicaWriteOp::StoreObject { object, body } => {
